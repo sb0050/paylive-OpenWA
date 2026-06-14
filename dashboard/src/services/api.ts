@@ -1,7 +1,14 @@
 // API Service Layer for OpenWA Dashboard
 // Centralized API client with TypeScript types
 
-const API_BASE_URL = '/api';
+const normalizeApiBaseUrl = (url?: string) => {
+  if (!url) return '/api';
+
+  const baseUrl = url.replace(/\/+$/, '');
+  return baseUrl.endsWith('/api') ? baseUrl : `${baseUrl}/api`;
+};
+
+export const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_URL);
 
 // =============================================================================
 // Types
@@ -171,6 +178,14 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 
   return response.json();
 }
+
+export const authApi = {
+  validate: (apiKey: string) =>
+    request<{ valid: boolean; role?: string }>('/auth/validate', {
+      method: 'POST',
+      headers: { 'X-API-Key': apiKey },
+    }),
+};
 
 // =============================================================================
 // Session API

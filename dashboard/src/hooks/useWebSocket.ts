@@ -25,9 +25,9 @@ interface WebSocketEvents {
   onMessage?: (event: MessageEvent) => void;
 }
 
-// Use current origin for WebSocket (goes through nginx proxy in Docker)
-// Falls back to env var or localhost for development
-const SOCKET_URL = import.meta.env.VITE_WS_URL || window.location.origin;
+// Use the configured backend in hosted deployments, while keeping the current
+// origin fallback for Docker/nginx setups that proxy websocket traffic.
+const SOCKET_URL = import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL || window.location.origin;
 
 export function useWebSocket(events: WebSocketEvents = {}) {
   const socketRef = useRef<Socket | null>(null);

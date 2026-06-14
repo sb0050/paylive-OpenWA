@@ -6,6 +6,7 @@ import { Layout } from './components/Layout';
 import { ToastProvider } from './components/Toast';
 import { RoleProvider, useRole, type UserRole } from './hooks/useRole';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { authApi } from './services/api';
 import './App.css';
 
 const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
@@ -41,12 +42,8 @@ function AppContent() {
 
     // Fetch the role from API
     try {
-      const response = await fetch('/api/auth/validate', {
-        method: 'POST',
-        headers: { 'X-API-Key': key },
-      });
-      if (response.ok) {
-        const data = await response.json();
+      const data = await authApi.validate(key);
+      if (data.valid && data.role) {
         setRole(data.role as UserRole);
       }
     } catch {
@@ -68,11 +65,8 @@ function AppContent() {
   useEffect(() => {
     if (!savedKey) return;
 
-    fetch('/api/auth/validate', {
-      method: 'POST',
-      headers: { 'X-API-Key': savedKey },
-    })
-      .then(res => res.json())
+    authApi
+      .validate(savedKey)
       .then(data => {
         if (data.valid && data.role) {
           setRole(data.role as UserRole);
