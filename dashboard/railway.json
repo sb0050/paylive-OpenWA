@@ -1,10 +1,5 @@
 {
   "build": {
-    "builder": "NIXPACKS",
-    "buildCommand": "npm install && npm run build"
-  },
-  "deploy": {
-    "startCommand": "node_modules/.bin/serve dist -p $PORT",
-    "restartPolicyType": "ON_FAILURE"
+    "builder": "NIXPACKS"
   }
 }
