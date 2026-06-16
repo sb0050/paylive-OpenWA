@@ -254,6 +254,11 @@ export interface IWhatsAppEngine {
   getContacts(): Promise<Contact[]>;
   getContactById(contactId: string): Promise<Contact | null>;
   checkNumberExists(number: string): Promise<boolean>;
+  /**
+   * Résout le vrai numéro de téléphone (chiffres) d'un contact à partir de son
+   * id — y compris quand l'id est un `@lid` (confidentialité WhatsApp).
+   */
+  resolvePhoneNumber(contactId: string): Promise<string | null>;
 
   // Groups - Basic
   getGroups(): Promise<Group[]>;

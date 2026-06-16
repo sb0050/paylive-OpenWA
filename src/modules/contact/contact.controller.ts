@@ -55,6 +55,25 @@ export class ContactController {
     return contact;
   }
 
+  @Get(':contactId/phone')
+  @ApiOperation({
+    summary: 'Resolve the real phone number of a contact (handles @lid ids)',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'contactId', description: 'Contact ID (e.g. xxx@lid or xxx@c.us)' })
+  @ApiResponse({ status: 200, description: 'Resolved phone number (digits) or null' })
+  async resolvePhone(
+    @Param('sessionId') sessionId: string,
+    @Param('contactId') contactId: string,
+  ) {
+    const engine = this.sessionService.getEngine(sessionId);
+    if (!engine) {
+      throw new Error('Session is not started');
+    }
+    const phone = await engine.resolvePhoneNumber(contactId);
+    return { phone };
+  }
+
   @Get('check/:number')
   @ApiOperation({ summary: 'Check if a phone number exists on WhatsApp' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
