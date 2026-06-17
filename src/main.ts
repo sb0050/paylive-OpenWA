@@ -7,6 +7,7 @@ import { ShutdownService } from './common/services/shutdown.service';
 import { createSwaggerConfig } from './config/swagger.config';
 import { BullBoardAuthMiddleware } from './common/security/bull-board-auth.middleware';
 import { AuthService } from './modules/auth/auth.service';
+import { LoggerService, LogLevel } from './common/services/logger.service';
 import { Request, Response, NextFunction } from 'express';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
@@ -69,6 +70,20 @@ STORAGE_PATH=./data/media
 }
 
 async function bootstrap() {
+  // Niveau de log applicatif (LoggerService custom). Par défaut INFO ; mettre
+  // LOG_LEVEL=debug pour voir les logs DEBUG (ex. « Message received » du moteur
+  // WhatsApp) sans changer le reste du comportement applicatif (NODE_ENV intact).
+  const rawLogLevel = String(process.env.LOG_LEVEL || '').toLowerCase();
+  const allowedLogLevels = Object.values(LogLevel) as string[];
+  if (allowedLogLevels.includes(rawLogLevel)) {
+    LoggerService.setLogLevel(rawLogLevel as LogLevel);
+    console.log(`[Bootstrap] Log level set to: ${rawLogLevel}`);
+  } else if (rawLogLevel) {
+    console.warn(
+      `[Bootstrap] LOG_LEVEL invalide "${rawLogLevel}" — ignoré (valeurs: ${allowedLogLevels.join(', ')})`,
+    );
+  }
+
   const app = await NestFactory.create(AppModule);
 
   // Enable shutdown hooks for graceful shutdown

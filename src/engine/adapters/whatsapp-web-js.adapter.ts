@@ -103,22 +103,33 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
       this.setupEventHandlers();
 
-      // Supprime le fichier de verrou Chromium laissé par un container précédent
+      // Supprime les verrous Chromium laissés par un container précédent
       // (restart Railway, redéploiement…). Sans cette suppression, Puppeteer refuse
       // de démarrer avec "The profile appears to be in use by another Chromium process".
-      const chromeProfileDir = path.join(
+      //
+      // ⚠ Chemin EXACT du user-data-dir (= ce que LocalAuth passe à Puppeteer) :
+      //   path.join(dataPath, `session-${clientId}`)
+      // Comme on fournit `dataPath` explicitement, LocalAuth N'AJOUTE PAS `.wwebjs_auth`.
+      // Les fichiers SingletonLock/Socket/Cookies sont à la RACINE de ce dossier
+      // (pas dans `Default/`). Sur Linux, SingletonLock est un lien symbolique →
+      // `fs.rmSync` (ou unlink) le supprime ; `existsSync` suit le lien et peut
+      // renvoyer false sur un lien pendant — on s'appuie donc sur le try/catch.
+      const userDataDir = path.join(
         path.resolve(this.config.sessionDataPath),
-        '.wwebjs_auth',
         `session-${this.config.sessionId}`,
-        'Default',
       );
       for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookies']) {
-        const lockPath = path.join(chromeProfileDir, lockFile);
+        const lockPath = path.join(userDataDir, lockFile);
         try {
-          fs.unlinkSync(lockPath);
+          fs.rmSync(lockPath, { force: true });
           this.logger.log(`Lock Chromium supprimé : ${lockFile}`);
-        } catch {
-          // Fichier absent = situation normale au premier démarrage
+        } catch (err) {
+          // ENOENT (fichier absent) = normal au 1er démarrage ; on logge le reste.
+          if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+            this.logger.warn(
+              `Suppression du lock ${lockFile} échouée: ${(err as Error)?.message}`,
+            );
+          }
         }
       }
 

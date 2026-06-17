@@ -7,6 +7,7 @@ import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { EventsGateway } from '../events/events.gateway';
 
 @ApiTags('sessions')
 @Controller('sessions')
@@ -14,6 +15,7 @@ export class SessionController {
   constructor(
     private readonly sessionService: SessionService,
     private readonly auditService: AuditService,
+    private readonly eventsGateway: EventsGateway,
   ) {}
 
   // Transform entity to DTO with lastActive field name
@@ -73,6 +75,46 @@ export class SessionController {
   async findOne(@Param('id') id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.findOne(id);
     return this.transformSession(session);
+  }
+
+  // ===========================================================================
+  // DEBUG — émission manuelle d'un event temps réel (test du pipeline Socket.IO)
+  //
+  // Permet de vérifier que les events OpenWA → worker (Socket.IO) circulent
+  // SANS dépendre de whatsapp-web.js : on émet un event synthétique
+  // (`message.received` par défaut) via le même EventsGateway que les vrais
+  // events. Si le worker logge `[openwa] event=message.received`, le pipeline
+  // Socket.IO fonctionne → le problème vient de la détection des messages
+  // entrants côté moteur WhatsApp. Sinon → souscription/room cassée.
+  // ===========================================================================
+  @Post(':id/debug/emit-event')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'DEBUG: emit a synthetic real-time event for a session' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  async emitDebugEvent(
+    @Param('id') id: string,
+    @Body() body: { event?: string; from?: string; messageBody?: string; status?: string } = {},
+  ) {
+    // Valide l'existence de la session (404 sinon).
+    const session = await this.sessionService.findOne(id);
+    const event = body?.event || 'message.received';
+
+    if (event === 'session.status') {
+      const status = body?.status || 'ready';
+      this.eventsGateway.emitSessionStatus(id, status, { phone: session.phone });
+      return { emitted: true, sessionId: id, event, status };
+    }
+
+    // message.received (défaut) — shape alignée sur les vrais messages entrants.
+    const data = {
+      id: `debug-${Date.now()}`,
+      from: body?.from || `33600000000@c.us`,
+      body: body?.messageBody || 'pl 999',
+      fromMe: false,
+      timestamp: Date.now(),
+    };
+    this.eventsGateway.emitMessage(id, data);
+    return { emitted: true, sessionId: id, event: 'message.received', data };
   }
 
   @Delete(':id')
