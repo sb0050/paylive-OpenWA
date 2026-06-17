@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import { Client, LocalAuth, MessageMedia, MessageTypes } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
@@ -101,6 +102,26 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       });
 
       this.setupEventHandlers();
+
+      // Supprime le fichier de verrou Chromium laissé par un container précédent
+      // (restart Railway, redéploiement…). Sans cette suppression, Puppeteer refuse
+      // de démarrer avec "The profile appears to be in use by another Chromium process".
+      const chromeProfileDir = path.join(
+        path.resolve(this.config.sessionDataPath),
+        '.wwebjs_auth',
+        `session-${this.config.sessionId}`,
+        'Default',
+      );
+      for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookies']) {
+        const lockPath = path.join(chromeProfileDir, lockFile);
+        try {
+          fs.unlinkSync(lockPath);
+          this.logger.log(`Lock Chromium supprimé : ${lockFile}`);
+        } catch {
+          // Fichier absent = situation normale au premier démarrage
+        }
+      }
+
       await this.client.initialize();
     } catch (error) {
       this.setStatus(EngineStatus.FAILED);
