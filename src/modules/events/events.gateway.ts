@@ -28,6 +28,8 @@ import { SUBSCRIBABLE_EVENTS, buildRoomName } from './dto/ws-messages.dto';
     origin: '*', // In production, restrict this
   },
   namespace: '/events',
+  // 2 Mo : les messages image (média base64) peuvent dépasser le défaut 1 Mo.
+  maxHttpBufferSize: 2 * 1024 * 1024,
 })
 export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
