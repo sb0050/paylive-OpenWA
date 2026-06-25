@@ -27,6 +27,13 @@ export default defineConfig({
         changeOrigin: true,
         secure: false,
       },
+      // Proxy the WebSocket (socket.io) transport so the dashboard's real-time
+      // chats/sessions streams work against the dev backend.
+      '/socket.io': {
+        target: 'http://localhost:2785',
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
 });

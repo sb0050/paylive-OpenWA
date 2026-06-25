@@ -1,8 +1,13 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Eye, EyeOff } from 'lucide-react';
+import { Eye, EyeOff, Languages } from 'lucide-react';
 import { GithubIcon } from '../components/GithubIcon';
+<<<<<<< HEAD
 import { authApi } from '../services/api';
+=======
+import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
+import { API_BASE_URL } from '../services/api';
+>>>>>>> upstream/main
 import './Login.css';
 
 interface LoginProps {
@@ -10,11 +15,16 @@ interface LoginProps {
 }
 
 export function Login({ onLogin }: LoginProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const currentLang = resolveSupportedLanguage(i18n.resolvedLanguage || i18n.language);
+
+  const changeLanguage = (language: SupportedLanguage) => {
+    void i18n.changeLanguage(language);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -26,8 +36,20 @@ export function Login({ onLogin }: LoginProps) {
     setError('');
 
     try {
+<<<<<<< HEAD
       const data = await authApi.validate(apiKey);
       if (data.valid) {
+=======
+      const response = await fetch(`${API_BASE_URL}/auth/validate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': apiKey,
+        },
+      });
+
+      if (response.ok) {
+>>>>>>> upstream/main
         onLogin(apiKey);
       } else {
         setError(t('login.invalidKey'));
@@ -51,6 +73,22 @@ export function Login({ onLogin }: LoginProps) {
             })}
           </span>
         </div>
+
+        <div className="login-language">
+          <Languages size={18} />
+          <select
+            value={currentLang}
+            onChange={event => changeLanguage(event.target.value as SupportedLanguage)}
+            aria-label={t('common.language')}
+          >
+            {languageOptions.map(option => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <form onSubmit={handleSubmit} className="login-form">
           <div className="input-group">
             <label htmlFor="apiKey">{t('login.apiKey')}</label>
@@ -63,7 +101,12 @@ export function Login({ onLogin }: LoginProps) {
                 placeholder={t('login.apiKeyPlaceholder')}
                 className={error ? 'error' : ''}
               />
-              <button type="button" className="toggle-visibility" onClick={() => setShowKey(!showKey)}>
+              <button
+                type="button"
+                className="toggle-visibility"
+                onClick={() => setShowKey(!showKey)}
+                aria-label={showKey ? t('common.hideApiKey') : t('common.showApiKey')}
+              >
                 {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
               </button>
             </div>

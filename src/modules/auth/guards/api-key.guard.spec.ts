@@ -1,4 +1,4 @@
-import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import { ExecutionContext, UnauthorizedException, ForbiddenException } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { ApiKeyGuard } from './api-key.guard';
@@ -139,7 +139,7 @@ describe('ApiKeyGuard', () => {
 
     const context = createMockContext({ 'x-api-key': 'viewer-key' });
 
-    await expect(guard.canActivate(context)).rejects.toThrow('Insufficient permissions');
+    await expect(guard.canActivate(context)).rejects.toThrow(ForbiddenException);
   });
 
   it('should pass session ID from route params to validateApiKey', async () => {
@@ -152,6 +152,38 @@ describe('ApiKeyGuard', () => {
     await guard.canActivate(context);
 
     expect(authService.validateApiKey).toHaveBeenCalledWith('key', '127.0.0.1', 'sess-123');
+  });
+
+  it('does not treat a non-session route :id as a session id (no @SessionScoped)', async () => {
+    reflector.getAllAndOverride
+      .mockReturnValueOnce(false) // not public
+      .mockReturnValueOnce(undefined) // no required role
+      .mockReturnValueOnce(undefined); // controller is NOT @SessionScoped
+
+    const apiKey = createMockApiKey();
+    (authService.validateApiKey as jest.Mock).mockResolvedValue(apiKey);
+
+    // e.g. GET /plugins/:id or /auth/api-keys/:id — :id is a plugin/key id, not a session.
+    const context = createMockContext({ 'x-api-key': 'key' }, { id: 'plugin-x' });
+    await guard.canActivate(context);
+
+    expect(authService.validateApiKey).toHaveBeenCalledWith('key', '127.0.0.1', undefined);
+  });
+
+  it('treats :id as the session id on a @SessionScoped controller (session scoping preserved)', async () => {
+    reflector.getAllAndOverride
+      .mockReturnValueOnce(false) // not public
+      .mockReturnValueOnce(undefined) // no required role
+      .mockReturnValueOnce(true); // controller IS @SessionScoped (SessionController)
+
+    const apiKey = createMockApiKey();
+    (authService.validateApiKey as jest.Mock).mockResolvedValue(apiKey);
+
+    // GET /sessions/:id/... — :id IS the session, so allowedSessions must still be enforced.
+    const context = createMockContext({ 'x-api-key': 'key' }, { id: 'sess-B' });
+    await guard.canActivate(context);
+
+    expect(authService.validateApiKey).toHaveBeenCalledWith('key', '127.0.0.1', 'sess-B');
   });
 
   it('ignores X-Forwarded-For by default (no trusted proxies) to prevent IP spoofing', async () => {

@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+node_modules
 .pnp
 .pnp.js
 
@@ -46,6 +47,7 @@ Thumbs.db
 # Data and storage
 data/
 media/
+!src/**/media/
 uploads/
 .wwebjs_auth/
 .wwebjs_cache/
@@ -67,10 +69,15 @@ uploads/
 .worktrees/
 
 # AI Agents
+.playwright-mcp/
 .remember/
 .agent/
 .claude/
 docs/plans/
 CLAUDE.md
 _docs/
+<<<<<<< HEAD
 .history/
+=======
+.superpowers/
+>>>>>>> upstream/main

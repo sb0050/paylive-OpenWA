@@ -1,11 +1,11 @@
-import { Injectable, CanActivate, ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import { Injectable, CanActivate, ExecutionContext, UnauthorizedException, ForbiddenException } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { Request } from 'express';
 import { AuthService } from '../auth.service';
 import { ApiKeyRole } from '../entities/api-key.entity';
-import { REQUIRED_ROLE_KEY, PUBLIC_KEY } from '../decorators/auth.decorators';
-import { ipMatches, normalizeIp } from '../../../common/utils/ip';
+import { REQUIRED_ROLE_KEY, PUBLIC_KEY, SESSION_SCOPED_KEY } from '../decorators/auth.decorators';
+import { resolveClientIp } from '../../../common/utils/ip';
 
 @Injectable()
 export class ApiKeyGuard implements CanActivate {
@@ -30,21 +30,29 @@ export class ApiKeyGuard implements CanActivate {
       throw new UnauthorizedException('API key is required');
     }
 
-    // Get session ID from route params if present
-    const sessionId = (request.params['sessionId'] || request.params['id']) as string | undefined;
-    const clientIp = this.getClientIp(request);
-
-    // Validate API key
-    const apiKey = await this.authService.validateApiKey(apiKeyHeader, clientIp, sessionId);
-
-    // Check role permission
     const requiredRole = this.reflector.getAllAndOverride<ApiKeyRole>(REQUIRED_ROLE_KEY, [
       context.getHandler(),
       context.getClass(),
     ]);
 
+    // Resolve the session id used for the key's allowedSessions scope. `:sessionId` is always a
+    // session; the bare `:id` param is only a session on controllers marked @SessionScoped (i.e.
+    // SessionController) — on other routes `:id` is an unrelated resource id (API key, plugin, …)
+    // and must NOT be fed to the allowedSessions check, which would spuriously deny a scoped key.
+    const sessionScoped = this.reflector.getAllAndOverride<boolean>(SESSION_SCOPED_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    const sessionId = (request.params['sessionId'] || (sessionScoped ? request.params['id'] : undefined)) as
+      | string
+      | undefined;
+    const clientIp = this.getClientIp(request);
+
+    // Validate API key
+    const apiKey = await this.authService.validateApiKey(apiKeyHeader, clientIp, sessionId);
+
     if (requiredRole && !this.authService.hasPermission(apiKey, requiredRole)) {
-      throw new UnauthorizedException(`Insufficient permissions. Required: ${requiredRole}`);
+      throw new ForbiddenException(`Insufficient permissions. Required: ${requiredRole}`);
     }
 
     // Attach API key to request for use in controllers
@@ -75,38 +83,7 @@ export class ApiKeyGuard implements CanActivate {
    * direct socket address is used — preventing IP-whitelist spoofing.
    */
   private getClientIp(request: Request): string {
-    const socketIp = normalizeIp(request.socket?.remoteAddress || request.ip || '');
     const trustedProxies = this.configService.get<string[]>('security.trustedProxies') ?? [];
-
-    if (trustedProxies.length === 0) {
-      return socketIp;
-    }
-
-    const isTrusted = (ip: string): boolean => trustedProxies.some(proxy => ipMatches(ip, proxy));
-
-    // Only trust the forwarded chain if the immediate peer is a trusted proxy.
-    if (!isTrusted(socketIp)) {
-      return socketIp;
-    }
-
-    const forwarded = request.headers['x-forwarded-for'];
-    if (!forwarded) {
-      return socketIp;
-    }
-
-    const hops = (Array.isArray(forwarded) ? forwarded.join(',') : forwarded)
-      .split(',')
-      .map(hop => normalizeIp(hop.trim()))
-      .filter(Boolean);
-
-    // Walk right-to-left and return the first hop that is not a trusted proxy:
-    // the closest address the trusted infrastructure actually observed.
-    for (let i = hops.length - 1; i >= 0; i--) {
-      if (!isTrusted(hops[i])) {
-        return hops[i];
-      }
-    }
-
-    return socketIp;
+    return resolveClientIp(request, trustedProxies);
   }
 }

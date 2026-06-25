@@ -79,17 +79,17 @@ docker compose restart openwa
 
 ```bash
 # Check health
-curl http://localhost:2785/health
+curl http://localhost:2785/api/health
 
 # Check all sessions reconnected
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions | jq '.[].status'
 
 # Send test message
-curl -X POST http://localhost:2785/api/sessions/default/messages \
+curl -X POST http://localhost:2785/api/sessions/default/messages/send-text \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"phone": "628xxx@c.us", "type": "text", "body": "Test after restart"}'
+  -d '{"chatId": "628xxx@c.us", "text": "Test after restart"}'
 ```
 
 **Rollback:** Restore from backup if data corruption detected (see Runbook: Restore from Backup)
@@ -116,9 +116,11 @@ curl -H "X-API-Key: $API_KEY" \
 # 2. Check if auto-reconnect is working
 docker compose logs openwa 2>&1 | grep -i "{sessionId}" | tail -20
 
-# 3. Try session restart
+# 3. Try session restart (stop then start — there is no /restart route)
 curl -X POST -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions/{sessionId}/restart
+  http://localhost:2785/api/sessions/{sessionId}/stop
+curl -X POST -H "X-API-Key: $API_KEY" \
+  http://localhost:2785/api/sessions/{sessionId}/start
 
 # 4. Wait for reconnection (30 seconds)
 sleep 30
@@ -133,12 +135,12 @@ curl -H "X-API-Key: $API_KEY" \
 #    - Has the phone been inactive for 14+ days?
 
 # 7. If need to re-scan QR:
+#    The endpoint returns a PNG data URL: { "qrCode": "data:image/png;base64,...", "status": "qr_ready" }
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}/qr
 
-# Display QR in terminal (requires qrencode)
-curl -s -H "X-API-Key: $API_KEY" \
-  "http://localhost:2785/api/sessions/{sessionId}/qr?format=raw" | qrencode -t ANSI
+# Display QR in terminal: there is no raw/format param — consume the `session.qr`
+# webhook/WebSocket event to get the raw QR string for qrencode.
 ```
 
 **Verification:**
@@ -147,13 +149,13 @@ curl -s -H "X-API-Key: $API_KEY" \
 # Session connected
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId} | jq '.status'
-# Expected: "CONNECTED"
+# Expected: "ready"
 
 # Test message
-curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages \
+curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"phone": "628xxx@c.us", "type": "text", "body": "Session reconnected"}'
+  -d '{"chatId": "628xxx@c.us", "text": "Session reconnected"}'
 ```
 
 ---
@@ -176,26 +178,27 @@ docker stats --no-stream openwa
 free -m
 
 # 2. Identify memory consumers
-# Check per-session memory
-curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/metrics/memory
+# Process-wide memory: scrape /api/metrics (Prometheus text, Bearer METRICS_TOKEN)
+curl -H "Authorization: Bearer $METRICS_TOKEN" \
+  http://localhost:2785/api/metrics \
+  | grep -E "openwa_process_resident_memory_bytes|openwa_process_heap_used_bytes"
 
 # 3. Check for memory leaks
 docker compose logs openwa 2>&1 | grep -i "heap\|memory\|gc"
 
 # 4. Immediate actions:
 
-# A. Clear message cache
-curl -X POST -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/cache/clear
+# A. Clear the in-process cache (no runtime cache-clear API — restart the container;
+#    if using Redis, flush via redis-cli)
+docker compose restart openwa
 
 # B. Restart container (will reconnect sessions)
 docker compose restart openwa
 
 # C. If caused by too many sessions:
-# List sessions sorted by memory
+# List sessions (no sort param); process memory is in stats/overview (memoryUsage, MB)
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions?sort=memory
+  http://localhost:2785/api/sessions/stats/overview
 
 # Consider removing unused sessions
 
@@ -235,9 +238,9 @@ curl -H "X-API-Key: $API_KEY" \
 curl -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}/webhooks
 
-# 2. Check recent webhook logs
-curl -H "X-API-Key: $API_KEY" \
-  "http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId}/logs?status=failed&limit=20"
+# 2. Check recent webhook deliveries
+# There is no webhook-delivery log API — inspect the server logs / audit trail instead:
+docker compose logs openwa 2>&1 | grep -i "webhook" | tail -20
 
 # 3. Identify failure reason:
 # A. Endpoint not responding
@@ -260,27 +263,30 @@ curl -X POST -H "X-API-Key: $API_KEY" \
 # 5. Fix based on cause:
 
 # A. Update webhook URL
-curl -X PATCH http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} \
+curl -X PUT http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"url": "https://new-endpoint.com/webhook"}'
 
 # B. Update authentication
-curl -X PATCH http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} \
+curl -X PUT http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"headers": {"Authorization": "Bearer new-token"}}'
 
-# C. Temporarily disable and re-enable
-curl -X POST -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId}/disable
+# C. Temporarily disable and re-enable (toggle the `active` boolean)
+curl -X PUT http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"active": false}'
 
-curl -X POST -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId}/enable
+curl -X PUT http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId} \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"active": true}'
 
 # 6. Retry failed deliveries
-curl -X POST -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId}/retry-failed
+# No retry-failed API — failed deliveries auto-retry with exponential backoff (doc 06 §6.6)
 ```
 
 **Verification:**
@@ -289,12 +295,11 @@ curl -X POST -H "X-API-Key: $API_KEY" \
 # Webhook test successful
 curl -X POST -H "X-API-Key: $API_KEY" \
   http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId}/test
-# Expected: {"status": "success"}
+# Expected: {"success": true, "statusCode": 200}
 
 # Recent deliveries successful
-curl -H "X-API-Key: $API_KEY" \
-  "http://localhost:2785/api/sessions/{sessionId}/webhooks/{webhookId}/logs?limit=5" | jq '.[].status'
-# Expected: all "success"
+# No delivery-log API — confirm via the server logs / audit trail:
+docker compose logs openwa 2>&1 | grep -i "webhook" | tail -5
 ```
 
 ---
@@ -316,8 +321,7 @@ curl -H "X-API-Key: $API_KEY" \
 
 ```bash
 # 1. Pre-maintenance checks (1 hour before)
-curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/health/detailed
+curl http://localhost:2785/api/health/ready
 docker stats --no-stream
 
 # 2. Notify users (via webhook or external system)
@@ -349,7 +353,7 @@ docker compose up -d
 
 # 9. Wait for health
 sleep 30
-curl http://localhost:2785/health
+curl http://localhost:2785/api/health
 
 # 10. Verify all sessions reconnected
 curl -H "X-API-Key: $API_KEY" \
@@ -364,12 +368,11 @@ curl -H "X-API-Key: $API_KEY" \
 
 ```bash
 # All services healthy
-curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/health/detailed
+curl http://localhost:2785/api/health/ready
 
 # All sessions connected
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions | jq '[.[] | select(.status == "CONNECTED")] | length'
+  http://localhost:2785/api/sessions | jq '[.[] | select(.status == "ready")] | length'
 
 # Test message flow
 # Send test message and verify webhook received
@@ -408,24 +411,25 @@ docker compose down
 
 # 5. Update version in docker-compose.yml
 # Change: image: ghcr.io/rmyndharis/openwa:0.1.0
-# To:     image: ghcr.io/rmyndharis/openwa:0.2.0
+# To:     image: ghcr.io/rmyndharis/openwa:0.7.3
 
 # 6. Pull new image
 docker compose pull
 
 # 7. Run database migrations (if any)
-docker compose run --rm openwa npm run migration:run
+# Use migration:run:prod in the production image — `migration:run` needs ts-node + the TS
+# source, both stripped from the prod image by `npm ci --omit=dev` (M13).
+docker compose run --rm openwa npm run migration:run:prod
 
 # 8. Start services
 docker compose up -d
 
 # 9. Wait for health
 sleep 30
-curl http://localhost:2785/health
+curl http://localhost:2785/api/health
 
 # 10. Verify version
-curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/health/detailed | jq '.version'
+curl http://localhost:2785/api/health | jq '.version'
 
 # 11. Verify all sessions
 curl -H "X-API-Key: $API_KEY" \
@@ -439,9 +443,8 @@ curl -H "X-API-Key: $API_KEY" \
 
 ```bash
 # Correct version
-curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/health/detailed | jq '.version'
-# Expected: "0.2.0"
+curl http://localhost:2785/api/health | jq '.version'
+# Expected: "0.7.3"
 
 # All tests pass
 ./scripts/smoke-test.sh
@@ -456,15 +459,14 @@ docker compose down
 
 # 2. Revert docker-compose.yml to previous version
 
-# 3. Restore database
-cp $BACKUP_DIR/openwa.db ./data/
+# 3. Restore from the pre-upgrade backup (both DBs + sessions)
+./scripts/restore.sh "$BACKUP_FILE"
 
 # 4. Start with old version
 docker compose up -d
 
-# 5. Verify rollback
-curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/health/detailed | jq '.version'
+# 5. Verify rollback (note: readiness is at /api/health/ready)
+curl -H "X-API-Key: $API_KEY" http://localhost:2785/api/health
 ```
 
 ---
@@ -481,78 +483,37 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Steps:**
 
+Use the repo's `scripts/backup.sh`. It captures **everything** required to restore a
+working install — critically including `main.sqlite`, the auth (API-key) + audit DB,
+which an earlier version of this runbook omitted (a "successful" backup that could not
+restore authentication):
+
 ```bash
-#!/bin/bash
-# scripts/backup.sh
+# scripts/backup.sh captures:
+#   - main.sqlite   — auth (API keys) + audit log   (ALWAYS SQLite)
+#   - openwa.sqlite — user data                      (or a pg_dump when DATABASE_TYPE=postgres)
+#   - sessions/     — WhatsApp LocalAuth session data
+#   - media/        — local media                    (skipped automatically when STORAGE_TYPE=s3)
 
-set -e
+# Run from the repo root (operates on the data dir, default ./data):
+./scripts/backup.sh
 
-DATE=$(date +%Y%m%d-%H%M%S)
-BACKUP_DIR="/backups/openwa/$DATE"
-RETENTION_DAYS=30
-
-echo "Starting backup to $BACKUP_DIR"
-
-# Create backup directory
-mkdir -p "$BACKUP_DIR"
-
-# 1. Backup database
-if [ "$DATABASE_ADAPTER" = "postgresql" ]; then
-    echo "Backing up PostgreSQL..."
-    docker compose exec -T postgres pg_dump -U postgres openwa > "$BACKUP_DIR/database.sql"
-else
-    echo "Backing up SQLite..."
-    # Use SQLite online backup
-    docker compose exec openwa sqlite3 /app/data/openwa.db ".backup /tmp/backup.db"
-    docker cp openwa:/tmp/backup.db "$BACKUP_DIR/openwa.db"
-fi
-
-# 2. Backup auth sessions
-echo "Backing up auth sessions..."
-cp -r ./data/.wwebjs_auth "$BACKUP_DIR/"
-
-# 3. Backup configuration
-echo "Backing up configuration..."
-cp .env "$BACKUP_DIR/"
-cp docker-compose.yml "$BACKUP_DIR/"
-
-# 4. Backup media (optional, can be large)
-if [ "$BACKUP_MEDIA" = "true" ]; then
-    echo "Backing up media..."
-    cp -r ./data/media "$BACKUP_DIR/"
-fi
-
-# 5. Create archive
-echo "Creating archive..."
-tar -czf "$BACKUP_DIR.tar.gz" -C "/backups/openwa" "$DATE"
-rm -rf "$BACKUP_DIR"
-
-# 6. Cleanup old backups
-echo "Cleaning up old backups..."
-find /backups/openwa -name "*.tar.gz" -mtime +$RETENTION_DAYS -delete
-
-# 7. Verify backup
-echo "Verifying backup..."
-tar -tzf "$BACKUP_DIR.tar.gz" > /dev/null
-
-echo "Backup completed: $BACKUP_DIR.tar.gz"
-echo "Size: $(du -h "$BACKUP_DIR.tar.gz" | cut -f1)"
+# Customize via environment:
+OPENWA_DATA_DIR=/srv/openwa/data \
+  BACKUP_DIR=/backups/openwa \
+  DATABASE_TYPE=postgres DATABASE_URL=postgres://user:pass@host:5432/openwa \
+  ./scripts/backup.sh
 ```
+
+> The data directory is a Docker **named volume** (`openwa-data`) in the production
+> compose. Run the script where that volume is mounted — e.g. point `OPENWA_DATA_DIR`
+> at the volume's mountpoint, or run it inside a container with `/app/data` mounted.
 
 **Verification:**
 
 ```bash
-# List backup contents
-tar -tzf $BACKUP_DIR.tar.gz
-
-# Check backup size
-du -h $BACKUP_DIR.tar.gz
-
-# Test restore to temp location
-mkdir /tmp/restore-test
-tar -xzf $BACKUP_DIR.tar.gz -C /tmp/restore-test
-ls -la /tmp/restore-test/
-rm -rf /tmp/restore-test
+# The archive MUST contain main.sqlite (auth/audit), the data store, and sessions/
+tar -tzf ./backups/openwa-backup-*.tar.gz
 ```
 
 ---
@@ -570,80 +531,35 @@ rm -rf /tmp/restore-test
 
 **Steps:**
 
+Use the repo's `scripts/restore.sh`. It restores **both** databases (`main.sqlite`
+auth/audit + the data store) and the WhatsApp `sessions/`, and snapshots the current
+data dir first so a bad restore can be undone:
+
 ```bash
-#!/bin/bash
-# scripts/restore.sh
-
-BACKUP_FILE=$1
-
-if [ -z "$BACKUP_FILE" ]; then
-    echo "Usage: ./restore.sh <backup-file.tar.gz>"
-    exit 1
-fi
-
-echo "WARNING: This will overwrite current data!"
-read -p "Continue? (yes/no): " CONFIRM
-if [ "$CONFIRM" != "yes" ]; then
-    exit 0
-fi
-
-set -e
-
-# 1. Stop services
-echo "Stopping services..."
+# 1. Stop the app (so files are quiescent)
 docker compose down
 
-# 2. Extract backup
-echo "Extracting backup..."
-RESTORE_DIR="/tmp/restore-$(date +%s)"
-mkdir -p "$RESTORE_DIR"
-tar -xzf "$BACKUP_FILE" -C "$RESTORE_DIR"
+# 2. Restore from an archive produced by scripts/backup.sh
+#    (operates on the data dir, default ./data; override with OPENWA_DATA_DIR)
+./scripts/restore.sh ./backups/openwa-backup-<timestamp>.tar.gz
 
-# 3. Restore database
-if [ -f "$RESTORE_DIR/*/database.sql" ]; then
-    echo "Restoring PostgreSQL..."
-    docker compose up -d postgres
-    sleep 10
-    docker compose exec -T postgres psql -U postgres openwa < "$RESTORE_DIR"/*/database.sql
-elif [ -f "$RESTORE_DIR/*/openwa.db" ]; then
-    echo "Restoring SQLite..."
-    cp "$RESTORE_DIR"/*/openwa.db ./data/
-fi
+# 3. (Postgres only) the archive contains database.sql — import it manually:
+#    psql "$DATABASE_URL" < ./data/database.sql
 
-# 4. Restore auth sessions
-echo "Restoring auth sessions..."
-rm -rf ./data/.wwebjs_auth
-cp -r "$RESTORE_DIR"/*/.wwebjs_auth ./data/
-
-# 5. Restore configuration (optional - review first)
-echo "Configuration files in backup:"
-ls -la "$RESTORE_DIR"/*/.env "$RESTORE_DIR"/*/docker-compose.yml
-read -p "Restore configuration? (yes/no): " RESTORE_CONFIG
-if [ "$RESTORE_CONFIG" = "yes" ]; then
-    cp "$RESTORE_DIR"/*/.env .
-    cp "$RESTORE_DIR"/*/docker-compose.yml .
-fi
-
-# 6. Start services
-echo "Starting services..."
+# 4. Start the app and CONFIRM an existing API key still authenticates
 docker compose up -d
-
-# 7. Wait for health
-echo "Waiting for health check..."
-sleep 30
-curl http://localhost:2785/health
-
-# 8. Cleanup
-rm -rf "$RESTORE_DIR"
-
-echo "Restore completed!"
+curl -s -X POST -H "X-API-Key: <an-existing-key>" http://localhost:2785/api/auth/validate
 ```
+
+> Restoring `main.sqlite` is the whole point: it carries the API keys and audit log.
+> If a restore leaves you unable to authenticate, the backup that produced the archive
+> did not capture `main.sqlite` — re-run `scripts/backup.sh` (which always does).
 
 **Verification:**
 
 ```bash
 # Health check
-curl http://localhost:2785/health
+curl http://localhost:2785/api/health
 
 # Verify sessions
 curl -H "X-API-Key: $API_KEY" \
@@ -651,7 +567,7 @@ curl -H "X-API-Key: $API_KEY" \
 
 # Verify data integrity
 curl -H "X-API-Key: $API_KEY" \
-  http://localhost:2785/api/sessions/default/messages?limit=1
+  "http://localhost:2785/api/sessions/default/messages?limit=1"
 ```
 
 ---
@@ -690,7 +606,7 @@ sudo systemctl restart nginx
 docker compose restart nginx
 
 # Verify HTTPS
-curl -v https://api.your-domain.com/health
+curl -v https://api.your-domain.com/api/health
 ```
 
 ---
@@ -741,8 +657,12 @@ df -h
 
 ### Resource Estimation
 
+> **Engine note:** The figures below apply to the default `whatsapp-web.js` engine
+> (Chromium/Puppeteer). With `ENGINE_TYPE=baileys` (browser-free), memory per session
+> is significantly lower — re-baseline with your own load profile.
+
 ```
-Per Session Requirements:
+Per Session Requirements (ENGINE_TYPE=whatsapp-web.js):
 - Memory: 300-500MB (average 400MB)
 - CPU: 0.1-0.2 cores idle, 0.5 cores peak
 - Disk: 100MB base + ~1KB per message

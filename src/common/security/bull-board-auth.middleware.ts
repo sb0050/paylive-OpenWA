@@ -1,7 +1,9 @@
 import { Injectable, NestMiddleware, UnauthorizedException, ForbiddenException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Request, Response, NextFunction } from 'express';
 import { AuthService } from '../../modules/auth/auth.service';
 import { ApiKeyRole } from '../../modules/auth/entities/api-key.entity';
+import { resolveClientIp } from '../utils/ip';
 
 /**
  * Protects the Bull Board UI (/admin/queues).
@@ -9,12 +11,17 @@ import { ApiKeyRole } from '../../modules/auth/entities/api-key.entity';
  * Bull Board is mounted as raw Express middleware by @bull-board/nestjs, so the
  * global ApiKeyGuard — which only runs on Nest controller handlers — does not
  * cover it. This middleware requires a valid ADMIN-role API key, supplied via
- * the X-API-Key header, an Authorization: Bearer token, or an ?apiKey query
- * param (the latter for direct browser access).
+ * the X-API-Key header or an Authorization: Bearer token.
+ *
+ * The ?apiKey query-string fallback was removed: an ADMIN key in the
+ * URL leaks into proxy/access logs, browser history, bookmarks, and the Referer header.
  */
 @Injectable()
 export class BullBoardAuthMiddleware implements NestMiddleware {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly configService: ConfigService,
+  ) {}
 
   async use(req: Request, _res: Response, next: NextFunction): Promise<void> {
     try {
@@ -42,13 +49,14 @@ export class BullBoardAuthMiddleware implements NestMiddleware {
     const authHeader = req.headers['authorization'];
     if (authHeader?.startsWith('Bearer ')) return authHeader.slice(7);
 
-    const queryKey = req.query?.apiKey;
-    if (typeof queryKey === 'string' && queryKey) return queryKey;
-
+    // No ?apiKey query fallback — an admin key in the URL leaks into logs/history.
     return undefined;
   }
 
   private getClientIp(req: Request): string {
-    return req.socket?.remoteAddress || req.ip || '';
+    // Mirror the ApiKeyGuard's IP model so allowedIps is enforced consistently for the queue UI:
+    // X-Forwarded-For is honored only behind a configured trusted proxy.
+    const trustedProxies = this.configService.get<string[]>('security.trustedProxies') ?? [];
+    return resolveClientIp(req, trustedProxies);
   }
 }
