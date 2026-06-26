@@ -1,10 +1,5 @@
 import { EventEmitter } from 'events';
-<<<<<<< HEAD
-import * as fs from 'fs';
-import { Client, LocalAuth, MessageMedia, MessageTypes } from 'whatsapp-web.js';
-=======
 import { Client, LocalAuth, MessageMedia, MessageTypes, WAState, type Message } from 'whatsapp-web.js';
->>>>>>> upstream/main
 import * as qrcode from 'qrcode';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -889,30 +884,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       this.logger.debug(`resolveContactPhone failed for ${contactId}`, {
         error: error instanceof Error ? error.message : String(error),
       });
-      return null;
-    }
-  }
-
-  async resolvePhoneNumber(contactId: string): Promise<string | null> {
-    this.ensureReady();
-    try {
-      // getContactLidAndPhone résout le vrai numéro même pour un id `@lid`.
-      const res = await (
-        this.client as unknown as {
-          getContactLidAndPhone: (
-            ids: string[],
-          ) => Promise<Array<{ lid?: string; pn?: string }>>;
-        }
-      ).getContactLidAndPhone([contactId]);
-      const pn = res?.[0]?.pn || null; // ex. "33612345678@c.us"
-      if (!pn) return null;
-      const digits = String(pn).split('@')[0].replace(/\D/g, '');
-      return digits || null;
-    } catch (error) {
-      this.logger.warn(
-        `resolvePhoneNumber failed: ${contactId}`,
-        String(error),
-      );
       return null;
     }
   }

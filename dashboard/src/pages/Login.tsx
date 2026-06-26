@@ -2,12 +2,8 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Languages } from 'lucide-react';
 import { GithubIcon } from '../components/GithubIcon';
-<<<<<<< HEAD
 import { authApi } from '../services/api';
-=======
 import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
-import { API_BASE_URL } from '../services/api';
->>>>>>> upstream/main
 import './Login.css';
 
 interface LoginProps {
@@ -36,20 +32,8 @@ export function Login({ onLogin }: LoginProps) {
     setError('');
 
     try {
-<<<<<<< HEAD
       const data = await authApi.validate(apiKey);
       if (data.valid) {
-=======
-      const response = await fetch(`${API_BASE_URL}/auth/validate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': apiKey,
-        },
-      });
-
-      if (response.ok) {
->>>>>>> upstream/main
         onLogin(apiKey);
       } else {
         setError(t('login.invalidKey'));

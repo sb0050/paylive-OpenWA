@@ -1,7 +1,9 @@
 // API Service Layer for OpenWA Dashboard
 // Centralized API client with TypeScript types
 
-<<<<<<< HEAD
+// Resolve the API base URL. Default '/api' (same-origin single-container setup). For a
+// split-origin deployment, set VITE_API_URL to the API origin (the '/api' suffix is
+// appended here, and not doubled if VITE_API_URL already ends with '/api') (#91).
 const normalizeApiBaseUrl = (url?: string) => {
   if (!url) return '/api';
 
@@ -10,18 +12,6 @@ const normalizeApiBaseUrl = (url?: string) => {
 };
 
 export const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_URL);
-=======
-// Resolve the API base URL. By default this is the same-origin relative path '/api',
-// correct when the dashboard and API are served from the same origin (the default
-// single-container setup). For a split-origin deployment (dashboard hosted separately
-// from the API), set VITE_API_URL at build time to the API ORIGIN — e.g.
-// `VITE_API_URL=https://gateway.example.com` — and the '/api' prefix is appended here.
-// Previously VITE_API_URL was documented but never read, so the dashboard always called
-// same-origin '/api' and a split deployment failed with "Invalid API Key" (#91).
-// Exported so direct fetches (e.g. auth/validate in Login.tsx / App.tsx) honor VITE_API_URL
-// too — otherwise split-origin deployments break. Empty VITE_API_URL → '/api'.
-export const API_BASE_URL = `${(import.meta.env.VITE_API_URL ?? '').replace(/\/+$/, '')}/api`;
->>>>>>> upstream/main
 
 // =============================================================================
 // Types
@@ -349,7 +339,6 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   return response.json();
 }
 
-<<<<<<< HEAD
 export const authApi = {
   validate: (apiKey: string) =>
     request<{ valid: boolean; role?: string }>('/auth/validate', {
@@ -357,7 +346,7 @@ export const authApi = {
       headers: { 'X-API-Key': apiKey },
     }),
 };
-=======
+
 /** Like {@link request} but returns the raw response text — e.g. a plugin's HTML config-UI bundle. */
 async function requestText(endpoint: string): Promise<string> {
   const apiKey = sessionStorage.getItem('openwa_api_key');
@@ -380,7 +369,6 @@ async function requestText(endpoint: string): Promise<string> {
 
   return response.text();
 }
->>>>>>> upstream/main
 
 // =============================================================================
 // Session API

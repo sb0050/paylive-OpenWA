@@ -421,12 +421,6 @@ export interface IWhatsAppEngine {
   getContactById(contactId: string): Promise<Contact | null>;
   checkNumberExists(number: string): Promise<boolean>;
   /**
-<<<<<<< HEAD
-   * Résout le vrai numéro de téléphone (chiffres) d'un contact à partir de son
-   * id — y compris quand l'id est un `@lid` (confidentialité WhatsApp).
-   */
-  resolvePhoneNumber(contactId: string): Promise<string | null>;
-=======
    * Resolve a phone number to its canonical chat id in the engine's native format, or null if the
    * number is not registered. The engine owns the JID scheme, so callers never build it themselves.
    */
@@ -437,7 +431,6 @@ export interface IWhatsAppEngine {
    * engine's native scheme; the adapter decides how to resolve it.
    */
   resolveContactPhone(contactId: string): Promise<string | null>;
->>>>>>> upstream/main
 
   // Groups - Basic
   getGroups(): Promise<Group[]>;

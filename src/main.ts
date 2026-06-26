@@ -15,14 +15,9 @@ import {
 } from './config/bootstrap-security';
 import { BullBoardAuthMiddleware } from './common/security/bull-board-auth.middleware';
 import { AuthService } from './modules/auth/auth.service';
-<<<<<<< HEAD
-import { LoggerService, LogLevel } from './common/services/logger.service';
-import { Request, Response, NextFunction } from 'express';
-=======
 import { Request, Response, NextFunction, json, urlencoded } from 'express';
 import { writeSecretFile } from './common/utils/secret-file';
 import { clearBlankEnv, BLANK_SHADOWED_ENV_KEYS } from './config/env-precedence';
->>>>>>> upstream/main
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -103,24 +98,8 @@ STORAGE_PATH=./data/media
 }
 
 async function bootstrap() {
-<<<<<<< HEAD
-  // Niveau de log applicatif (LoggerService custom). Par défaut INFO ; mettre
-  // LOG_LEVEL=debug pour voir les logs DEBUG (ex. « Message received » du moteur
-  // WhatsApp) sans changer le reste du comportement applicatif (NODE_ENV intact).
-  const rawLogLevel = String(process.env.LOG_LEVEL || '').toLowerCase();
-  const allowedLogLevels = Object.values(LogLevel) as string[];
-  if (allowedLogLevels.includes(rawLogLevel)) {
-    LoggerService.setLogLevel(rawLogLevel as LogLevel);
-    console.log(`[Bootstrap] Log level set to: ${rawLogLevel}`);
-  } else if (rawLogLevel) {
-    console.warn(
-      `[Bootstrap] LOG_LEVEL invalide "${rawLogLevel}" — ignoré (valeurs: ${allowedLogLevels.join(', ')})`,
-    );
-  }
-
-  const app = await NestFactory.create(AppModule);
-=======
   // Apply the operator-configured log verbosity (LOG_LEVEL) before anything logs. Unset/invalid → INFO.
+  // (Préserve la fonctionnalité LOG_LEVEL du fork : LOG_LEVEL=debug → logs DEBUG du moteur WhatsApp.)
   const requestedLevel = process.env.LOG_LEVEL?.trim().toLowerCase();
   if (requestedLevel && (Object.values(LogLevel) as string[]).includes(requestedLevel)) {
     LoggerService.setLogLevel(requestedLevel as LogLevel);
@@ -156,7 +135,6 @@ async function bootstrap() {
   const bodyLimit = resolveBodyLimit(process.env.BODY_SIZE_LIMIT);
   app.use(json({ limit: bodyLimit }));
   app.use(urlencoded({ extended: true, limit: bodyLimit }));
->>>>>>> upstream/main
 
   // Enable shutdown hooks for graceful shutdown
   app.enableShutdownHooks();
