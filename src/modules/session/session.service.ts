@@ -594,9 +594,40 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       },
       onMessage: (message): void => {
         if (!this.isLiveEngine(id, engine)) return;
+
+        // [order-debug] Trace temporaire « prise de commande ». Logge TOUT message
+        // entrant (avant le filtre status) au niveau INFO pour qu'il apparaisse sans
+        // LOG_LEVEL=debug. Montre si « pl <ref> » (texte) et image+légende « pl »
+        // arrivent bien jusqu'ici, avec/ sans média. À retirer une fois validé.
+        {
+          const dbgBody = String(message.body || '').slice(0, 80);
+          const dbgMedia = (message as {
+            media?: { mimetype?: string; data?: string; omitted?: boolean; sizeBytes?: number };
+          }).media;
+          const dbgHasMedia = Boolean(dbgMedia);
+          // Distingue un média RÉELLEMENT téléchargé (data présent) d'une enveloppe
+          // « omitted » (image > MEDIA_DOWNLOAD_MAX_BYTES) : sans `data`, le worker
+          // PayLive ne reconstruit pas le média et la commande image+légende échoue.
+          const dbgDataLen = typeof dbgMedia?.data === 'string' ? dbgMedia.data.length : 0;
+          const dbgMediaState = !dbgHasMedia
+            ? 'none'
+            : dbgMedia?.omitted
+              ? `OMITTED(${dbgMedia.sizeBytes ?? '?'}o, >cap)`
+              : `data(${dbgDataLen}b64)`;
+          const looksLikeOrder =
+            /^\s*pl\s+\S+/i.test(dbgBody) || (dbgHasMedia && /\bpl\b/i.test(dbgBody));
+          this.logger.log(
+            `[order-debug] inbound session=${id} from=${message.from} type=${message.type} ` +
+              `fromMe=${message.fromMe} status=${message.isStatusBroadcast ? 'broadcast' : 'normal'} ` +
+              `media=${dbgMediaState}${dbgMedia?.mimetype ? `(${dbgMedia.mimetype})` : ''} ` +
+              `order=${looksLikeOrder} body="${dbgBody}"`,
+          );
+        }
+
         // Status/Story posts arrive via the inbound path for some engines; don't persist or webhook them.
         // Mirrors the isStatusBroadcast guard in onMessageCreate below.
         if (message.isStatusBroadcast) {
+          this.logger.log(`[order-debug] ignoré: status/story broadcast (from=${message.from})`);
           return;
         }
         this.logger.debug(`Message received from ${message.from}`, {
@@ -619,6 +650,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           .then(async ({ continue: shouldContinue, data: finalMessage }) => {
             if (!shouldContinue) {
               // A plugin handled the event and asked to stop the chain (continue: false).
+              this.logger.log(
+                `[order-debug] hook a stoppé la chaîne (continue:false) — message non émis (from=${message.from})`,
+              );
               return;
             }
 
@@ -670,6 +704,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               }
             }
             if (!isNewMessage) {
+              this.logger.log(`[order-debug] doublon ignoré (déjà persisté/émis) msg=${incoming.id}`);
               return; // duplicate re-fire — the original already persisted and dispatched
             }
 
@@ -677,6 +712,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             void this.webhookService.dispatch(id, 'message.received', finalMessage);
             // Emit real-time event to WebSocket clients
             this.eventsGateway.emitMessage(id, finalMessage);
+            this.logger.log(
+              `[order-debug] émis → webhook + Socket.IO (message.received) msg=${incoming.id} ` +
+                `type=${incoming.type} media=${Boolean(incoming.media)} body="${String(incoming.body || '').slice(0, 80)}"`,
+            );
           })
           .catch(err => this.logger.error(`onMessage handler failed for ${id}`, String(err)));
       },
