@@ -72,14 +72,28 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     this.logger.log('WebSocket Gateway initialized');
   }
 
+  /**
+   * Read the API key from the socket handshake (auth field → header → query fallback).
+   * Lives on the handshake, so it's available synchronously on every event handler —
+   * unlike `client.data`, which is only populated once the async `handleConnection`
+   * resolves. handleSubscribe uses this as a fallback to avoid a connect/subscribe race
+   * (a client that emits `subscribe` inside its `connect` handler can be processed before
+   * handleConnection's `await validateApiKey` has stored `client.data.rawApiKey`).
+   */
+  private extractApiKey(client: Socket): string | undefined {
+    const handshakeAuth = client.handshake.auth as { apiKey?: string } | undefined;
+    return (
+      handshakeAuth?.apiKey ||
+      (client.handshake.headers['x-api-key'] as string) ||
+      (client.handshake.query.apiKey as string) ||
+      undefined
+    );
+  }
+
   async handleConnection(client: Socket) {
     // Prefer Socket.IO's `auth` field (not logged in URLs), then the header; the query
     // param is a deprecated transition fallback (the key leaks into access logs).
-    const handshakeAuth = client.handshake.auth as { apiKey?: string } | undefined;
-    const apiKey =
-      handshakeAuth?.apiKey ||
-      (client.handshake.headers['x-api-key'] as string) ||
-      (client.handshake.query.apiKey as string);
+    const apiKey = this.extractApiKey(client);
 
     if (!apiKey) {
       this.logger.warn(`Client ${client.id} rejected: No API key provided`);
@@ -142,7 +156,11 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
     // Re-validate the API key on every subscribe: a long-lived socket whose key was
     // revoked/expired after connect must not be able to keep opening new subscriptions.
-    const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey;
+    // Fall back to the handshake key when `client.data` isn't populated yet — a client
+    // that subscribes inside its `connect` handler can race the async handleConnection
+    // (which sets rawApiKey only after `await validateApiKey`). The handshake travels
+    // with the socket, so it's always readable here.
+    const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey ?? this.extractApiKey(client);
     let subscriberKey: { allowedSessions?: string[] | null } | null;
     try {
       subscriberKey = rawApiKey ? await this.authService.validateApiKey(rawApiKey) : null;

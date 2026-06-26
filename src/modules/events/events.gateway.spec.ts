@@ -109,6 +109,22 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(sock.join).toHaveBeenCalled();
   });
 
+  it('subscribes via the handshake key when client.data is not yet populated (connect/subscribe race)', async () => {
+    // Simulate a client that emits `subscribe` inside its `connect` handler, before the async
+    // handleConnection has stored `client.data.rawApiKey`. The handshake still carries the key.
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
+    const sock = makeSocket({ apiKey: 'good' }); // data:{} — handleConnection NOT awaited yet
+
+    const res = (await gateway.handleMessage(
+      asSocket(sock),
+      subscribeMsg('sess-1', ['message.received']),
+    )) as WSSubscribedResponse;
+
+    expect(res.type).toBe('subscribed');
+    expect(sock.join).toHaveBeenCalled();
+    expect(sock.disconnect).not.toHaveBeenCalled();
+  });
+
   it('rejects a subscription to a reserved, never-emitted event (group.*) with INVALID_EVENTS', async () => {
     authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
     const sock = makeSocket({ apiKey: 'good' });
