@@ -27,13 +27,15 @@ export { QUEUE_NAMES } from './queue-names';
           host: configService.get<string>('redis.host', 'localhost'),
           port: configService.get<number>('redis.port', 6379),
           password: configService.get<string>('redis.password'),
+          connectTimeout: configService.get<number>('redis.connectTimeoutMs', 5000),
+          enableOfflineQueue: false,
         },
       }),
     }),
     BullModule.registerQueue({
       name: QUEUE_NAMES.WEBHOOK,
       // Auto-evict finished jobs so completed/failed webhook payloads don't accumulate in Redis
-      // unbounded (M19). Keep a small recent window for debugging; cap age too.
+      // unbounded. Keep a small recent window for debugging; cap age too.
       defaultJobOptions: {
         removeOnComplete: { age: 3600, count: 1000 },
         removeOnFail: { age: 86400, count: 5000 },

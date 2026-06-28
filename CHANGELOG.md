@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-06-28
+
+### Added
+
+- **Bounded list pagination.** `GET /sessions` and `GET /webhooks` (and the matching agent tools) now accept `limit` (1–1000, default 1000) and `offset` query parameters, so large deployments can page through results instead of receiving an unbounded list. (#496)
+- **Concurrent-session cap.** New `MAX_CONCURRENT_SESSIONS` env (default `0` = unlimited) caps how many WhatsApp engines may run or initialize at once, protecting memory/Chromium-constrained hosts. (#496)
+- **Configurable Redis connect timeout.** New `REDIS_CONNECT_TIMEOUT_MS` (default `5000`) bounds how long the queue and cache connections wait when reaching Redis. (#496)
+
+### Fixed
+
+- **Webhook delivery during a Redis outage.** The webhook queue producer now fails fast instead of buffering indefinitely when Redis is unreachable, falling back to direct (signed, idempotent) delivery; the queue Worker keeps its offline queue so it still tolerates brief reconnects. (#496)
+- **Accurate session stats at scale.** `GET /sessions/stats` aggregates status counts in the database, so totals stay correct on deployments with more sessions than the list cap. (#496)
+- **Plugin storage key safety & portability.** Plugin storage keys are validated and encoded to filesystem-safe filenames (JID-style keys now work on Windows), with backward-compatible reads/deletes of pre-existing files. (#496)
+
+### Changed
+
+- Refreshed project documentation, roadmap, and testing strategy against the current baseline. (#496)
+
+## [0.7.8] - 2026-06-28
+
+### Added
+
+- **Optional inbound-media skip.** New `MEDIA_DOWNLOAD_ENABLED` flag (default `true`) lets operators skip downloading inbound media entirely on both the whatsapp-web.js and Baileys engines — useful for text-only or low-resource deployments. When disabled, inbound messages omit the `media` field and report `hasMedia: false` in webhooks and the dashboard. Thanks @spidgrou. (#492)
+
+### Fixed
+
+- External-S3 setups no longer silently fall back to local disk after upgrading: `docker-compose.yml` again forwards the legacy `S3_ACCESS_KEY` / `S3_SECRET_KEY` (alongside the canonical `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`) so an existing `.env` keeps reaching the container, and the legacy names are blank-cleared so they can't shadow the dashboard config. (#488 follow-up)
+- The production default-secret guard no longer skips a weak credential for a host-pinned **external** datastore just because the built-in flag is set: the built-in exemption now requires both the `*_BUILTIN` flag **and** an internal host (`postgres` / `minio`), so an external Postgres/MinIO with a default password is still rejected in production. (#488 follow-up)
+- The Infrastructure page now shows an error + retry (instead of an editable form seeded from defaults) when the live `/infra/status` can't be loaded, so a save can no longer flip a running built-in database/Redis/storage to external+empty. (#488 follow-up)
+- `/infra/status` no longer blocks on the WhatsApp Web version registry fetch, and that fetch is rate-limited after a failure, so a firewalled/offline host no longer stalls up to 5s on every status poll and every session start/reconnect. (#488 follow-up)
+- A replayed `message.sent` WebSocket echo no longer downgrades a chat message already shown as delivered/read; the live-append path now applies the same forward-only delivery-status merge as the ack path. (#484 follow-up)
+
+### Changed
+
+- **Italian translation update.** Refreshed the Italian (`it`) dashboard locale. Thanks @albanobattistella. (#491)
+
+## [0.7.7] - 2026-06-28
+
+### Added
+
+- Dashboard **chat thread UX**: URLs in messages are now clickable links, WhatsApp text formatting (bold/italic/strikethrough/monospace) renders, images open in a photo lightbox, and the scroll position is remembered per chat. Thanks @softronicve. (#484)
+- The Infrastructure page now shows the actual **WhatsApp Web build** the whatsapp-web.js engine is using (e.g. `2.3000.1042251103-alpha`) and how it was chosen (pinned via `WWEBJS_WEB_VERSION`, auto-resolved, or native), surfaced via `/infra/status`. The engine card previously showed only the npm library version (`whatsapp-web.js 1.34.7`), which is unrelated to the WA Web build that actually governs connection stability. (#488)
+- Infrastructure data **backup & restore**: export all Data-DB tables to a JSON file and import them back, wired into the database-switch flow. When you change the database backend, the restart dialog now warns that the new database starts empty and offers a one-click backup before switching; a storage switch warns that existing media is not moved. (#488)
+- The Infrastructure page flags any database/redis/storage setting that is **pinned by an environment variable** (its running value differs from the saved config), so it's clear a dashboard change won't apply until that variable is unset, instead of the control silently having no effect. (#488)
+- The storage card now warns when **S3 is selected but unreachable** (a dead/misconfigured bucket no longer shows a misleading green badge), via a new `s3Available` field on `/infra/status`; the check re-probes (throttled) rather than latching the boot-time result, so a bundled MinIO that comes up after the app self-corrects. A backup import that exceeds the request size limit now reports an actionable message (raise `BODY_SIZE_LIMIT`) instead of a bare "Payload Too Large". (#488)
+- Data-loss & availability hardening for the new infra flows: importing a backup now **refuses an empty/garbage file** (it no longer wipes the database and reports success) and asks for confirmation first; selecting the **built-in Postgres/MinIO no longer crash-loops a production boot** on the default-secret guard (the bundled containers run on the internal-only network); and a transient failure fetching the WhatsApp Web version is no longer cached, so it retries instead of permanently falling back. (#488)
+- Human-readable console logs: the `LoggerService` now renders a colorized, NestJS-style line (`[OpenWA] <pid> - <timestamp> <LEVEL> [Context] <message>` with dimmed `key=value` metadata and stack traces on their own line) instead of always emitting raw JSON, so application logs line up visually with NestJS's own framework logs. The format defaults to structured JSON in production (`NODE_ENV=production`, for containers and log aggregators) and human-readable pretty everywhere else, and can be pinned with `LOG_FORMAT=pretty|json`. `NO_COLOR` / `FORCE_COLOR` are honored. JSON output is byte-for-byte unchanged when selected. (#469)
+
+### Fixed
+
+- whatsapp-web.js sessions that scanned the QR then immediately disconnected (looping `qr → authenticating → disconnected`) when no `WWEBJS_WEB_VERSION` was pinned — the common Docker default. The engine now auto-resolves the current known-good WhatsApp Web build from the wppconnect `wa-version` registry and pins it, instead of relying on whatsapp-web.js's auto-select which could latch onto an incompatible bleeding-edge build that authenticates but never reaches "ready". `WWEBJS_WEB_VERSION=off` keeps the old native auto-select; an explicit version still pins exactly. (#488)
+- Dashboard message-analytics charts no longer silently vanish on PostgreSQL: `/stats/messages` (top-chats) ordered by an unquoted mixed-case alias (`ORDER BY messageCount`), which PostgreSQL case-folds and rejects with `column "messagecount" does not exist` (500). It now orders by the aggregate directly, so the query — and the dashboard charts it feeds — work on PostgreSQL as they already did on SQLite. The chart section also shows a clear notice on a real error instead of rendering nothing (it previously treated every error as a non-admin 403 and hid itself). (#488)
+- The Infrastructure page now shows what is **actually running** for the database, Redis, storage, and engine — the badge/selected card follow the live `/infra/status` instead of the saved `data/.env.generated`, which could disagree when a setting is supplied via environment variable. Previously a stack running PostgreSQL via `DATABASE_TYPE=postgres` showed "SQLite" (the first-run default still in the saved file). `/infra/status` now also reports `redis.enabled`. (#488)
+- The "Use Built-in PostgreSQL/Redis/MinIO Container" toggles now reflect whether OpenWA's **bundled container is actually running** and backing the service (detected from the labeled container + the configured host), not just the saved intent — so a Postgres stack started via the `postgres` compose profile correctly shows built-in, and a stopped/external one shows off. Falls back to the saved flag when Docker isn't reachable. (#488)
+- Switching **away** from a built-in backend (built-in → external/disabled) now tears down the bundled container reliably even after a page reload: removal is derived server-side from the saved `*_BUILTIN` flags + the running labeled containers, instead of only trusting the browser's in-memory list (which reset on reload and left the container orphaned). Named volumes are preserved, so re-enabling reuses the data. (#488)
+- Dashboard "by type" message chart: each message type now gets a stable, distinct color keyed by type name (with a deterministic hash fallback) instead of a rotating array-index palette, so a slice keeps its color when the set of present types changes between requests and types past the eighth no longer collide. (#486)
+- Removed the oversized decorative watermark icons bleeding through the dashboard stat cards. (#488)
+- Dashboard switches for the **database, Redis, and storage** backends now actually take effect after a restart, matching how the engine switch already worked. The bundled `docker-compose.yml` forwards these settings blank (`${VAR:-}`) so the dashboard's saved selection (in `data/.env.generated`) is honored, while a real value set in your `.env`/host still pins it (and the UI now says so). Previously compose forwarded concrete defaults that silently shadowed the dashboard's choice, so switching had no effect under Docker. (#488)
+
+### Changed
+
+- ⚠️ `docker-compose.yml` now forwards the S3 credentials under their canonical names `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` (and adds `S3_REGION`), matching what the app and dashboard read. The legacy `S3_ACCESS_KEY` / `S3_SECRET_KEY` are still accepted as a fallback, so existing setups keep working, but updating your `.env` to the canonical names is recommended. (#488)
+- ⚠️ Database/Redis/storage selection is now sourced from the dashboard-managed `data/.env.generated` when not pinned by an environment variable (see Fixed, above). If you previously relied on the compose file's concrete defaults overriding a stale `data/.env.generated`, set the value explicitly in your `.env`/host to pin it. First-run defaults (SQLite, local storage, Redis off) are unchanged. (#488)
+
+## [0.7.6] - 2026-06-26
+
+### Changed
+
+- CI now runs the dashboard unit tests, and re-runs the client-SDK suites when a server DTO or the engine interface changes (not only on SDK edits), so contract drift is caught at its source. (#478)
+- The Postgres connection pool now applies query/connection timeouts (`statement_timeout`, `idleTimeoutMillis`, `connectionTimeoutMillis`) on the runtime connection, so a stuck query or a saturated pool fails fast instead of hanging requests. The migration connection keeps idle/connection timeouts but never `statement_timeout`, so a long `CREATE INDEX` is not aborted. Env-tunable (`DATABASE_STATEMENT_TIMEOUT_MS`, `DATABASE_IDLE_TIMEOUT_MS`, `DATABASE_CONNECTION_TIMEOUT_MS`), conservative defaults, `0` disables; SQLite is unaffected. (#480)
+
+### Fixed
+
+- A plugin whose enable failed after it had already subscribed hooks no longer leaves stale hook registrations behind; a later successful enable could otherwise dispatch each event to the plugin more than once. (#477)
+- The WebSocket `message.ack` event now carries the same `{ id, messageId, status, ack }` shape over the socket as the matching webhook does — the socket previously omitted `id` and the legacy `ack`. (#477)
+- Reconnect timers are no longer stacked when two disconnects arrive back-to-back, and a terminal engine failure now cancels any pending reconnect so a `FAILED` session cannot be resurrected by a stale timer. (#477)
+- The dashboard recovers from a stale lazy-loaded chunk after a redeploy with a single guarded reload instead of replacing the whole UI with the error screen; the Content-Security-Policy `img-src` now allows `blob:` so the outgoing image-attachment preview renders. (#477)
+- The Baileys engine's number-check (`GET /sessions/:id/contacts/check/:number`) now returns a neutral `<phone>@c.us` id, matching the whatsapp-web.js engine, instead of a raw `@s.whatsapp.net` id. (#477)
+- The data export/import now includes the `lid_mappings` resolution cache, so a backup/restore or a SQLite↔PostgreSQL migration no longer drops it. (#477)
+- The JavaScript client SDK applies the JSON `Content-Type` and `X-API-Key` after caller-supplied headers, so they can no longer be overridden by `defaultHeaders` (matching the Python and PHP SDKs); an unfollowed redirect (HTTP status `0`) now raises a clear error instead of `OpenWA API 0`. (#478)
+- The infrastructure status endpoint reports the active S3 bucket when storage is in S3 mode, instead of only the unused local media path. (#478)
+- The migration CLI now honors the dashboard-written `data/.env.generated`, so `migration:run:prod` targets the configured database (e.g. PostgreSQL) instead of silently defaulting to SQLite. (#479)
+- The first-run generated config writes `STORAGE_LOCAL_PATH` (the key the backend reads) instead of the dead `STORAGE_PATH`. (#479)
+- The Sessions page now keeps the shared dashboard cache in sync, so creating/stopping/deleting a session no longer leaves the Dashboard showing stale session counts or status until a refresh. (#479)
+
+### Security
+
+- The startup banner prints the full admin API key only when it is first created; on subsequent boots the key is masked, so the live credential is not re-written to the log pipeline on every restart. (#478)
+- The production secret guard now rejects a placeholder `REDIS_PASSWORD` (e.g. `changeme`); an empty/unset password is still allowed so passwordless private-network Redis continues to boot. (#478)
+- The published PHP SDK package no longer ships its test suite, PHPUnit config, or `composer.lock`. (#478)
+- The production weak-secret guard now also rejects the common defaults `123456`, `qwerty`, `root`, `test`, and `demo`. Matching stays an exact full-value comparison, so a strong secret that merely contains one of these words is not blocked. (#480)
+- The gateway now logs a startup warning when `API_KEY_PEPPER` is unset in production (stored API-key hashes then use plain SHA-256). Advisory only — enabling a pepper invalidates existing key hashes, so it stays opt-in and is never enforced. (#480)
+
+## [0.7.5] - 2026-06-26
+
+### Fixed
+
+- The stats/analytics endpoint no longer crashes on PostgreSQL. The message time-series query grouped by an output alias named `timestamp` — a reserved type keyword in PostgreSQL — so `GROUP BY timestamp` was not read as the alias and the query failed with _"column m.createdAt must appear in the GROUP BY clause"_ (SQLite tolerated it, so unit tests on the SQLite test DB never caught it). The alias is now `bucket`; the API response field is unchanged. (#474)
+
+### Documentation
+
+- Added a Traefik / Coolify reverse-proxy guide to the troubleshooting FAQ: WebSocket forwarding, the `docker-proxy` double-hop that causes intermittent `504`s behind Coolify (held-open Socket.IO connections exhausting the pool to the single-port upstream), and idle-timeout tuning. (#467)
+
 ## [0.7.4] - 2026-06-25
 
 ### Fixed

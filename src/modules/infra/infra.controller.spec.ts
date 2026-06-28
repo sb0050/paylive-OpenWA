@@ -36,6 +36,7 @@ import { Message, MessageDirection, MessageStatus } from '../message/entities/me
 import { MessageBatch, BatchStatus } from '../message/entities/message-batch.entity';
 import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
+import { LidMapping } from '../../engine/identity/lid-mapping.entity';
 
 describe('InfraController access control (Vuln 2)', () => {
   const reflector = new Reflector();
@@ -456,6 +457,31 @@ describe('InfraController.importData round-trips export-data (no silent message/
     expect((await ds.getRepository(Message).findOneByOrFail({ id: 'm1' })).body).toBe('keep me');
     expect(await ds.getRepository(Session).findOneBy({ id: 's2' })).toBeNull();
   });
+
+  it('refuses an empty/garbage backup — does not wipe existing data (#488 review must-fix)', async () => {
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm1',
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a',
+        to: 'b',
+        body: 'keep me',
+        type: 'text',
+        direction: MessageDirection.INCOMING,
+        status: MessageStatus.DELIVERED,
+      }),
+    );
+
+    // A wrong/empty file (no rows to restore) must NOT commit the all-rows DELETE and report success.
+    const res = await controller.importData({ tables: {} });
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings.length).toBeGreaterThan(0);
+    expect(await ds.getRepository(Session).count()).toBe(1);
+    expect(await ds.getRepository(Message).count()).toBe(1);
+  });
 });
 
 describe('InfraController.import/export preserves every data-DB table', () => {
@@ -469,7 +495,7 @@ describe('InfraController.import/export preserves every data-DB table', () => {
     ds = new DataSource({
       type: 'sqlite',
       database: ':memory:',
-      entities: [Session, Webhook, Message, MessageBatch, Template, BaileysStoredMessage],
+      entities: [Session, Webhook, Message, MessageBatch, Template, BaileysStoredMessage, LidMapping],
       synchronize: true,
     });
     await ds.initialize();
@@ -495,6 +521,28 @@ describe('InfraController.import/export preserves every data-DB table', () => {
         lastActiveAt: null,
       }),
     );
+
+  // lid_mappings is the persisted lid->phone cache; it is NOT a FK to sessions, so the sessions DELETE
+  // never touches it — but export omitted it, so a backup→restore into a fresh DB dropped it entirely.
+  it('restores lid_mappings instead of dropping them on a backup→restore', async () => {
+    await seedSession('s1');
+    const lidRepo = ds.getRepository(LidMapping);
+    await lidRepo.save(lidRepo.create({ lid: '111', phone: '628111', sessionId: 's1' }));
+    await lidRepo.save(lidRepo.create({ lid: '222', phone: null, sessionId: 's1' })); // negative cache
+
+    const dump = await controller.exportData();
+    expect((dump.tables as unknown as { lidMappings?: unknown[] }).lidMappings).toHaveLength(2);
+
+    // Simulate restoring into a fresh data DB (the documented backend-migration flow).
+    await lidRepo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(await lidRepo.count()).toBe(2);
+    expect((await lidRepo.findOneByOrFail({ lid: '111' })).phone).toBe('628111');
+    expect((await lidRepo.findOneByOrFail({ lid: '222' })).phone).toBeNull();
+  });
 
   // DELETE FROM sessions cascades to templates + baileys_stored_messages (both FK ON DELETE CASCADE),
   // so an import that never re-inserts them permanently wipes both on the documented backup flow.
@@ -590,6 +638,14 @@ describe('InfraController.getConfig (#226)', () => {
 });
 
 describe('InfraController.getStatus engine (F7 — reads the real engine.puppeteer.* keys)', () => {
+  // Pin the WA-Web version so getStatus does not fire the wa-version registry fetch (no network in tests).
+  const savedWebVer = process.env.WWEBJS_WEB_VERSION;
+  beforeAll(() => (process.env.WWEBJS_WEB_VERSION = 'off'));
+  afterAll(() => {
+    if (savedWebVer === undefined) delete process.env.WWEBJS_WEB_VERSION;
+    else process.env.WWEBJS_WEB_VERSION = savedWebVer;
+  });
+
   it('reports the saved headless/browserArgs instead of stale defaults from non-existent flat keys', async () => {
     const map: Record<string, unknown> = {
       'engine.type': 'whatsapp-web.js',
@@ -604,11 +660,11 @@ describe('InfraController.getStatus engine (F7 — reads the real engine.puppete
       config as never,
       ds as never,
       ds as never,
-      {} as never,
-      {} as never,
+      {} as never, // engineFactory
+      { isDockerAvailable: () => false } as never, // dockerService — no Docker in unit tests
       cache as never,
-      {} as never,
-      {} as never,
+      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
+      {} as never, // shutdownService
     );
 
     const status = await controller.getStatus();
@@ -619,6 +675,14 @@ describe('InfraController.getStatus engine (F7 — reads the real engine.puppete
 });
 
 describe('InfraController.getStatus storage (reads the real storage.localPath key)', () => {
+  // Pin the WA-Web version so getStatus does not fire the wa-version registry fetch (no network in tests).
+  const savedWebVer = process.env.WWEBJS_WEB_VERSION;
+  beforeAll(() => (process.env.WWEBJS_WEB_VERSION = 'off'));
+  afterAll(() => {
+    if (savedWebVer === undefined) delete process.env.WWEBJS_WEB_VERSION;
+    else process.env.WWEBJS_WEB_VERSION = savedWebVer;
+  });
+
   const buildController = (map: Record<string, unknown>) => {
     const config = { get: (key: string, def?: unknown) => (key in map ? map[key] : def) };
     const cache = { isAvailable: () => Promise.resolve(false) };
@@ -627,11 +691,11 @@ describe('InfraController.getStatus storage (reads the real storage.localPath ke
       config as never,
       ds as never,
       ds as never,
-      {} as never,
-      {} as never,
+      {} as never, // engineFactory
+      { isDockerAvailable: () => false } as never, // dockerService — no Docker in unit tests
       cache as never,
-      {} as never,
-      {} as never,
+      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
+      {} as never, // shutdownService
     );
   };
 
@@ -648,6 +712,17 @@ describe('InfraController.getStatus storage (reads the real storage.localPath ke
   it('falls back to ./data/media (matching StorageService) when storage.localPath is unset', async () => {
     const status = await buildController({ 'storage.type': 'local' }).getStatus();
     expect(status.storage.path).toBe('./data/media');
+  });
+
+  it('reports the bucket in S3 mode so the active backend is visible', async () => {
+    const status = await buildController({ 'storage.type': 's3', 'storage.s3.bucket': 'my-openwa-bucket' }).getStatus();
+    expect(status.storage.type).toBe('s3');
+    expect(status.storage.bucket).toBe('my-openwa-bucket');
+  });
+
+  it('omits bucket in local mode (no fabricated field)', async () => {
+    const status = await buildController({ 'storage.type': 'local' }).getStatus();
+    expect(status.storage.bucket).toBeUndefined();
   });
 });
 

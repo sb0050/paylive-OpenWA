@@ -561,10 +561,11 @@ describe('BaileysAdapter messaging', () => {
     expect(res).toEqual({ id: 'OUT1', timestamp: 1700000001 });
   });
 
-  it('getNumberId resolves via onWhatsApp and returns the jid when it exists', async () => {
+  it('getNumberId resolves via onWhatsApp and returns a NEUTRAL jid (never @s.whatsapp.net)', async () => {
     fakeSock.onWhatsApp.mockResolvedValue([{ jid: '628111@s.whatsapp.net', exists: true }]);
     const adapter = await readyAdapter();
-    await expect(adapter.getNumberId('628111')).resolves.toBe('628111@s.whatsapp.net');
+    // Must cross the engine boundary in the neutral dialect, matching whatsapp-web.js (<phone>@c.us).
+    await expect(adapter.getNumberId('628111')).resolves.toBe('628111@c.us');
     await expect(adapter.checkNumberExists('628111')).resolves.toBe(true);
   });
 
@@ -870,6 +871,44 @@ describe('BaileysAdapter inbound fan-out', () => {
     } finally {
       if (prev === undefined) delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
       else process.env.MEDIA_DOWNLOAD_MAX_BYTES = prev;
+    }
+  });
+
+  it('inbound media: skips download and omits media field when MEDIA_DOWNLOAD_ENABLED=false', async () => {
+    const prev = process.env.MEDIA_DOWNLOAD_ENABLED;
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'false';
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      const baileys = jest.requireMock('@whiskeysockets/baileys') as {
+        getContentType: jest.Mock;
+        downloadMediaMessage: jest.Mock;
+      };
+      baileys.getContentType.mockReturnValue('imageMessage');
+      baileys.downloadMediaMessage.mockClear();
+
+      const onMessage = jest.fn();
+      const adapter = newAdapter();
+      await adapter.initialize({ onMessage });
+      fakeSock.fire('messages.upsert', {
+        type: 'notify',
+        messages: [
+          {
+            key: { remoteJid: '628111@s.whatsapp.net', fromMe: false, id: 'DISABLED1' },
+            message: { imageMessage: { mimetype: 'image/png', caption: 'should not download' } },
+            messageTimestamp: 1700000040,
+          },
+        ],
+      });
+      await new Promise(r => setImmediate(r));
+      expect(onMessage).toHaveBeenCalledTimes(1);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const msg = onMessage.mock.calls[0][0] as { media?: unknown; type: string };
+      expect(msg.type).toBe('image');
+      expect(msg.media).toBeUndefined();
+      expect(baileys.downloadMediaMessage).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.MEDIA_DOWNLOAD_ENABLED;
+      else process.env.MEDIA_DOWNLOAD_ENABLED = prev;
     }
   });
 
