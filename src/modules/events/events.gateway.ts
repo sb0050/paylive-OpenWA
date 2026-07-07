@@ -11,6 +11,8 @@ import {
 import { Server, Socket } from 'socket.io';
 import { Logger } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
+import { AuditService } from '../audit/audit.service';
+import { AuditAction } from '../audit/entities/audit-log.entity';
 import { resolveCorsPolicy } from '../../config/bootstrap-security';
 
 /**
@@ -66,7 +68,10 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
   private logger = new Logger('EventsGateway');
 
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly auditService: AuditService,
+  ) {}
 
   afterInit() {
     this.logger.log('WebSocket Gateway initialized');
@@ -91,12 +96,20 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   async handleConnection(client: Socket) {
-    // Prefer Socket.IO's `auth` field (not logged in URLs), then the header; the query
-    // param is a deprecated transition fallback (the key leaks into access logs).
+    // Read the key via auth → header → query. We deliberately KEEP the query fallback that upstream
+    // dropped for log-hygiene: the PayLive worker connects to OpenWA with `query: { apiKey }`
+    // (workers/src/openwaClient.ts), so removing it here would reject the worker's Socket.IO
+    // connection and break the entire WhatsApp realtime pipeline.
+    // TODO(paylive): migrate the worker to `auth: { apiKey }`, then switch to auth||header only.
     const apiKey = this.extractApiKey(client);
 
     if (!apiKey) {
       this.logger.warn(`Client ${client.id} rejected: No API key provided`);
+      void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
+        ipAddress: client.handshake.address,
+        metadata: { surface: 'websocket' },
+        errorMessage: 'missing API key',
+      });
       client.emit('message', this.createError('UNAUTHORIZED', 'API key required'));
       client.disconnect();
       return;
@@ -115,6 +128,13 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     } catch (error) {
       this.logger.warn(`Client ${client.id} rejected: Auth error`, {
         error: error instanceof Error ? error.message : String(error),
+      });
+      // Audit the rejected credential like the REST guard does, so probing over the WS surface leaves
+      // a forensic trail too. Fire-and-forget: audit logging must never affect the rejection path.
+      void this.auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
+        ipAddress: client.handshake.address,
+        metadata: { surface: 'websocket' },
+        errorMessage: error instanceof Error ? error.message : String(error),
       });
       client.emit('message', this.createError('UNAUTHORIZED', 'Authentication failed'));
       client.disconnect();
@@ -323,9 +343,11 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
-   * Emit a live delivery-status update (neutral DeliveryStatus, e.g. delivered/read/failed).
+   * Emit a live delivery-status update. The payload mirrors the `message.ack` webhook exactly
+   * (`id`, `messageId`, neutral `status`, and the deprecated legacy numeric `ack`) so a socket
+   * client and a webhook consumer see the same shape.
    */
-  emitMessageAck(sessionId: string, data: { messageId: string; status: DeliveryStatus }) {
+  emitMessageAck(sessionId: string, data: { id: string; messageId: string; status: DeliveryStatus; ack: number }) {
     this.emitToRooms(sessionId, 'message.ack', data);
   }
 
@@ -341,18 +363,5 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
    */
   emitMessageReaction(sessionId: string, data: Record<string, unknown>) {
     this.emitToRooms(sessionId, 'message.reaction', data);
-  }
-
-  /**
-   * Emit webhook delivery status (broadcast to all - no session context)
-   */
-  emitWebhookStatus(webhookId: string, success: boolean, error?: string) {
-    // This one broadcasts to all since webhooks don't have session context in the same way
-    this.server.emit('webhook:delivery', {
-      webhookId,
-      success,
-      error,
-      timestamp: new Date().toISOString(),
-    });
   }
 }
