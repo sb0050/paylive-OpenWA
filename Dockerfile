@@ -45,9 +45,15 @@ RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:
 # ===== Stage 2: Production =====
 FROM docker.io/node:22-slim AS production
 
-# Install Chrome/Chromium and required dependencies
+# Install Google Chrome (stable) + runtime deps.
+# The Debian `chromium` package hard-crashes with SIGTRAP ("Trace/breakpoint trap", exit 133) at
+# launch on Railway's current kernel (6.18), even with --no-sandbox/--no-zygote/--single-process and
+# vm.mmap_rnd_bits=28 — proven by launching `chromium about:blank` with no session/profile. So the
+# binary itself is incompatible, not a sandbox/memory/session issue. Google's own Chrome build
+# launches cleanly. amd64-only (Railway runs x86_64, verified). Chrome's .deb declares its own lib
+# deps; apt resolves them from the package lists, which must therefore still be present here — hence
+# the download+install happens BEFORE the final `rm -rf /var/lib/apt/lists/*`.
 RUN apt-get update && apt-get install -y \
-    chromium \
     fonts-liberation \
     libappindicator3-1 \
     libasound2 \
@@ -69,10 +75,16 @@ RUN apt-get update && apt-get install -y \
     gosu \
     curl \
     procps \
+    && curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y /tmp/chrome.deb \
+    && rm -f /tmp/chrome.deb \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Chrome executable path for Puppeteer
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# Chrome executable path for Puppeteer. Currently NOT set in the Railway variables, so this ENV
+# applies as-is. ⚠ If it is ever set there it OVERRIDES this line — keep it aligned to
+# /usr/bin/google-chrome-stable, else the app points at the now-removed /usr/bin/chromium and every
+# session fails to launch.
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 # Create app user for security
