@@ -98,7 +98,18 @@ Create a new session (OPERATOR).
 curl -X POST "$BASE/api/sessions" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "name": "my-bot", "config": { "autoReconnect": true }, "proxyUrl": "http://proxy.example.com:8080", "proxyType": "http" }'
+  -d '{ "name": "my-bot" }'
+```
+
+With an optional per-session egress proxy — only if your network can't reach WhatsApp directly. The
+proxy **must be a real, reachable host**; an unreachable value silently blocks the WhatsApp WebSocket
+(no QR is ever delivered) and `POST /api/sessions/:id/start` returns `504` after ~30s:
+
+```bash
+curl -X POST "$BASE/api/sessions" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "my-bot", "proxyUrl": "http://user:pass@your-real-proxy.host:8080", "proxyType": "http" }'
 ```
 
 #### POST /api/sessions/:id/start
@@ -1085,9 +1096,7 @@ Always returns `501` — settings are read-only at runtime. ADMIN key required (
 
 ```bash
 curl -X PUT "$BASE/api/settings" \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{ "general": { "sessionTimeout": 10 } }'
+  -H "X-API-Key: $API_KEY"
 ```
 
 ### 07.13 Administration (Infrastructure, Plugins, MCP)
@@ -1249,7 +1258,8 @@ curl "$BASE/api/plugins/chat-flow" \
 
 #### GET /api/plugins/:id/config-ui
 
-Fetch a plugin's sandboxed config-UI HTML (for an iframe srcdoc).
+Fetch a plugin's sandboxed config-UI HTML. The dashboard renders it in an opaque-origin iframe,
+uses a `postMessage` bridge for config, and retains any schema form as a fallback.
 
 ```bash
 curl "$BASE/api/plugins/chat-flow/config-ui" \

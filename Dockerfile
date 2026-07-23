@@ -45,15 +45,20 @@ RUN npm run build && npm run dashboard:ci -- --include=dev && npm run dashboard:
 # ===== Stage 2: Production =====
 FROM docker.io/node:22-slim AS production
 
-# Install Google Chrome (stable) + runtime deps.
-# The Debian `chromium` package hard-crashes with SIGTRAP ("Trace/breakpoint trap", exit 133) at
-# launch on Railway's current kernel (6.18), even with --no-sandbox/--no-zygote/--single-process and
-# vm.mmap_rnd_bits=28 — proven by launching `chromium about:blank` with no session/profile. So the
-# binary itself is incompatible, not a sandbox/memory/session issue. Google's own Chrome build
-# launches cleanly. amd64-only (Railway runs x86_64, verified). Chrome's .deb declares its own lib
-# deps; apt resolves them from the package lists, which must therefore still be present here — hence
-# the download+install happens BEFORE the final `rm -rf /var/lib/apt/lists/*`.
+# Navigateur pour Puppeteer, exposé via le symlink /usr/local/bin/puppeteer-chrome
+# (ce que le reste du Dockerfile/code attend).
+#  - amd64 (Railway, x86_64) : Google Chrome STABLE. Le paquet Debian `chromium`
+#    hard-crash en SIGTRAP (exit 133) au lancement sur le kernel Railway (6.18),
+#    même avec --no-sandbox/--no-zygote/--single-process — prouvé avec
+#    `chromium about:blank` sans session/profil. Le binaire lui-même est
+#    incompatible ; le build Google Chrome se lance proprement. On PRÉFÈRE donc
+#    google-chrome-stable à « Chrome for Testing » d'upstream (fix éprouvé).
+#  - arm64 : chromium Debian (build natif ; Chrome/CfT n'a pas de build arm64).
+# La .deb Chrome déclare ses propres deps → apt les résout depuis les listes de
+# paquets, encore présentes ici (install AVANT `rm -rf /var/lib/apt/lists/*`).
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
+    $([ "$TARGETARCH" = arm64 ] && echo chromium) \
     fonts-liberation \
     libappindicator3-1 \
     libasound2 \
@@ -73,18 +78,19 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     dumb-init \
     gosu \
+    patch \
     curl \
     procps \
-    && curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y /tmp/chrome.deb \
-    && rm -f /tmp/chrome.deb \
+    && if [ "$TARGETARCH" != arm64 ]; then \
+         curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+         && apt-get install -y /tmp/chrome.deb \
+         && rm -f /tmp/chrome.deb; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
-# Chrome executable path for Puppeteer. Currently NOT set in the Railway variables, so this ENV
-# applies as-is. ⚠ If it is ever set there it OVERRIDES this line — keep it aligned to
-# /usr/bin/google-chrome-stable, else the app points at the now-removed /usr/bin/chromium and every
-# session fails to launch.
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+# Puppeteer ne télécharge PAS son propre Chromium au npm install : le navigateur
+# est fourni ci-dessus (google-chrome-stable amd64 / chromium arm64) et exposé
+# via le symlink /usr/local/bin/puppeteer-chrome plus bas.
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 # Create app user for security
@@ -95,8 +101,27 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies only
-RUN npm ci --omit=dev && npm cache clean --force
+# Backport upstream whatsapp-web.js#201832 (id._serialized -> id.$1 normalization,
+# broken by WA Web 2.3000.x ~2026-07-14) into the installed dep at build time.
+# The patcher self-disables once whatsapp-web.js ships the fix upstream.
+COPY scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch ./scripts/
+
+# Install production dependencies only, then apply the backport patcher (needs `patch`).
+RUN npm ci --omit=dev && node scripts/patch-wwebjs-201832.js && npm cache clean --force
+
+# Expose le navigateur installé plus haut via un symlink stable.
+#  - amd64 : google-chrome-stable (fix SIGTRAP Railway éprouvé — on N'utilise PAS
+#    « Chrome for Testing » d'upstream ici).
+#  - arm64 : chromium Debian (CfT/Chrome n'ont pas de build linux-arm64).
+# `test -n` fait échouer le build franchement plutôt que de livrer une image cassée.
+RUN if [ "$TARGETARCH" = arm64 ]; then \
+        chrome_path=/usr/bin/chromium; \
+    else \
+        chrome_path=/usr/bin/google-chrome-stable; \
+    fi && \
+    test -n "$chrome_path" && test -x "$chrome_path" && \
+    ln -s "$chrome_path" /usr/local/bin/puppeteer-chrome
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/puppeteer-chrome
 
 # Copy built application from builder stage
 COPY --from=builder /app/dist ./dist

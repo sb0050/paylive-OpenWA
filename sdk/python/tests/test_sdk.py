@@ -110,7 +110,7 @@ class TestClientCore:
 
     def test_exposes_all_resources(self):
         client = make_client(MockBackend())
-        for r in ["sessions", "messages", "contacts", "groups", "webhooks", "chats", "status", "health"]:
+        for r in ["sessions", "messages", "contacts", "groups", "webhooks", "chats", "status", "health", "search", "profile", "calls"]:
             assert hasattr(client, r)
 
 
@@ -178,6 +178,13 @@ class TestMessages:
         assert "/messages/forward" in backend.calls[-3].url
         assert "/messages/react" in backend.calls[-2].url
         assert "/messages/delete" in backend.calls[-1].url
+
+    def test_edit_message(self):
+        backend = MockBackend().on("POST", "/messages/edit", body={"messageId": "m1", "timestamp": 3})
+        res = make_client(backend).messages.edit_message("s1", {"chatId": "a@c.us", "messageId": "m1", "body": "edited"})
+        assert backend.last_call.url == "http://localhost:2785/api/sessions/s1/messages/edit"
+        assert backend.last_call.body == {"chatId": "a@c.us", "messageId": "m1", "body": "edited"}
+        assert res["messageId"] == "m1"
 
     def test_history_and_reactions_path(self):
         backend = MockBackend()
@@ -317,6 +324,72 @@ class TestGroups:
         client.groups.invite_code("s", "g")
         client.groups.revoke_invite_code("s", "g")
         assert "/revoke" in backend.calls[-1].url
+
+
+    def test_join_group(self):
+        backend = MockBackend().on("POST", "/groups/join", body={"success": True, "groupId": "g1@g.us"})
+        res = make_client(backend).groups.join_group("s", {"inviteCode": "ABCxyz"})
+        assert backend.last_call.url == "http://localhost:2785/api/sessions/s/groups/join"
+        assert backend.last_call.body == {"inviteCode": "ABCxyz"}
+        assert res["groupId"] == "g1@g.us"
+
+    def test_group_settings_get_and_update(self):
+        backend = MockBackend()
+        backend.on("GET", "/settings", body={"announce": True, "locked": False, "ephemeralSeconds": 604800})
+        backend.on("PUT", "/settings", body={"success": True, "message": "Group settings updated"})
+        client = make_client(backend)
+        settings = client.groups.get_group_settings("s", "g1@g.us")
+        assert backend.calls[-1].url == "http://localhost:2785/api/sessions/s/groups/g1@g.us/settings"
+        assert settings["announce"] is True
+        assert settings["ephemeralSeconds"] == 604800
+        res = client.groups.update_group_settings("s", "g1@g.us", {"announce": False, "ephemeralSeconds": 0})
+        assert backend.calls[-1].method == "PUT"
+        assert backend.calls[-1].url == "http://localhost:2785/api/sessions/s/groups/g1@g.us/settings"
+        assert backend.calls[-1].body == {"announce": False, "ephemeralSeconds": 0}
+        assert res["success"] is True
+
+
+class TestProfile:
+    def test_set_profile_name_and_status(self):
+        backend = MockBackend()
+        backend.on("PUT", "/profile/name", body={"success": True, "message": "Profile name updated"})
+        backend.on("PUT", "/profile/status", body={"success": True, "message": "Profile status updated"})
+        client = make_client(backend)
+        client.profile.set_profile_name("s", {"name": "My Business"})
+        assert backend.calls[-1].method == "PUT"
+        assert backend.calls[-1].url == "http://localhost:2785/api/sessions/s/profile/name"
+        assert backend.calls[-1].body == {"name": "My Business"}
+        # An empty status clears the about text; the body is forwarded verbatim.
+        client.profile.set_profile_status("s", {"status": ""})
+        assert backend.calls[-1].url == "http://localhost:2785/api/sessions/s/profile/status"
+        assert backend.calls[-1].body == {"status": ""}
+
+    def test_set_profile_picture_url_and_base64(self):
+        backend = MockBackend().on("PUT", "/profile/picture", body={"success": True, "message": "Profile picture updated"})
+        client = make_client(backend)
+        client.profile.set_profile_picture("s", {"url": "https://example.com/avatar.jpg"})
+        assert backend.calls[-1].method == "PUT"
+        assert backend.calls[-1].url == "http://localhost:2785/api/sessions/s/profile/picture"
+        assert backend.calls[-1].body == {"url": "https://example.com/avatar.jpg"}
+        client.profile.set_profile_picture("s", {"base64": "aGVsbG8=", "mimetype": "image/jpeg"})
+        assert backend.calls[-1].body == {"base64": "aGVsbG8=", "mimetype": "image/jpeg"}
+
+
+class TestCalls:
+    def test_reject_call(self):
+        backend = MockBackend().on("POST", "/reject", body={"success": True})
+        res = make_client(backend).calls.reject_call("s", "CALL1")
+        assert backend.last_call.method == "POST"
+        assert backend.last_call.url == "http://localhost:2785/api/sessions/s/calls/CALL1/reject"
+        assert backend.last_call.body is None  # no request body
+        assert res["success"] is True
+
+    def test_reject_call_404_maps_to_not_found(self):
+        backend = MockBackend().on("POST", "/reject", status=404, body={
+            "statusCode": 404, "message": "Call not found or no longer ringing", "error": "Not Found"
+        })
+        with pytest.raises(OpenWANotFoundError):
+            make_client(backend).calls.reject_call("s", "CALL1")
 
 
 class TestContacts:
@@ -502,5 +575,77 @@ class TestLabelsChannelsCatalog:
 
     def test_client_exposes_all_resources(self):
         client = make_client(MockBackend())
-        for r in ["sessions", "messages", "contacts", "groups", "webhooks", "chats", "status", "health", "labels", "channels", "catalog", "templates"]:
+        for r in ["sessions", "messages", "contacts", "groups", "webhooks", "chats", "status", "health", "labels", "channels", "catalog", "templates", "search", "profile", "calls"]:
             assert hasattr(client, r)
+
+
+# ── Search ─────────────────────────────────────────────────────────
+
+
+class TestSearch:
+    def test_search_minimal_required_q(self):
+        backend = MockBackend().on("GET", "/api/search", body={
+            "hits": [], "total": 0, "tookMs": 3, "provider": "builtin-fts",
+        })
+        res = make_client(backend).search.search({"q": "hello"})
+        assert res["total"] == 0
+        assert res["provider"] == "builtin-fts"
+        assert backend.last_call.url == "http://localhost:2785/api/search?q=hello"
+
+    def test_search_forwards_all_optional_filters(self):
+        backend = MockBackend().on("GET", "/api/search", body={
+            "hits": [], "total": 0, "tookMs": 1, "provider": "builtin-fts",
+        })
+        make_client(backend).search.search({
+            "q": "invoice",
+            "sessionId": "s1",
+            "chatId": "628123@c.us",
+            "direction": "incoming",
+            "type": "chat",
+            "from": "628123456789@c.us",
+            "dateFrom": 1720000000000,
+            "dateTo": 1720100000000,
+            "limit": 20,
+            "offset": 40,
+        })
+        url = backend.last_call.url
+        assert url.startswith("http://localhost:2785/api/search?")
+        assert "q=invoice" in url
+        assert "sessionId=s1" in url
+        assert "chatId=628123%40c.us" in url  # @ percent-encoded in query
+        assert "direction=incoming" in url
+        assert "type=chat" in url
+        assert "from=628123456789%40c.us" in url
+        assert "dateFrom=1720000000000" in url
+        assert "dateTo=1720100000000" in url
+        assert "limit=20" in url
+        assert "offset=40" in url
+
+    def test_search_returns_hits_shape(self):
+        hit = {
+            "messageId": "m1", "waMessageId": "wam1", "sessionId": "s1",
+            "chatId": "628123@c.us", "body": "please send the invoice",
+            "snippet": "please send the <mark>invoice</mark>", "timestamp": 1720000000,
+            "type": "chat", "direction": "incoming", "from": "628123456789@c.us",
+            "score": 0.42,
+        }
+        backend = MockBackend().on("GET", "/api/search", body={
+            "hits": [hit], "total": 1, "tookMs": 7, "provider": "builtin-fts",
+        })
+        res = make_client(backend).search.search({"q": "invoice"})
+        assert res["total"] == 1
+        assert res["hits"][0]["messageId"] == "m1"
+        assert res["hits"][0]["snippet"] == "please send the <mark>invoice</mark>"
+        assert res["hits"][0]["score"] == 0.42
+        assert res["hits"][0]["direction"] == "incoming"
+
+    def test_search_none_values_skipped_in_query(self):
+        # None-typed optional filters must be omitted, never sent as the literal "None".
+        backend = MockBackend().on("GET", "/api/search", body={
+            "hits": [], "total": 0, "tookMs": 0, "provider": "builtin-fts",
+        })
+        make_client(backend).search.search({"q": "x", "sessionId": None, "limit": 5})
+        url = backend.last_call.url
+        assert "q=x" in url
+        assert "limit=5" in url
+        assert "sessionId" not in url

@@ -115,12 +115,16 @@ describe('dispatchConversationMedia', () => {
 
 import * as fs from 'fs';
 import * as os from 'os';
-import { PluginLoaderService } from './plugin-loader.service';
+import { PluginLoaderService, seedConfigDefaults } from './plugin-loader.service';
 import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
 import { HookManager } from '../hooks';
 import { PluginStorageService } from './plugin-storage.service';
 import { IPlugin, PluginContext, PluginManifest, PluginStatus, PluginType } from './plugin.interfaces';
+import { SearchProviderRegistry } from '../../modules/search/search-provider.registry';
+import { WorkerThreadChannel } from './sandbox/worker-thread-channel';
+import { PluginWorkerHost } from './sandbox/plugin-worker-host';
+import { PluginLogLevel } from './sandbox/protocol';
 
 describe('PluginLoaderService.registerBuiltInPlugin config', () => {
   function makeLoader(): PluginLoaderService {
@@ -209,7 +213,7 @@ describe('PluginLoaderService — enable/config persistence', () => {
     expect(loader2.getPlugin('persist-test')?.config).toEqual({ execPath: '/new/chromium', headless: true });
   });
 
-  it('reports a re-registered plugin as installed after restart even if it was enabled (no boot auto-enable, no divergence)', () => {
+  it('reports a re-registered plugin as installed: registering never runs it, and the registry agrees', () => {
     loader.registerBuiltInPlugin(manifest, {}, {});
     storage.setPluginStatus('persist-test', PluginStatus.ENABLED); // operator enabled it
 
@@ -218,7 +222,9 @@ describe('PluginLoaderService — enable/config persistence', () => {
     const loader2 = new PluginLoaderService(config, new HookManager(), storage2, {} as unknown as ModuleRef);
     loader2.registerBuiltInPlugin(manifest, {}, {});
 
-    // Runtime is INSTALLED (not auto-enabled) AND the registry agrees (no enabled/installed divergence).
+    // Runtime is INSTALLED (registering does not run the lifecycle) AND the registry agrees, so there
+    // is no enabled/installed divergence. Restoring an operator-enabled plugin is a separate step that
+    // happens at bootstrap and skips built-ins — see plugin-restore-on-boot.spec.ts (#856).
     expect(loader2.getPlugin('persist-test')?.status).toBe(PluginStatus.INSTALLED);
     expect(storage2.getPluginStatus('persist-test')).toBe(PluginStatus.INSTALLED);
   });
@@ -406,6 +412,145 @@ describe('PluginLoaderService — skips dot-prefixed directories on load (crash-
   });
 });
 
+describe('PluginLoaderService — prunes registry ghosts of removed built-ins', () => {
+  let tmpDir: string;
+  let pluginsDir: string;
+  let loader: PluginLoaderService;
+  let storage: PluginStorageService;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-ghosts-'));
+    pluginsDir = path.join(tmpDir, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    const config = {
+      get: (k: string) => (k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : undefined),
+    } as unknown as ConfigService;
+    storage = new PluginStorageService(config);
+    loader = new PluginLoaderService(config, new HookManager(), storage, {} as unknown as ModuleRef);
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const seedGhost = (id: string): void => {
+    // A leftover directory with no manifest (code deleted) + a stale registry entry still claiming
+    // the plugin is installed — the ghost state upgrades from <=0.6 are in.
+    fs.mkdirSync(path.join(pluginsDir, id), { recursive: true });
+    storage.setPluginEntry({
+      id,
+      type: 'extension',
+      name: id,
+      version: '1.0.0',
+      status: 'installed',
+      config: {},
+      builtIn: true,
+      installedAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+  };
+
+  it('prunes registry entries of legacy removed built-ins (auto-reply, translation) with no manifest', () => {
+    seedGhost('auto-reply');
+    seedGhost('translation');
+
+    loader.onModuleInit();
+
+    expect(storage.getPluginEntry('auto-reply')).toBeUndefined();
+    expect(storage.getPluginEntry('translation')).toBeUndefined();
+  });
+
+  it('keeps a manifest-less NON-legacy plugin entry (config survives an unreadable dir)', () => {
+    seedGhost('some-other-plugin');
+
+    loader.onModuleInit();
+
+    expect(storage.getPluginEntry('some-other-plugin')).toBeDefined();
+  });
+});
+
+describe('PluginLoaderService — loadPlugin seeds configSchema defaults', () => {
+  let tmpDir: string;
+  let pluginsDir: string;
+  let loader: PluginLoaderService;
+  let storage: PluginStorageService;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-seed-'));
+    pluginsDir = path.join(tmpDir, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    const config = {
+      get: (k: string) => (k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : undefined),
+    } as unknown as ConfigService;
+    storage = new PluginStorageService(config);
+    loader = new PluginLoaderService(config, new HookManager(), storage, {} as unknown as ModuleRef);
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('seeds defaults into the runtime instance and the persisted registry entry at load', () => {
+    const dir = path.join(pluginsDir, 'seeded-plg');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'manifest.json'),
+      JSON.stringify({
+        id: 'seeded-plg',
+        name: 'seeded-plg',
+        version: '1.0.0',
+        type: 'extension',
+        main: 'index.js',
+        configSchema: {
+          type: 'object',
+          properties: { timezone: { type: 'string', default: 'UTC' } },
+        },
+      }),
+    );
+    fs.writeFileSync(path.join(dir, 'index.js'), 'module.exports = class {};');
+
+    loader.onModuleInit();
+
+    expect(loader.getPlugin('seeded-plg')?.config).toEqual({ timezone: 'UTC' });
+    expect(storage.getPluginEntry('seeded-plg')?.config).toEqual({ timezone: 'UTC' });
+  });
+});
+
+describe('seedConfigDefaults', () => {
+  const schema = {
+    type: 'object' as const,
+    properties: {
+      timezone: { type: 'string' as const, default: 'UTC' },
+      cooldownSec: { type: 'number' as const, default: 3600 },
+      schedule: { type: 'object' as const, required: true }, // no default — must stay absent
+      rules: { type: 'array' as const, default: [{ q: 'hi', a: 'hello' }] },
+    },
+  };
+
+  it('seeds schema defaults for absent keys only', () => {
+    const out = seedConfigDefaults(schema, { timezone: 'Asia/Jakarta' });
+    expect(out).toEqual({
+      timezone: 'Asia/Jakarta', // explicit value wins
+      cooldownSec: 3600,
+      rules: [{ q: 'hi', a: 'hello' }],
+    });
+    expect(out).not.toHaveProperty('schedule'); // required-without-default is never invented
+  });
+
+  it('returns the input unchanged when nothing is missing (and no schema)', () => {
+    const config = { timezone: 'UTC', cooldownSec: 1, rules: [] };
+    expect(seedConfigDefaults(schema, config)).toBe(config);
+    expect(seedConfigDefaults(undefined, config)).toBe(config);
+  });
+
+  it('deep-clones object/array defaults so runtime and persisted copies cannot share references', () => {
+    const out = seedConfigDefaults(schema, {});
+    const again = seedConfigDefaults(schema, {});
+    expect(out.rules).toEqual(again.rules);
+    expect(out.rules).not.toBe(again.rules);
+    expect((out.rules as unknown[])[0]).not.toBe((again.rules as unknown[])[0]);
+  });
+
+  it('null is an explicit value and is not overwritten by the default', () => {
+    const out = seedConfigDefaults(schema, { timezone: null });
+    expect(out.timezone).toBeNull();
+  });
+});
+
 describe('PluginLoaderService — enable concurrency', () => {
   let tmpDir: string;
   let loader: PluginLoaderService;
@@ -548,7 +693,11 @@ describe('PluginLoaderService.dispatchWebhookForInstance config delivery', () =>
       sandboxHosts: Map<string, { dispatchWebhook: jest.Mock }>;
     };
     internals.plugins.set('chatwoot-adapter', {
-      manifest: { id: 'chatwoot-adapter', sessionScoped: true },
+      manifest: {
+        id: 'chatwoot-adapter',
+        sessionScoped: true,
+        ingress: [{ route: 'chatwoot', signature: { scheme: 'none' } }],
+      },
       config: { baseUrl: 'base', accountId: 1 },
       sessionConfig: { 'sess-1': { baseUrl: 'https://tenant1' } },
     });
@@ -559,6 +708,7 @@ describe('PluginLoaderService.dispatchWebhookForInstance config delivery', () =>
       pluginId: 'chatwoot-adapter',
       instanceId: 'acct1',
       route: 'chatwoot',
+      method: 'PATCH',
       deliveryId: 'd1',
       sessionId: 'sess-1',
       payload: { headers: {}, query: {}, body: '', rawBody: '' },
@@ -568,7 +718,228 @@ describe('PluginLoaderService.dispatchWebhookForInstance config delivery', () =>
     expect(dispatchWebhook).toHaveBeenCalledTimes(1);
     // Session override (tenant1) merged over the base — this is what makes an instance multi-tenant.
     expect(dispatchWebhook).toHaveBeenCalledWith(
-      expect.objectContaining({ config: { baseUrl: 'https://tenant1', accountId: 1 } }),
+      expect.objectContaining({
+        config: { baseUrl: 'https://tenant1', accountId: 1 },
+        method: 'PATCH',
+        verified: false,
+      }),
     );
+  });
+});
+
+describe('PluginLoaderService — search-provider wiring', () => {
+  function makeLoader(moduleRefGet: jest.Mock): PluginLoaderService {
+    const configService = { get: jest.fn().mockReturnValue(undefined) } as unknown as ConfigService;
+    const pluginStorage = {
+      getPluginEntry: jest.fn().mockReturnValue(undefined),
+      setPluginEntry: jest.fn(),
+      setPluginStatus: jest.fn(),
+      getPluginConfig: jest.fn().mockReturnValue(null),
+      getPluginSessions: jest.fn().mockReturnValue(undefined),
+      getPluginSessionConfig: jest.fn().mockReturnValue(undefined),
+      createPluginStorage: jest
+        .fn()
+        .mockReturnValue({ get: jest.fn(), set: jest.fn(), delete: jest.fn(), list: jest.fn() }),
+    } as unknown as PluginStorageService;
+    return new PluginLoaderService(configService, new HookManager(), pluginStorage, {
+      get: moduleRefGet,
+    } as unknown as ModuleRef);
+  }
+
+  it('getSearchRegistry returns the registry when ModuleRef has it', () => {
+    const registry = new SearchProviderRegistry();
+    const loader = makeLoader(jest.fn().mockReturnValue(registry));
+    expect((loader as unknown as { getSearchRegistry: () => unknown }).getSearchRegistry()).toBe(registry);
+  });
+
+  it('getSearchRegistry returns undefined when ModuleRef has no registry (search disabled)', () => {
+    const loader = makeLoader(
+      jest.fn().mockImplementation(() => {
+        throw new Error('not found');
+      }),
+    );
+    expect((loader as unknown as { getSearchRegistry: () => unknown }).getSearchRegistry()).toBeUndefined();
+  });
+
+  it('disablePlugin unregisters the plugin’s search-provider entry', async () => {
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'plugin:disable-test', label: 'p', search: jest.fn(), health: jest.fn() });
+    const loader = makeLoader(jest.fn().mockReturnValue(registry));
+    const manifest: PluginManifest = {
+      id: 'disable-test',
+      name: 'Disable Test',
+      version: '1.0.0',
+      type: PluginType.EXTENSION,
+      main: 'index.js',
+    };
+    loader.registerBuiltInPlugin(manifest, {});
+    await loader.enablePlugin('disable-test'); // builtIn → enableInProcess, status→ENABLED
+    expect(registry.list().map(p => p.id)).toContain('plugin:disable-test');
+
+    await loader.disablePlugin('disable-test');
+
+    expect(registry.list().map(p => p.id)).not.toContain('plugin:disable-test');
+  });
+});
+
+describe('PluginLoaderService — search-provider enable-failure cleanup', () => {
+  jest.setTimeout(30000);
+  let tmpDir: string;
+  const BOOTSTRAP = path.resolve(__dirname, 'sandbox/worker-bootstrap.ts');
+  const TS_NODE_OPTS = JSON.stringify({
+    module: 'commonjs',
+    moduleResolution: 'node',
+    resolvePackageJsonExports: false,
+    // TypeScript 6 rejects the legacy resolution pair unless acknowledged. Revisit before TS 7.
+    ignoreDeprecations: '6.0',
+  });
+
+  // Runs the REAL worker (ts-node) instead of the compiled dist bootstrap, so enableSandboxed
+  // exercises its true load/lifecycle/catch path with a live worker thread.
+  class RealWorkerLoader extends PluginLoaderService {
+    protected createSandboxHost(
+      capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+      onHookSubscribe?: (event: string, priority?: number) => void,
+      onWebhookSubscribe?: (route: string) => void,
+      onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
+      runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
+      onSearchProviderRegister?: () => void,
+    ): PluginWorkerHost {
+      return new PluginWorkerHost(
+        new WorkerThreadChannel({
+          workerEntry: BOOTSTRAP,
+          execArgv: ['-r', 'ts-node/register/transpile-only'],
+          env: { ...process.env, TS_NODE_COMPILER_OPTIONS: TS_NODE_OPTS },
+        }),
+        capDispatcher,
+        onHookSubscribe,
+        onWebhookSubscribe,
+        onLog,
+        runWithHookGuard,
+        undefined,
+        onSearchProviderRegister,
+      );
+    }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-search-ef-'));
+    fs.mkdirSync(path.join(tmpDir, 'rt'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'rt', 'manifest.json'),
+      JSON.stringify({ id: 'rt', name: 'RT', version: '1.0.0', type: 'EXTENSION', main: 'index.cjs' }),
+    );
+    // Fixture: register a search provider, THEN throw in onEnable — so the host has received
+    // search-provider-register (and activated the provider in auto mode) before enable fails.
+    fs.writeFileSync(
+      path.join(tmpDir, 'rt', 'index.cjs'),
+      "module.exports = class { async onEnable(ctx) { ctx.registerSearchProvider(async () => ({ hits: [], total: 0, tookMs: 1, provider: 'plugin:rt' })); throw new Error('onEnable failed'); } };",
+    );
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('unregisters the search provider when enable fails after registration (no dead active provider)', async () => {
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'builtin-fts', label: 'b', search: jest.fn(), health: jest.fn() });
+    const config = {
+      get: (k: string) =>
+        k === 'search.provider' ? 'auto' : k === 'plugins.dir' || k === 'dataDir' ? tmpDir : undefined,
+    } as unknown as ConfigService;
+    const storage = new PluginStorageService(config);
+    const loader = new RealWorkerLoader(config, new HookManager(), storage, {
+      get: () => registry,
+    } as unknown as ModuleRef);
+
+    loader.loadPlugin(path.join(tmpDir, 'rt'));
+    await expect(loader.enablePlugin('rt')).rejects.toThrow('onEnable failed');
+
+    // Registered mid-onEnable, then onEnable threw → the catch must unregister the dead provider.
+    expect(registry.list().map(p => p.id)).not.toContain('plugin:rt');
+    expect(registry.active()?.id).toBe('builtin-fts');
+  });
+});
+
+describe('PluginLoaderService — search-provider worker-crash fallback', () => {
+  jest.setTimeout(30000);
+  let tmpDir: string;
+  const BOOTSTRAP = path.resolve(__dirname, 'sandbox/worker-bootstrap.ts');
+  const TS_NODE_OPTS = JSON.stringify({
+    module: 'commonjs',
+    moduleResolution: 'node',
+    resolvePackageJsonExports: false,
+    // TypeScript 6 rejects the legacy resolution pair unless acknowledged. Revisit before TS 7.
+    ignoreDeprecations: '6.0',
+  });
+
+  // Real ts-node worker (so enableSandboxed runs its true path) that captures the host so the test can
+  // crash it.
+  class CapturingLoader extends PluginLoaderService {
+    lastHost?: PluginWorkerHost;
+    protected createSandboxHost(
+      capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+      onHookSubscribe?: (event: string, priority?: number) => void,
+      onWebhookSubscribe?: (route: string) => void,
+      onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
+      runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
+      onSearchProviderRegister?: () => void,
+      onWorkerExit?: (code: number, intentional: boolean) => void,
+    ): PluginWorkerHost {
+      const host = new PluginWorkerHost(
+        new WorkerThreadChannel({
+          workerEntry: BOOTSTRAP,
+          execArgv: ['-r', 'ts-node/register/transpile-only'],
+          env: { ...process.env, TS_NODE_COMPILER_OPTIONS: TS_NODE_OPTS },
+        }),
+        capDispatcher,
+        onHookSubscribe,
+        onWebhookSubscribe,
+        onLog,
+        runWithHookGuard,
+        undefined,
+        onSearchProviderRegister,
+        onWorkerExit,
+      );
+      this.lastHost = host;
+      return host;
+    }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-search-crash-'));
+    fs.mkdirSync(path.join(tmpDir, 'ok'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'ok', 'manifest.json'),
+      JSON.stringify({ id: 'ok', name: 'OK', version: '1.0.0', type: 'EXTENSION', main: 'index.cjs' }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ok', 'index.cjs'),
+      "module.exports = class { async onEnable(ctx) { ctx.registerSearchProvider(async () => ({ hits: [], total: 0, tookMs: 1, provider: 'plugin:ok' })); } };",
+    );
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('falls back to builtin-fts when the plugin worker crashes after a successful enable', async () => {
+    const registry = new SearchProviderRegistry();
+    registry.register({ id: 'builtin-fts', label: 'b', search: jest.fn(), health: jest.fn() });
+    const config = {
+      get: (k: string) =>
+        k === 'search.provider' ? 'auto' : k === 'plugins.dir' || k === 'dataDir' ? tmpDir : undefined,
+    } as unknown as ConfigService;
+    const storage = new PluginStorageService(config);
+    const loader = new CapturingLoader(config, new HookManager(), storage, {
+      get: () => registry,
+    } as unknown as ModuleRef);
+
+    loader.loadPlugin(path.join(tmpDir, 'ok'));
+    await loader.enablePlugin('ok'); // registers + setActive -> active = plugin:ok
+    expect(registry.active()?.id).toBe('plugin:ok');
+
+    // Worker crashes (unexpected exit) — terminate() emits the worker 'exit' event -> handleExit -> onWorkerExit.
+    await loader.lastHost!.terminate();
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(registry.list().map(p => p.id)).not.toContain('plugin:ok');
+    expect(registry.active()?.id).toBe('builtin-fts'); // fell back, not pinned to the dead plugin
   });
 });

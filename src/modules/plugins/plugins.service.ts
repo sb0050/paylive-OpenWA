@@ -16,9 +16,18 @@ import { redactSecretConfig, restoreSecretConfig } from './redact-config';
 import { parsePluginPackage } from './plugin-installer';
 import { fetchSafeBuffer } from './plugin-download';
 import { annotateCatalog, CatalogEntry, CatalogPlugin } from './catalog';
+import { redactSsrfError } from '../../common/security/ssrf-guard';
+import { createLogger } from '../../common/services/logger.service';
 
 /** Cap on the catalog JSON download (the catalog is small; this bounds a hostile response). */
 const CATALOG_MAX_BYTES = 1 * 1024 * 1024;
+
+/**
+ * Module-level logger so the SSRF redactor can log the full blocked-address detail server-side before
+ * returning the generic message (the service has no `this.logger` and its methods are sync/void-returning
+ * around the download calls).
+ */
+const logger = createLogger('PluginsService');
 
 /** A plugin can host provisioned instances iff it declares an ingress route AND the webhook:ingress
  *  permission — mirrors IntegrationInstanceController.assertIngressCapable. */
@@ -120,11 +129,17 @@ export class PluginsService {
     }
 
     if (plugin.status === PluginStatus.ENABLED) {
+      // Converge the persisted decision even on the no-op path, so a plugin left running by an older
+      // build (which had no such field) is still restored after the next restart.
+      this.pluginLoader.setOperatorEnabled(id, true);
       return { success: true, message: `Plugin ${id} is already enabled` };
     }
 
     try {
       await this.pluginLoader.enablePlugin(id);
+      // Only after the lifecycle actually succeeded: a plugin that failed to enable must not be
+      // restored on every boot just to fail again.
+      this.pluginLoader.setOperatorEnabled(id, true);
       return { success: true, message: `Plugin ${id} enabled successfully` };
     } catch (error) {
       return {
@@ -146,11 +161,15 @@ export class PluginsService {
     }
 
     if (plugin.status !== PluginStatus.ENABLED) {
+      // Clear the decision here too: a plugin sitting in ERROR after a failed restore is not ENABLED,
+      // and disabling it must stop the gateway retrying it on every boot.
+      this.pluginLoader.setOperatorEnabled(id, false);
       return { success: true, message: `Plugin ${id} is not enabled` };
     }
 
     try {
       await this.pluginLoader.disablePlugin(id);
+      this.pluginLoader.setOperatorEnabled(id, false);
       return { success: true, message: `Plugin ${id} disabled successfully` };
     } catch (error) {
       return {
@@ -332,7 +351,7 @@ export class PluginsService {
       buffer = await fetchSafeBuffer(url, { maxBytes });
     } catch (error) {
       throw new BadRequestException(
-        `Failed to download plugin from URL: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to download plugin from URL: ${redactSsrfError(error, logger, 'plugin download')}`,
       );
     }
     // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
@@ -354,7 +373,7 @@ export class PluginsService {
       raw = await fetchSafeBuffer(url, { maxBytes: CATALOG_MAX_BYTES });
     } catch (error) {
       throw new BadRequestException(
-        `Failed to fetch plugin catalog: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to fetch plugin catalog: ${redactSsrfError(error, logger, 'plugin catalog download')}`,
       );
     }
 
@@ -417,6 +436,18 @@ export class PluginsService {
         fs.mkdirSync(path.dirname(dest), { recursive: true });
         fs.writeFileSync(dest, entry.data);
       }
+      // ctx.storage files share the package directory under shipped defaults. Restore service-owned
+      // state from the backup unless the new package explicitly supplied that exact path. Copy (rather
+      // than move) so the rollback below still has a complete original directory.
+      const packagePaths = new Set(entries.map(entry => entry.relPath));
+      for (const entry of fs.readdirSync(backup, { withFileTypes: true })) {
+        if (!entry.isFile() || !/^key-[A-Za-z0-9_-]+\.json$/.test(entry.name) || packagePaths.has(entry.name)) {
+          continue;
+        }
+        const stateFile = path.join(dir, entry.name);
+        fs.copyFileSync(path.join(backup, entry.name), stateFile);
+        fs.chmodSync(stateFile, 0o600);
+      }
       this.pluginLoader.loadPlugin(dir);
       if (wasEnabled) {
         await this.pluginLoader.enablePlugin(id);
@@ -455,7 +486,7 @@ export class PluginsService {
       buffer = await fetchSafeBuffer(url, { maxBytes });
     } catch (error) {
       throw new BadRequestException(
-        `Failed to download plugin from URL: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to download plugin from URL: ${redactSsrfError(error, logger, 'plugin download')}`,
       );
     }
     return this.updatePackage(id, buffer);

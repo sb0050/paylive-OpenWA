@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Optional } from '@nestjs/common';
+import { Injectable, OnApplicationBootstrap, OnModuleInit, OnModuleDestroy, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
 import { toNeutralJid, userPart } from '../../engine/identity/wa-id';
@@ -24,7 +24,9 @@ import {
   IPlugin,
   PluginType,
   PluginLogger,
+  PluginConfigSchema,
   validateIngressManifest,
+  warnUnauthenticatedIngressRoutes,
 } from './plugin.interfaces';
 import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
 import { PluginStorageService } from './plugin-storage.service';
@@ -36,6 +38,7 @@ import { PluginLogLevel } from './sandbox/protocol';
 import { buildConversationSendFacade, ConversationMediaType } from './conversation-send-facade';
 import { shouldDispatchToPlugin } from './handover-gate';
 import { makeOnWebhookSubscribe } from './webhook-subscribe.util';
+import { registerPluginSearchProvider, unregisterPluginSearchProvider } from './search-provider-registration.util';
 import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
 import type { MessageService } from '../../modules/message/message.service';
 import type { SessionService } from '../../modules/session/session.service';
@@ -43,6 +46,7 @@ import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.in
 import type { ConversationMappingService } from '../../modules/integration/conversation-mapping.service';
 import type { PluginInstanceService } from '../../modules/integration/plugin-instance.service';
 import type { IngressJobData } from '../../modules/queue/processors/ingress.processor';
+import type { SearchProviderRegistry } from '../../modules/search/search-provider.registry';
 
 /** Default per-plugin heap cap for the sandbox worker; an OOM terminates the worker, not the host. */
 const SANDBOX_MAX_OLD_GEN_MB = 256;
@@ -50,6 +54,8 @@ const SANDBOX_MAX_OLD_GEN_MB = 256;
 const SANDBOX_HOOK_TIMEOUT_MS = 5000;
 /** A sandboxed plugin's healthCheck must answer within this, else it's reported unhealthy (not hung). */
 const SANDBOX_HEALTH_TIMEOUT_MS = 5000;
+/** A sandboxed plugin's search handler must answer within this, else /search fails fast (not hung). */
+const SANDBOX_SEARCH_TIMEOUT_MS = 10000;
 /**
  * A sandboxed plugin's load()/onLoad/onEnable/onDisable must complete within this, else the worker is
  * torn down and the operation fails — a wedged lifecycle can't hang the enable/disable request (and
@@ -127,8 +133,41 @@ export function dispatchConversationMedia(
   }
 }
 
+// Plugin ids whose bundled-extension code was permanently removed (v0.7 — superseded by the
+// marketplace chat-flow / group-translate; also reserved in plugin-installer). A leftover
+// directory without a manifest marks them as deleted on disk, so the stale registry entry (which
+// still reports them installed/enabled) is pruned on boot. Scoped to these known ids so a
+// temporarily-unreadable plugin dir (e.g. an unmounted volume) never loses its persisted config.
+const LEGACY_REMOVED_PLUGIN_IDS = new Set(['auto-reply', 'translation']);
+
+/**
+ * Fill config keys the schema declares a `default` for and that are absent (undefined) in the
+ * stored config. Seeding happens at LOAD time (fresh installs and every boot), so a plugin whose
+ * schema fields carry defaults never runs its lifecycle with them missing — the failure class of
+ * "enable throws: <field> is required/has no value" for defaulted fields. Explicit values — even
+ * null — are never overwritten, and object/array defaults are deep-cloned so the seeded runtime
+ * config and the persisted entry can't share a mutable reference. Required fields WITHOUT a
+ * declared default stay absent on purpose: those need real operator input, not an invented value.
+ */
+export function seedConfigDefaults(
+  schema: PluginConfigSchema | undefined,
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const properties = schema?.properties;
+  if (!properties) return config;
+  let seeded: Record<string, unknown> | undefined;
+  for (const [key, field] of Object.entries(properties)) {
+    if (config[key] !== undefined || field === null || typeof field !== 'object') continue;
+    const value = field.default;
+    if (value === undefined) continue;
+    if (!seeded) seeded = { ...config };
+    seeded[key] = value !== null && typeof value === 'object' ? structuredClone(value) : value;
+  }
+  return seeded ?? config;
+}
+
 @Injectable()
-export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
+export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = createLogger('PluginLoaderService');
   private readonly plugins = new Map<string, PluginInstance>();
   /** Plugin ids whose enable() is in flight — a synchronous lock so concurrent enables can't double-run. */
@@ -169,6 +208,37 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       action: 'plugins_loaded',
       count: this.plugins.size,
     });
+  }
+
+  /**
+   * Re-enable the plugins the operator had enabled (#856). `status` cannot carry that across a restart
+   * — it describes the runtime, and loading never runs a plugin — so the decision is read from the
+   * separately persisted `enabledByOperator`. Without this, every restart (an upgrade, a host reboot, a
+   * Docker restart policy) silently switched off every extension, and a relay simply stopped relaying.
+   *
+   * Runs at bootstrap rather than in onModuleInit so the rest of the app is wired before any plugin
+   * code executes. Built-ins are skipped: an engine is enabled by EngineFactory against the configured
+   * engine.type, and enabling a non-active engine here would be rejected anyway.
+   *
+   * Best-effort and sequential, like the shutdown teardown: a plugin that cannot come back is logged
+   * and left in ERROR, and never holds up the gateway.
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    const restorable = this.getAllPlugins().filter(
+      p => !p.builtIn && this.pluginStorage.getPluginEntry(p.manifest.id)?.enabledByOperator === true,
+    );
+    for (const plugin of restorable) {
+      const pluginId = plugin.manifest.id;
+      try {
+        await this.enablePlugin(pluginId);
+      } catch (error) {
+        this.logger.error(
+          `Failed to restore plugin ${pluginId} on startup; it stays disabled until re-enabled`,
+          error instanceof Error ? error.message : String(error),
+          { pluginId, action: 'plugin_restore_failed' },
+        );
+      }
+    }
   }
 
   /**
@@ -216,6 +286,12 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
           pluginPath,
           action: 'manifest_missing',
         });
+        if (LEGACY_REMOVED_PLUGIN_IDS.has(entry.name)) {
+          this.pluginStorage.deletePluginEntry(entry.name);
+          this.logger.log(`Pruned stale registry entry for removed built-in plugin: ${entry.name}`, {
+            action: 'registry_ghost_pruned',
+          });
+        }
         continue;
       }
 
@@ -245,6 +321,11 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     // load and become provisionable. No-op for plugins that declare no ingress.
     validateIngressManifest(manifest);
 
+    // Surface a loud warning for any ingress route that skips signature verification — a scheme:'none'
+    // route is a fully-unauthenticated public endpoint that can trigger WhatsApp sends. Additive (a
+    // warning, not a refusal) so a legit scheme:'none' deployment still boots.
+    warnUnauthenticatedIngressRoutes(manifest, this.logger);
+
     // Check if plugin already loaded
     if (this.plugins.has(manifest.id)) {
       throw new Error(`Plugin ${manifest.id} is already loaded`);
@@ -259,7 +340,9 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     const pluginInstance: PluginInstance = {
       manifest,
       status: PluginStatus.INSTALLED,
-      config: storedConfig,
+      // Seed schema-declared defaults under the stored config, so a defaulted field is never
+      // missing when the plugin later runs (explicit values are never overwritten).
+      config: seedConfigDefaults(manifest.configSchema, storedConfig),
       instance: null,
       loadedAt: new Date(),
       builtIn: false,
@@ -289,20 +372,27 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
    * load into a 500). Does NOT enable or run the plugin — boot never auto-executes plugin code.
    */
   private ensureRegistryEntry(manifest: PluginManifest, builtIn: boolean): void {
-    // Reconcile the persisted entry with the freshly-loaded runtime: the runtime always loads
-    // INSTALLED and is never auto-enabled on boot (enabling must stay an explicit ADMIN action that
-    // runs the lifecycle), so the entry's status is (re)set to INSTALLED to match — a previously
-    // enabled plugin must be re-enabled after a restart. The operator's persisted config is preserved
-    // so secrets/settings survive. Best-effort: saveRegistry swallows fs errors, so a disk failure
-    // never turns a load into a 500.
+    // Reconcile the persisted entry with the freshly-loaded runtime: loading never runs the plugin, so
+    // the entry's status is (re)set to INSTALLED to match the runtime. Enabling is a separate step that
+    // runs the lifecycle — at bootstrap for a plugin the operator had enabled (see
+    // onApplicationBootstrap), or on an explicit ADMIN action. The operator's persisted config and
+    // enable decision are preserved so settings/secrets and the decision itself survive. Best-effort:
+    // saveRegistry swallows fs errors, so a disk failure never turns a load into a 500.
     const existing = this.pluginStorage.getPluginEntry(manifest.id);
+    // The operator's standing enable decision (#856). `status` below is deliberately reset, so intent
+    // has to live in its own field or a restart loses it. A pre-#856 row has no such field: adopt it
+    // from a status of ENABLED, which can only have been written by an explicit enable since the last
+    // boot (every boot rewrites the status to INSTALLED), so it is a faithful record of the intent.
+    const enabledByOperator = existing?.enabledByOperator ?? existing?.status === PluginStatus.ENABLED;
     this.pluginStorage.setPluginEntry({
       id: manifest.id,
       type: manifest.type,
       name: manifest.name,
       version: manifest.version,
       status: PluginStatus.INSTALLED,
-      config: existing?.config ?? {},
+      // The operator's persisted config survives, with schema-declared defaults seeded under it so
+      // the persisted entry matches the seeded runtime config (see loadPlugin).
+      config: seedConfigDefaults(manifest.configSchema, existing?.config ?? {}),
       builtIn,
       installedAt: existing?.installedAt ?? new Date(),
       updatedAt: new Date(),
@@ -310,7 +400,20 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       // carried over or every boot wipes them from disk (lost after the second restart).
       activeSessions: existing?.activeSessions,
       sessionConfig: existing?.sessionConfig,
+      enabledByOperator,
     });
+  }
+
+  /**
+   * Record that the operator wants this plugin on (or off), so bootstrap can restore it (#856).
+   *
+   * Call this ONLY from an operator-facing action. In particular it must never be called from
+   * disablePlugin: onModuleDestroy disables every running plugin during a graceful shutdown, and
+   * treating that as "the operator turned it off" would erase the decision on the way out — which is
+   * the very bug this exists to fix, just moved somewhere harder to see.
+   */
+  setOperatorEnabled(pluginId: string, enabled: boolean): void {
+    this.pluginStorage.setPluginEnabledByOperator(pluginId, enabled);
   }
 
   async enablePlugin(pluginId: string): Promise<void> {
@@ -417,6 +520,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
 
       // Unregister all hooks for this plugin
       this.hookManager.unregisterPlugin(pluginId);
+      // Drop the plugin's search-provider entry (if any) so queries don't route to a terminated worker.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
 
       plugin.status = PluginStatus.DISABLED;
 
@@ -612,6 +717,11 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     // provisioning wrote) so the ingress handler reads it as ctx.config — this is what makes a minted
     // instance multi-tenant. Best-effort: an unresolved plugin just yields undefined (base config only).
     const plugin = this.plugins.get(d.pluginId);
+    const route = plugin?.manifest.ingress?.find(candidate => candidate.route === d.route);
+    // Reaching dispatch means every authenticating scheme already passed host verification. A route
+    // explicitly configured with scheme:none is unauthenticated and must never be labelled verified.
+    // Missing/hot-swapped route metadata fails closed.
+    const verified = route ? route.signature.scheme !== 'none' : false;
     const instance = await this.getPluginInstanceService().resolve(d.pluginId, d.instanceId);
     const config = plugin
       ? resolvePluginConfig(
@@ -624,12 +734,12 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     const result = await host.dispatchWebhook({
       instanceId: d.instanceId,
       route: d.route,
-      method: 'POST',
+      method: d.method ?? 'POST',
       headers: d.payload.headers,
       query: d.payload.query,
       body: d.payload.body,
       rawBody: d.payload.rawBody,
-      verified: true,
+      verified,
       deliveryId: d.deliveryId,
       sessionId: d.sessionId,
       config,
@@ -676,6 +786,23 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../../modules/integration/plugin-instance.service') as typeof import('../../modules/integration/plugin-instance.service');
     return this.moduleRef.get(mod.PluginInstanceService, { strict: false });
+  }
+
+  /**
+   * Resolve the SearchProviderRegistry lazily — search is conditionally loaded (SEARCH_ENABLED=false omits
+   * SearchModule), so the registry may not be registered. Mirrors the lazy-require pattern for
+   * MessageService/SessionService to avoid a static module edge and a DI cycle. Returns undefined when
+   * search is disabled, so the loader can no-op search-provider registration without throwing.
+   */
+  private getSearchRegistry(): SearchProviderRegistry | undefined {
+    try {
+      const mod =
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('../../modules/search/search-provider.registry') as typeof import('../../modules/search/search-provider.registry');
+      return this.moduleRef.get(mod.SearchProviderRegistry, { strict: false });
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -753,6 +880,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
     onWebhookSubscribe?: (route: string) => void,
     onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
     runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
+    onSearchProviderRegister?: () => void,
+    onWorkerExit?: (code: number, intentional: boolean) => void,
   ): PluginWorkerHost {
     const workerEntry = path.join(__dirname, 'sandbox', 'worker-bootstrap.js');
     return new PluginWorkerHost(
@@ -768,6 +897,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       onLog,
       runWithHookGuard,
       SANDBOX_MAX_INFLIGHT_CAPS,
+      onSearchProviderRegister,
+      onWorkerExit,
     );
   }
 
@@ -918,6 +1049,53 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       else context.logger[level](message, meta);
     };
 
+    // When the worker declares itself a search provider (ctx.registerSearchProvider →
+    // search-provider-register), register a PluginSearchProvider in the SearchProviderRegistry. The host
+    // is in sandboxHosts by the time registration fires (during onLoad/onEnable), so look it up lazily
+    // like onHookSubscribe. Search disabled (no registry, or SEARCH_PROVIDER=none) → the util skips.
+    const onSearchProviderRegister = (): void => {
+      const liveHost = this.sandboxHosts.get(pluginId);
+      if (!liveHost) return;
+      registerPluginSearchProvider({
+        pluginId,
+        label: `${plugin.manifest.name} (plugin)`,
+        transport: liveHost,
+        timeoutMs: SANDBOX_SEARCH_TIMEOUT_MS,
+        registry: this.getSearchRegistry(),
+        mode: this.configService.get<string>('search.provider', 'auto'),
+      });
+    };
+
+    // A worker that crashes AFTER a successful enable is otherwise invisible to the loader (handleExit only
+    // drains in-flight calls). Drop the plugin's search-provider entry so the registry falls back to
+    // builtin-fts instead of routing every /search to a dead worker (auto mode would otherwise pin the dead
+    // provider ACTIVE). Mirrors the enable-failure cleanup. Broader crash-lifecycle cleanup (status, hooks)
+    // is a pre-existing gap for all bridges and out of scope here.
+    const onWorkerExit = (code: number, intentional: boolean): void => {
+      // Always release the search-provider slot so the registry can fall back to builtin-fts. On a crash
+      // this is the only cleanup; on a deliberate disable/enable-failure the explicit unregister already
+      // ran, making this a harmless no-op.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
+      if (intentional) return; // routine disable/enable-failure already logged and expected
+      // Unexpected crash after a successful enable: the worker is gone. Drop the dead host +
+      // unregister the hook shims (so they don't keep dispatching into the dead worker) + mark the
+      // plugin ERROR so the dashboard reflects reality. The dispatchHook/dispatchWebhook dead-checks
+      // fail-fast; this cleanup is the root-cause fix (it also makes the shim's !liveHost guard fire).
+      const crashed = this.plugins.get(pluginId);
+      if (crashed) {
+        crashed.status = PluginStatus.ERROR;
+        crashed.error = `worker exited unexpectedly (code ${code})`;
+        this.pluginStorage.setPluginStatus(pluginId, PluginStatus.ERROR);
+      }
+      this.hookManager.unregisterPlugin(pluginId);
+      this.sandboxHosts.delete(pluginId);
+      this.logger.warn(`Sandboxed plugin ${pluginId} worker exited unexpectedly (code ${code})`, {
+        pluginId,
+        code,
+        action: 'sandbox_worker_exit',
+      });
+    };
+
     const host = this.createSandboxHost(
       (verb, args) => dispatchCapabilityVerb(context, verb, args),
       onHookSubscribe,
@@ -926,6 +1104,8 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       // Re-establish the in-flight hook context for worker-initiated capability calls, so a sandboxed
       // plugin that sends from within a send hook can't loop the event back into itself unboundedly.
       (events, run) => this.hookManager.runInFlight(events as HookEvent[], run),
+      onSearchProviderRegister,
+      onWorkerExit,
     );
     this.sandboxHosts.set(pluginId, host);
     try {
@@ -934,6 +1114,10 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
       await host.runLifecycle('onEnable', SANDBOX_LIFECYCLE_TIMEOUT_MS);
     } catch (error) {
       this.sandboxHosts.delete(pluginId);
+      // Drop a search provider registered mid-onEnable before the failure: without this, a plugin that
+      // registers then throws leaves a dead provider as the ACTIVE registry entry in auto mode, so every
+      // /search routes to a terminated worker → outage. Mirrors disablePlugin's cleanup.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
       await host.terminate().catch(() => undefined);
       throw error;
     }
@@ -1064,7 +1248,7 @@ export class PluginLoaderService implements OnModuleInit, OnModuleDestroy {
         assertPermission: this.assertPermission.bind(this),
         assertSessionActive: (sessionId: string) => this.assertSessionActive(plugin, sessionId),
         resolveChatId: async env => {
-          if (!env.instanceId || !env.source) {
+          if (!env.instanceId || !env.source?.externalConversationId) {
             throw new PluginCapabilityError(
               `Plugin ${plugin.manifest.id}: conversation.send requires chatId, or both instanceId and source to resolve one`,
             );

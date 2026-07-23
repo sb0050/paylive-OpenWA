@@ -19,9 +19,9 @@
   <img src="https://img.shields.io/github/package-json/v/rmyndharis/OpenWA?label=version&color=blue" alt="Version"/>
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"/>
   <img src="https://img.shields.io/badge/node-22_LTS-brightgreen.svg" alt="Node"/>
-  <img src="https://img.shields.io/badge/NestJS-11.x-red.svg" alt="NestJS"/>
+  <img src="https://img.shields.io/github/package-json/dependency-version/rmyndharis/OpenWA/@nestjs/core?label=NestJS&color=red" alt="NestJS"/>
   <img src="https://img.shields.io/badge/docker-ready-blue.svg" alt="Docker"/>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript"/>
+  <img src="https://img.shields.io/github/package-json/dependency-version/rmyndharis/OpenWA/dev/typescript?label=TypeScript&color=3178C6" alt="TypeScript"/>
 </p>
 
 ---
@@ -59,6 +59,7 @@
 | 23-S| [Plugin Sandboxing](./23-plugin-sandboxing.md)                   | Worker isolation, capabilities, and plugin limits |
 | 24  | [MCP Integration](./24-mcp-integration.md)                       | Model Context Protocol tools and auth model       |
 | 25  | [Integration Fabric](./25-integration-fabric.md)                | Inbound webhook substrate for plugin integrations |
+| 26  | [Global Search](./26-global-search.md)                          | Cross-session message search and the provider model |
 
 **Examples**
 
@@ -203,7 +204,7 @@ socket.on('message', msg => {
 | --------- | ----------------------------- |
 | Runtime   | Node.js 22 LTS                |
 | Framework | NestJS 11.x                   |
-| Language  | TypeScript 5.x                |
+| Language  | TypeScript 6.x                |
 | WA Engine | Pluggable (`ENGINE_TYPE`): whatsapp-web.js (default) or Baileys |
 | WebSocket | Socket.IO                     |
 | Database  | SQLite (default) / PostgreSQL |

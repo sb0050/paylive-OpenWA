@@ -1,21 +1,20 @@
 import type { GroupMetadata } from '@whiskeysockets/baileys';
 import { mapBaileysGroup, mapBaileysGroupInfo } from './baileys-group-mapper';
 
-const meta = (over: Partial<GroupMetadata> = {}): GroupMetadata =>
-  ({
-    id: '123-456@g.us',
-    subject: 'My Group',
-    owner: '628999@s.whatsapp.net',
-    desc: 'a description',
-    creation: 1700000000,
-    announce: false,
-    participants: [
-      { id: '628999@s.whatsapp.net', admin: 'superadmin' },
-      { id: '628111@s.whatsapp.net', admin: null },
-      { id: '628222@s.whatsapp.net', admin: 'admin' },
-    ],
-    ...over,
-  }) as GroupMetadata;
+const meta = (over: Partial<GroupMetadata> = {}): GroupMetadata => ({
+  id: '123-456@g.us',
+  subject: 'My Group',
+  owner: '628999@s.whatsapp.net',
+  desc: 'a description',
+  creation: 1700000000,
+  announce: false,
+  participants: [
+    { id: '628999@s.whatsapp.net', admin: 'superadmin' },
+    { id: '628111@s.whatsapp.net', admin: null },
+    { id: '628222@s.whatsapp.net', admin: 'admin' },
+  ],
+  ...over,
+});
 
 describe('mapBaileysGroup', () => {
   it('maps the summary shape and flags self-admin', () => {
@@ -58,6 +57,22 @@ describe('mapBaileysGroupInfo', () => {
       { id: '628111@s.whatsapp.net', number: '628111', name: undefined, isAdmin: false, isSuperAdmin: false },
       { id: '628222@s.whatsapp.net', number: '628222', name: undefined, isAdmin: true, isSuperAdmin: false },
     ]);
+  });
+
+  it('maps the group settings fields (announce / restrict→locked / ephemeralDuration→ephemeralSeconds)', () => {
+    const info = mapBaileysGroupInfo(meta({ announce: true, restrict: true, ephemeralDuration: 86400 }));
+    expect(info.announce).toBe(true);
+    expect(info.locked).toBe(true);
+    expect(info.ephemeralSeconds).toBe(86400);
+  });
+
+  it('leaves the settings fields undefined when the metadata does not carry them', () => {
+    const m = meta();
+    delete m.announce;
+    const info = mapBaileysGroupInfo(m);
+    expect(info.announce).toBeUndefined();
+    expect(info.locked).toBeUndefined();
+    expect(info.ephemeralSeconds).toBeUndefined();
   });
 
   it('canonicalizes participant ids and owner through the supplied normalizer (lid -> resolved phone)', () => {

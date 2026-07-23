@@ -194,6 +194,7 @@ REDIS_ENABLED=true
 REDIS_BUILTIN=false      # false = external Redis
 REDIS_HOST=your-redis-host.com
 REDIS_PORT=6379
+REDIS_USERNAME=optional
 REDIS_PASSWORD=optional
 ```
 
@@ -249,6 +250,10 @@ docker compose up -d
 | **BullMQ**   | Drain then config    | N/A (wait for empty queues)                              |
 
 ### Migration Script (Legacy)
+
+> **Note:** This example uses the standalone `sqlite3` npm package, which is no longer part of
+> OpenWA's dependencies (the app itself uses `better-sqlite3`). Install it ad hoc before running:
+> `npm install --no-save sqlite3`.
 
 ```typescript
 // scripts/migrate-sqlite-to-postgres.ts
@@ -1243,6 +1248,30 @@ async function fullImport(options: ImportOptions): Promise<void> {
 | Duplicate key errors     | Existing data conflict | Use merge strategy           |
 | Permission denied        | File ownership         | `chown -R 1000:1000 ./data`  |
 | Out of memory            | Large export           | Increase Docker memory limit |
+
+### PostgreSQL: boot crash-loop after upgrading a `DATABASE_SYNCHRONIZE=true` deployment
+
+**Symptom:** after upgrade, the container crash-loops on boot. `docker logs` shows one of:
+
+- `column "id" is of type uuid but default expression is of type character varying`
+- `foreign key constraint ... cannot be implemented ... incompatible types: character varying and uuid`
+
+**Cause:** a deployment previously bootstrapped with `DATABASE_SYNCHRONIZE=true` on PostgreSQL has native `uuid` `id`/FK columns (TypeORM derives them from `@PrimaryGeneratedColumn('uuid')`), while the migration chain assumes `varchar`. The two are incompatible, and migrations run unconditionally on the Postgres data connection (`migrationsRun: true`), so boot cannot complete (issue #690).
+
+**Fix (automatic for most deployments):** OpenWA ships a guard migration (`NormalizeSynchronizeUuidColumns`, ordered before the first collision) that converts the affected `uuid` columns to `varchar` on the next boot. For small-to-medium databases this is transparent — upgrade and restart.
+
+**Large-database maintenance window:** the conversion rewrites `messages` and `message_batches` in full under an exclusive lock. If either table is large (millions of rows) and your orchestrator's liveness/readiness grace is tight, run the migration against the stopped app during a planned window:
+
+```bash
+docker compose down
+DATABASE_TYPE=postgres DATABASE_HOST=... DATABASE_USERNAME=... \
+  DATABASE_PASSWORD=... DATABASE_NAME=openwa npm run migration:run
+docker compose up -d
+```
+
+(The CLI runner does not impose a statement timeout; the migration lifts it via `SET LOCAL`.)
+
+`DATABASE_SYNCHRONIZE=true` on PostgreSQL is unsupported for production. Leave it unset (the default `false`) and let migrations manage the schema.
 
 ### Debug Commands
 

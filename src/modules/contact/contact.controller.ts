@@ -31,6 +31,25 @@ export class ContactController {
     });
   }
 
+  @Get('profile-pictures')
+  @ApiOperation({
+    summary: 'Batch-resolve profile picture URLs for up to 50 contacts',
+    description:
+      'One request for a whole chat sidebar — avoids the burst of parallel single fetches that ' +
+      'would exhaust the per-IP throttle. Engine lookups run 3 at a time; per-id failures return null.',
+  })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiQuery({ name: 'ids', required: true, description: 'Comma-separated contact ids (max 50 used)' })
+  // NOTE: declared BEFORE @Get(':contactId') so the literal segment wins over the param route.
+  async getProfilePictures(@Param('sessionId') sessionId: string, @Query('ids') ids?: string) {
+    const list = (ids ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    const pictures = await this.contactService.getProfilePictures(sessionId, list);
+    return { pictures };
+  }
+
   @Get(':contactId')
   @ApiOperation({ summary: 'Get a specific contact by ID' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -45,7 +64,14 @@ export class ContactController {
   }
 
   @Get('check/:number')
-  @ApiOperation({ summary: 'Check if a phone number exists on WhatsApp' })
+  @ApiOperation({
+    summary: 'Check if a phone number exists on WhatsApp',
+    description:
+      'Returns whether the number is a registered WhatsApp account and its canonical id. Use this to ' +
+      'pre-validate a recipient before sending: the send endpoints return 201 on accepting a message ' +
+      'even for numbers that are not on WhatsApp, so this is the only way to confirm a new number is ' +
+      'reachable before you send to it.',
+  })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'number', description: 'Phone number to check (e.g., 628123456789)' })
   @ApiResponse({

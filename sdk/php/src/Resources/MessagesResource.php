@@ -22,12 +22,17 @@ class MessagesResource
     }
 
     /**
+     * List messages, optionally filtered by chat or sender. Returns a page shaped
+     * {messages: list, total: count} — iterate over the `messages` field, not the
+     * result itself. Consistent with the JavaScript, Python, and Java SDKs.
+     *
      * @param array<string,mixed> $query
-     * @return array<int,array<string,mixed>>
+     * @return array{messages: array<int,array<string,mixed>>, total: int}
      */
     public function list(string $sessionId, array $query = []): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages", $query) ?? [];
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages", $query)
+            ?? ['messages' => [], 'total' => 0];
     }
 
     /**
@@ -118,6 +123,18 @@ class MessagesResource
     public function delete(string $sessionId, array $body): array
     {
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/delete", [], $body);
+    }
+
+    /**
+     * Edit the text of a message sent by this account. Body is
+     * {chatId, messageId, body}; 404 when the message is not found.
+     *
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public function editMessage(string $sessionId, array $body): array
+    {
+        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/edit", [], $body);
     }
 
     /**

@@ -9,6 +9,8 @@
  * (B2) and hook bridge (B3) add more message kinds later.
  */
 
+import type { SearchQuery, SearchResults } from '../../../modules/search/search.types';
+
 export type PluginLifecycleMethod = 'onLoad' | 'onEnable' | 'onDisable' | 'onUnload';
 
 /** Static context fields handed to a sandboxed plugin at load (serializable; no live references). */
@@ -41,10 +43,11 @@ export type HostToWorkerMessage =
   | { kind: 'config-change'; config: Record<string, unknown> }
   // Ask the worker plugin to run its healthCheck(); it replies with health-result.
   | { kind: 'health-check'; id: number }
-  // Dispatch a verified inbound webhook to the worker for a route it subscribed to (webhook-subscribe).
+  // Dispatch an inbound webhook to the worker for a route it subscribed to (webhook-subscribe).
   // `body`/`rawBody` are buffered host-side to a string, like PluginNetResponse.body. `verified`
-  // reflects the host's signature check (see PluginIngressRoute.verify); the worker still re-checks
-  // when `verify: 'self'`. The worker replies with webhook-result.
+  // reflects whether the host authenticated the delivery via the route's signature scheme; it is
+  // false for scheme:none. PluginIngressRoute.verify:'self' is reserved and does not trigger a second
+  // worker-side verification pass. The worker replies with webhook-result.
   | {
       kind: 'webhook';
       id: number;
@@ -61,7 +64,12 @@ export type HostToWorkerMessage =
       // Per-instance-resolved config for this delivery (like the `hook` message's config). The worker
       // exposes it as ctx.config for the duration of the handler via hookConfigStore.
       config?: Record<string, unknown>;
-    };
+    }
+  // Host→Worker: dispatch a search query to a plugin that registered as a SearchProvider. The worker
+  // runs the plugin's search handler and replies with `search-result` (same `id` correlation as
+  // hook/health-check/webhook). No per-session config: search is a global query; session scoping travels
+  // inside SearchQuery.sessionIds (scoped by SearchService from the caller's API-key).
+  | { kind: 'search'; id: number; query: SearchQuery };
 
 export type WorkerToHostMessage =
   | { kind: 'ready' }
@@ -90,6 +98,13 @@ export type WorkerToHostMessage =
       body?: string;
       error?: string;
     }
+  // The plugin called ctx.registerSearchProvider → the worker tells the host "I provide search." The host
+  // then creates a PluginSearchProvider wrapping this worker and registers it in SearchProviderRegistry.
+  | { kind: 'search-provider-register' }
+  // The worker's search-handler result for a host `search` request. ok:true carries SearchResults; ok:false
+  // carries the handler's error (handler threw / no handler / etc.).
+  | { kind: 'search-result'; id: number; ok: true; results: SearchResults }
+  | { kind: 'search-result'; id: number; ok: false; error: string }
   | { kind: 'error'; error: string };
 
 /**

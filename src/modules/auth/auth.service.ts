@@ -1,6 +1,7 @@
-import { Injectable, NotFoundException, UnauthorizedException, OnModuleInit } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException, UnauthorizedException, OnModuleInit } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { IsNull, MoreThan, Not, Repository } from 'typeorm';
 import { randomBytes } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
@@ -10,6 +11,7 @@ import { hashApiKey } from './api-key-hash';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 import { CreateApiKeyDto, UpdateApiKeyDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
+import { EventsGateway, type ApiKeyEvictionReason } from '../events/events.gateway';
 
 const API_KEY_FILE = join(process.cwd(), 'data', '.api-key');
 
@@ -55,6 +57,7 @@ export class AuthService implements OnModuleInit {
   constructor(
     @InjectRepository(ApiKey, 'main')
     private readonly apiKeyRepository: Repository<ApiKey>,
+    private readonly moduleRef: ModuleRef,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -170,20 +173,54 @@ export class AuthService implements OnModuleInit {
   async update(id: string, dto: UpdateApiKeyDto): Promise<ApiKey> {
     const apiKey = await this.findOne(id);
 
+    const removesOrSchedulesLastAdmin =
+      (dto.role !== undefined && dto.role !== ApiKeyRole.ADMIN) ||
+      (dto.expiresAt !== undefined && dto.expiresAt !== null);
+    if (removesOrSchedulesLastAdmin) {
+      await this.assertNotLastUsableAdmin(apiKey);
+    }
+
+    // Capture the authorization-relevant fields BEFORE applying the change. Only a change to role,
+    // allowedIps, allowedSessions, or expiry can widen or restrict what an already-connected WebSocket
+    // socket may see, so only those trigger eviction of live /events sockets — a benign rename must
+    // NOT disconnect clients. REST enforces the new state immediately; without eviction a live socket
+    // keeps streaming events for sessions/IPs the key just lost until it resubscribes or drops.
+    const before = {
+      role: apiKey.role,
+      allowedIps: apiKey.allowedIps,
+      allowedSessions: apiKey.allowedSessions,
+      expiresAt: apiKey.expiresAt,
+    };
+
     if (dto.name) apiKey.name = dto.name;
     if (dto.role) apiKey.role = dto.role;
     if (dto.allowedIps !== undefined) apiKey.allowedIps = dto.allowedIps;
     if (dto.allowedSessions !== undefined) apiKey.allowedSessions = dto.allowedSessions;
     if (dto.expiresAt !== undefined) apiKey.expiresAt = dto.expiresAt ? new Date(dto.expiresAt) : null;
 
-    return this.apiKeyRepository.save(apiKey);
+    const saved = await this.apiKeyRepository.save(apiKey);
+
+    // Compare membership, not order: a pure reorder of allowedIps/allowedSessions is a no-op for the
+    // .includes()-based enforcement, so sort before stringify to avoid a spurious eviction on a reorder.
+    const ordered = (v: string[] | null) => (v ? [...v].sort() : v);
+    const authzChanged =
+      saved.role !== before.role ||
+      saved.expiresAt?.getTime() !== before.expiresAt?.getTime() ||
+      JSON.stringify(ordered(saved.allowedIps)) !== JSON.stringify(ordered(before.allowedIps)) ||
+      JSON.stringify(ordered(saved.allowedSessions)) !== JSON.stringify(ordered(before.allowedSessions));
+    if (authzChanged) {
+      this.evictActiveSockets(id, 'authorization_changed');
+    }
+    return saved;
   }
 
   async delete(id: string): Promise<void> {
     const apiKey = await this.findOne(id);
+    await this.assertNotLastUsableAdmin(apiKey);
     // Drop any un-flushed usage accumulator so a deleted key leaves nothing behind in the Map.
     this.pendingUsage.delete(id);
     await this.apiKeyRepository.remove(apiKey);
+    this.evictActiveSockets(id, 'deleted');
     this.logger.log(`API key deleted: ${apiKey.name}`, {
       keyId: id,
       action: 'api_key_deleted',
@@ -192,11 +229,54 @@ export class AuthService implements OnModuleInit {
 
   async revoke(id: string): Promise<ApiKey> {
     const apiKey = await this.findOne(id);
+    await this.assertNotLastUsableAdmin(apiKey);
     // A revoked key fails validation before its next flush, so its accumulator would orphan —
     // drop it here.
     this.pendingUsage.delete(id);
     apiKey.isActive = false;
-    return this.apiKeyRepository.save(apiKey);
+    const saved = await this.apiKeyRepository.save(apiKey);
+    // Kick any WebSocket connections already authenticated with this key: without this, a revoked
+    // key keeps receiving events on already-subscribed sockets until they happen to disconnect.
+    this.evictActiveSockets(id, 'revoked');
+    return saved;
+  }
+
+  private async assertNotLastUsableAdmin(target: ApiKey): Promise<void> {
+    const now = new Date();
+    const targetIsUsableAdmin =
+      target.role === ApiKeyRole.ADMIN && target.isActive && (!target.expiresAt || target.expiresAt > now);
+    if (!targetIsUsableAdmin) return;
+
+    const otherUsableAdmins = await this.apiKeyRepository.count({
+      where: [
+        { id: Not(target.id), role: ApiKeyRole.ADMIN, isActive: true, expiresAt: IsNull() },
+        { id: Not(target.id), role: ApiKeyRole.ADMIN, isActive: true, expiresAt: MoreThan(now) },
+      ],
+    });
+    if (otherUsableAdmins === 0) {
+      throw new ConflictException('Cannot remove the last active admin key');
+    }
+  }
+
+  /**
+   * Disconnect every WebSocket socket authenticated with the given key id. Resolved lazily via
+   * ModuleRef (not constructor injection) to avoid a static DI cycle between AuthModule and
+   * EventsModule. Best-effort: if the WS gateway isn't loaded (or has no sockets for the key),
+   * this is a silent no-op.
+   */
+  private evictActiveSockets(keyId: string, reason: ApiKeyEvictionReason = 'revoked'): void {
+    try {
+      const gateway = this.moduleRef.get(EventsGateway, { strict: false });
+      if (gateway) {
+        gateway.evictApiKey(keyId, reason);
+      }
+    } catch (error) {
+      // Eviction is best-effort: the key's DB state is already authoritative (validateApiKey
+      // rejects it), so a failure here must never roll back the revoke/delete.
+      this.logger.warn(`Failed to evict WebSocket sockets for key ${keyId}`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async validateApiKey(rawKey: string, clientIp?: string, sessionId?: string): Promise<ApiKey> {

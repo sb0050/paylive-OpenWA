@@ -51,9 +51,8 @@ RUN npm run build
 # Runtime stage
 FROM node:22-slim
 
-# Install Chrome dependencies
+# Install Chrome dependencies (avoid Debian's chromium package due to SIGTRAP in non-root)
 RUN apt-get update && apt-get install -y \
-    chromium \
     curl \
     fonts-ipafont-gothic \
     fonts-wqy-zenhei \
@@ -61,12 +60,24 @@ RUN apt-get update && apt-get install -y \
     fonts-kacst \
     fonts-freefont-ttf \
     libxss1 \
+    libnss3 \
+    libnspr4 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Chrome path for Puppeteer
+# Set Puppeteer skip download (we install it dynamically later)
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Create app directory
 WORKDIR /app
@@ -75,13 +86,25 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
 
+# NOTE: Chrome for Testing has no linux-arm64 build, so this example targets linux/amd64.
+# For arm64, install Debian's `chromium` package and point PUPPETEER_EXECUTABLE_PATH to
+# /usr/bin/chromium — see the repo's Dockerfile for the mixed multi-arch build.
+# Download Chrome for Testing via Puppeteer and point ENV to it
+RUN mkdir -p /opt/puppeteer && \
+    PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31' && \
+    chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
+    test -n "$chrome_path" && \
+    ln -s "$chrome_path" /usr/local/bin/puppeteer-chrome
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/puppeteer-chrome
+
 # Copy build output
 COPY --from=build /app/dist ./dist
 
 # Create non-root user
 RUN groupadd -r openwa && useradd -r -g openwa openwa
-RUN chown -R openwa:openwa /app
+RUN chown -R openwa:openwa /app /opt/puppeteer
 USER openwa
+
 
 # Expose port
 EXPOSE 2785
@@ -494,9 +517,11 @@ API_KEY_PEPPER=optional-key-hashing-pepper
 # ===========================================
 # WEBHOOK
 # ===========================================
-WEBHOOK_TIMEOUT=30000
-WEBHOOK_RETRY_COUNT=3
+WEBHOOK_TIMEOUT=10000
 WEBHOOK_RETRY_DELAY=5000
+WEBHOOK_DISPATCH_CONCURRENCY=16
+WEBHOOK_DISPATCH_MAX_QUEUED=1000
+# Retry attempts are configured per webhook with the retryCount API field (default 3, range 0-5).
 
 # ===========================================
 # RATE LIMITING
@@ -525,9 +550,10 @@ export default () => ({
     dataPath: process.env.SESSION_DATA_PATH || './.wwebjs_auth',
   },
   webhook: {
-    timeout: parseInt(process.env.WEBHOOK_TIMEOUT, 10) || 30000,
-    retryCount: parseInt(process.env.WEBHOOK_RETRY_COUNT, 10) || 3,
-    retryDelay: parseInt(process.env.WEBHOOK_RETRY_DELAY, 10) || 5000,
+    timeout: parseInt(process.env.WEBHOOK_TIMEOUT || '10000', 10),
+    retryDelay: parseInt(process.env.WEBHOOK_RETRY_DELAY || '5000', 10),
+    dispatchConcurrency: parseInt(process.env.WEBHOOK_DISPATCH_CONCURRENCY || '16', 10),
+    dispatchMaxQueued: parseInt(process.env.WEBHOOK_DISPATCH_MAX_QUEUED || '1000', 10),
   },
   rateLimit: {
     shortTtl: parseInt(process.env.RATE_LIMIT_SHORT_TTL, 10) || 1000,
@@ -725,15 +751,15 @@ groups:
           summary: "WhatsApp session disconnected"
           description: "{{ $value }} session(s) in disconnected state"
 
-      # Failed messages climbing
-      - alert: FailedMessagesRising
-        expr: rate(openwa_messages_failed_total[5m]) > 0
+      # Failed messages currently stored
+      - alert: FailedMessagesPresent
+        expr: openwa_messages_failed_total > 0
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Messages are failing"
-          description: "openwa_messages_failed_total is increasing over the last 5 minutes"
+          description: "{{ $value }} message(s) are currently in FAILED state"
 
       # Process memory growth (app-exported RSS; ~2GB example threshold)
       - alert: HighProcessMemory
@@ -898,8 +924,8 @@ export class MetricsService {
 | `openwa_sessions_total` | gauge | — | Configured sessions |
 | `openwa_sessions_active` | gauge | — | READY (active) sessions |
 | `openwa_sessions` | gauge | `status` | Session count per status |
-| `openwa_messages_total` | counter | `direction` (`incoming`/`outgoing`) | Messages by direction |
-| `openwa_messages_failed_total` | counter | — | Messages in FAILED state |
+| `openwa_messages_total` | gauge | `direction` (`incoming`/`outgoing`) | Current stored messages by direction |
+| `openwa_messages_failed_total` | gauge | — | Current messages in FAILED state |
 
 ### Grafana Dashboard Definition
 
@@ -918,11 +944,11 @@ export class MetricsService {
       ]
     },
     {
-      "title": "Messages Sent (24h)",
+      "title": "Stored Outgoing Messages",
       "type": "stat",
       "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
       "targets": [
-        { "expr": "increase(openwa_messages_total{direction=\"outgoing\"}[24h])" }
+        { "expr": "openwa_messages_total{direction=\"outgoing\"}" }
       ]
     },
     {
@@ -942,11 +968,11 @@ export class MetricsService {
       ]
     },
     {
-      "title": "Message Rate by Direction",
+      "title": "Stored Messages by Direction",
       "type": "timeseries",
       "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
       "targets": [
-        { "expr": "rate(openwa_messages_total[5m])", "legendFormat": "{{direction}}" }
+        { "expr": "openwa_messages_total", "legendFormat": "{{direction}}" }
       ]
     },
     {
@@ -1040,9 +1066,9 @@ These are the metrics OpenWA actually exports at `GET /api/metrics`:
 | **Sessions** | `openwa_sessions_total` | Configured sessions | Near your expected session count |
 | **Sessions** | `openwa_sessions_active` | READY (active) sessions | Drops below expected |
 | **Sessions** | `openwa_sessions{status="..."}` | Per-status counts (e.g. `disconnected`, `failed`) | `disconnected`/`failed` > 0 |
-| **Messages** | `openwa_messages_total{direction="outgoing"}` | Outgoing messages | Sudden drop |
-| **Messages** | `openwa_messages_total{direction="incoming"}` | Incoming messages | Sudden drop |
-| **Messages** | `openwa_messages_failed_total` | Messages in FAILED state | Rising rate |
+| **Messages** | `openwa_messages_total{direction="outgoing"}` | Current stored outgoing messages | Unexpected change |
+| **Messages** | `openwa_messages_total{direction="incoming"}` | Current stored incoming messages | Unexpected change |
+| **Messages** | `openwa_messages_failed_total` | Current messages in FAILED state | Above acceptable threshold |
 | **System** | `openwa_process_resident_memory_bytes` | RSS | Growth / near limit |
 | **System** | `openwa_process_heap_used_bytes` | V8 heap used | Growth |
 | **System** | `openwa_process_uptime_seconds` | Process uptime | Frequent restarts (resets) |
@@ -1075,59 +1101,17 @@ flowchart TB
 
 ### Backup Script
 
-```bash
-#!/bin/bash
-# scripts/backup.sh
-
-set -e
-
-DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="/backups"
-S3_BUCKET="s3://openwa-backups"
-
-# Database backup
-echo "Backing up database..."
-pg_dump -Fc $DATABASE_URL > $BACKUP_DIR/db_$DATE.dump
-gzip $BACKUP_DIR/db_$DATE.dump
-
-# Session data backup
-echo "Backing up session data..."
-tar -czf $BACKUP_DIR/sessions_$DATE.tar.gz /app/.wwebjs_auth
-
-# Upload to S3
-echo "Uploading to S3..."
-aws s3 cp $BACKUP_DIR/db_$DATE.dump.gz $S3_BUCKET/database/
-aws s3 cp $BACKUP_DIR/sessions_$DATE.tar.gz $S3_BUCKET/sessions/
-
-# Cleanup local files older than 7 days
-find $BACKUP_DIR -mtime +7 -delete
-
-echo "Backup completed: $DATE"
-```
+Use the shipped [`scripts/backup.sh`](../scripts/backup.sh); do not maintain a second inline copy.
+It captures the always-SQLite `main.sqlite`, the configured data database, whatsapp-web.js session
+state (`SESSION_DATA_PATH`), Baileys auth state (`BAILEYS_AUTH_DIR`, default `./data/baileys`), local
+media, installed plugin packages, plugin registry/state, and generated secret/config files. See the
+authoritative [backup runbook](./11-operational-runbooks.md#runbook-database-backup).
 
 ### Recovery Procedure
 
-```bash
-#!/bin/bash
-# scripts/restore.sh
-
-set -e
-
-BACKUP_DATE=$1
-
-# Download from S3
-aws s3 cp s3://openwa-backups/database/db_$BACKUP_DATE.dump.gz /tmp/
-aws s3 cp s3://openwa-backups/sessions/sessions_$BACKUP_DATE.tar.gz /tmp/
-
-# Restore database
-gunzip /tmp/db_$BACKUP_DATE.dump.gz
-pg_restore -d $DATABASE_URL /tmp/db_$BACKUP_DATE.dump
-
-# Restore sessions
-tar -xzf /tmp/sessions_$BACKUP_DATE.tar.gz -C /
-
-echo "Restore completed"
-```
+Use the matching [`scripts/restore.sh`](../scripts/restore.sh) and follow the
+[restore runbook](./11-operational-runbooks.md#runbook-restore-from-backup). Stop the application
+before restoring; PostgreSQL dumps still require the explicit `psql` step described there.
 
 ## 10.8 Scaling Guidelines
 

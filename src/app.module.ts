@@ -5,6 +5,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerModule } from '@nestjs/throttler';
+import Redis from 'ioredis';
+import { RedisThrottlerStorage } from './common/throttler/redis-throttler.storage';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { SessionModule } from './modules/session/session.module';
@@ -21,6 +23,8 @@ import { InfraModule } from './modules/infra/infra.module';
 import { EventsModule } from './modules/events/events.module';
 import { ContactModule } from './modules/contact/contact.module';
 import { GroupModule } from './modules/group/group.module';
+import { ProfileModule } from './modules/profile/profile.module';
+import { CallModule } from './modules/call/call.module';
 import { LabelModule } from './modules/label/label.module';
 import { ChannelModule } from './modules/channel/channel.module';
 import { CacheModule } from './common/cache';
@@ -34,6 +38,7 @@ import { PluginsModule } from './core/plugins';
 import { PluginsApiModule } from './modules/plugins/plugins.module';
 import { AgentToolsModule } from './core/agent-tools/agent-tools.module';
 import { IntegrationModule } from './modules/integration/integration.module';
+import { SearchModule } from './modules/search/search.module';
 
 // Only import QueueModule if explicitly enabled to avoid Redis connection errors
 const queueModules: Array<Type | DynamicModule> = [];
@@ -43,6 +48,14 @@ if (process.env.QUEUE_ENABLED === 'true') {
     QueueModule: Type;
   };
   queueModules.push(queueModule.QueueModule);
+}
+
+// Global message search. Opt-out via SEARCH_ENABLED=false: the module (route + provider + registry)
+// is absent entirely — zero footprint, no DI wiring. Mirrors the queueModules/MCP conditional shape so
+// an opt-out deployment never even loads the search providers. Default is ON for zero-config first boot.
+const searchModules: Array<Type | DynamicModule> = [];
+if (process.env.SEARCH_ENABLED !== 'false') {
+  searchModules.push(SearchModule);
 }
 
 // Only mount the MCP server if explicitly enabled to avoid startup cost and
@@ -103,7 +116,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
         const synchronize = configService.get<boolean>('database.synchronize', true);
         return {
           name: 'main',
-          type: 'sqlite' as const,
+          type: 'better-sqlite3' as const,
           database: configService.get<string>('database.database', './data/main.sqlite'),
           entities: [
             __dirname + '/modules/auth/**/*.entity{.ts,.js}',
@@ -194,7 +207,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
         return {
           ...baseConfig,
           name: 'data',
-          type: 'sqlite' as const,
+          type: 'better-sqlite3' as const,
           database: configService.get<string>('dataDatabase.database', './data/openwa.sqlite'),
           synchronize,
           migrationsRun: !synchronize,
@@ -202,12 +215,14 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
       },
     }),
 
-    // Rate limiting
+    // Rate limiting. When REDIS_ENABLED, the hit-count storage moves to Redis so limits aggregate
+    // across replicas; otherwise the default in-memory (per-process) storage is used. Default off —
+    // a single-node deployment gains nothing from Redis storage, and it adds a connection dep.
     ThrottlerModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        throttlers: [
+      useFactory: (configService: ConfigService) => {
+        const throttlers = [
           {
             name: 'short',
             ttl: configService.get<number>('api.rateLimit.shortTtl', 1000),
@@ -223,8 +238,23 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
             ttl: configService.get<number>('api.rateLimit.longTtl', 3600000),
             limit: configService.get<number>('api.rateLimit.longLimit', 1000),
           },
-        ],
-      }),
+        ];
+        // Fail-open on Redis error (see RedisThrottlerStorage), so a Redis outage never blocks the API.
+        const redisStorage =
+          process.env.REDIS_ENABLED === 'true'
+            ? new RedisThrottlerStorage(
+                new Redis({
+                  host: configService.get<string>('redis.host', 'localhost'),
+                  port: configService.get<number>('redis.port', 6379),
+                  username: configService.get<string>('redis.username'),
+                  password: configService.get<string>('redis.password'),
+                  connectTimeout: configService.get<number>('redis.connectTimeoutMs', 5000),
+                  maxRetriesPerRequest: 3,
+                }),
+              )
+            : undefined;
+        return { throttlers, ...(redisStorage ? { storage: redisStorage } : {}) };
+      },
     }),
 
     // Core modules
@@ -247,6 +277,8 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     InfraModule,
     ContactModule,
     GroupModule,
+    ProfileModule, // Own-profile API (name / status / picture)
+    CallModule, // Incoming-call API (reject a ringing call)
     LabelModule, // Phase 3: Labels Management
     ChannelModule, // Phase 3: Channels/Newsletter
     StatsModule, // Phase 3: Statistics Dashboard
@@ -256,6 +288,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     PluginsApiModule, // Phase 5: Plugins API
     AgentToolsModule, // Agent-invocable tool registry (protocol-neutral)
     IntegrationModule, // Integration Fabric: @Public provider-webhook ingress + fast-ack pipeline
+    ...searchModules, // Global message search (opt-out via SEARCH_ENABLED=false; default ON)
     ...mcpModules, // MCP Streamable-HTTP server (opt-in via MCP_ENABLED=true)
     ...serveStaticModules, // Bundled dashboard SPA (production single-port setup)
   ],

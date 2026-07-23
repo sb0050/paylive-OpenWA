@@ -1,4 +1,6 @@
 import { IngressService, extractConversationId } from './ingress.service';
+import { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
+import { createHmac } from 'node:crypto';
 
 function deps(overrides: Record<string, unknown> = {}) {
   return {
@@ -44,8 +46,52 @@ describe('IngressService.handle', () => {
     const svc = new IngressService(d);
     const res = await svc.handle(req);
     expect(d.events.recordOrSkip).toHaveBeenCalled();
-    expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: 'd1' }), 'd1');
+    expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: 'd1', method: 'POST' }), 'd1');
     expect(res.status).toBe(202);
+  });
+
+  it('uses the signed webhook-id as the default Standard Webhooks dedup key', async () => {
+    const rawKey = Buffer.from('0123456789abcdef0123456789abcdef', 'hex');
+    const secret = `v1,whsec_${rawKey.toString('base64')}`;
+    const body = '{}';
+    const timestamp = '1000';
+    const webhookId = 'msg_signed_1';
+    const signature = 'v1,' + createHmac('sha256', rawKey).update(`${webhookId}.${timestamp}.${body}`).digest('base64');
+    const d = deps({
+      instances: {
+        resolve: jest.fn().mockResolvedValue({
+          id: 'chatwoot:acct1',
+          pluginId: 'chatwoot',
+          instanceId: 'acct1',
+          secret,
+          enabled: true,
+          sessionScope: 'sess-1',
+          verifyToken: null,
+        }),
+      },
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'standard-webhooks' },
+      }),
+      now: () => 1_000_000,
+    });
+
+    const res = await new IngressService(d).handle({
+      ...req,
+      rawBody: body,
+      headers: {
+        'webhook-id': webhookId,
+        'webhook-timestamp': timestamp,
+        'webhook-signature': signature,
+      },
+    });
+
+    expect(res.status).toBe(202);
+    expect(d.events.recordOrSkip).toHaveBeenCalledWith(expect.objectContaining({ providerDeliveryId: webhookId }));
+    expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: webhookId }), webhookId);
   });
 
   it('short-circuits a duplicate delivery with 200 and no enqueue', async () => {
@@ -267,5 +313,172 @@ describe('extractConversationId', () => {
 
   it('returns undefined on a malformed body without throwing', () => {
     expect(extractConversationId({ jsonPointer: '/a/b' }, {}, 'not json')).toBeUndefined();
+  });
+});
+
+describe('IngressService.handle — response contract', () => {
+  const baseReq = {
+    pluginId: 'p',
+    instanceId: 'i1',
+    route: 'send-sms',
+    method: 'POST',
+    headers: { 'x-delivery': 'd1' },
+    query: {} as Record<string, string>,
+    rawBody: '{}',
+  };
+
+  function depsWith(overrides: Record<string, unknown> = {}) {
+    return {
+      instances: {
+        resolve: jest.fn().mockResolvedValue({
+          id: 'p:i1',
+          pluginId: 'p',
+          instanceId: 'i1',
+          secret: 's',
+          enabled: true,
+          sessionScope: 'sess-1',
+          verifyToken: null,
+        }),
+      },
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'send-sms',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+      }),
+      events: { recordOrSkip: jest.fn().mockResolvedValue(true) },
+      enqueue: jest.fn().mockResolvedValue(undefined),
+      log: jest.fn(),
+      now: () => 0,
+      ...overrides,
+    };
+  }
+
+  it('rejects 503 on a dead session BEFORE dedup or enqueue (no dedup trap)', async () => {
+    const d = depsWith({
+      sessionStatus: jest.fn().mockReturnValue(undefined),
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'send-sms',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+        response: { preflight: [{ type: 'session-alive' }] },
+      }),
+    });
+    const res = await new IngressService(d).handle(baseReq);
+    expect(res.status).toBe(503);
+    expect(d.events.recordOrSkip).not.toHaveBeenCalled();
+    expect(d.enqueue).not.toHaveBeenCalled();
+    expect(d.log).toHaveBeenCalledWith(
+      'ingress_preflight_rejected',
+      expect.objectContaining({ status: 503, route: 'send-sms' }),
+    );
+  });
+
+  it('passes a READY session through to ack + enqueue', async () => {
+    const d = depsWith({
+      sessionStatus: jest.fn().mockReturnValue(EngineStatus.READY),
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'send-sms',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+        response: { preflight: [{ type: 'session-alive' }] },
+      }),
+    });
+    const res = await new IngressService(d).handle(baseReq);
+    expect(res.status).toBe(202);
+    expect(d.enqueue).toHaveBeenCalled();
+  });
+
+  it('renders a declared ack status/body/headers', async () => {
+    const d = depsWith({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'send-sms',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+        response: { ack: { status: 200, body: '{"ok":true}', headers: { 'content-type': 'application/json' } } },
+      }),
+    });
+    const res = await new IngressService(d).handle(baseReq);
+    expect(res.status).toBe(200);
+    expect(res.body).toBe('{"ok":true}');
+    expect(res.headers).toEqual({ 'content-type': 'application/json' });
+  });
+
+  it('returns the ack for a response route WITHOUT awaiting a slow enqueue', async () => {
+    let resolveEnqueue: () => void;
+    const enqueuePromise = new Promise<unknown>(resolve => {
+      // Promise resolve requires an argument; wrap it so resolveEnqueue stays a 0-arg () => void.
+      resolveEnqueue = () => resolve(undefined);
+    });
+    const d = depsWith({
+      enqueue: jest.fn().mockReturnValue(enqueuePromise),
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'send-sms',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+        response: { ack: { status: 200 } },
+      }),
+    });
+    const res = await new IngressService(d).handle(baseReq);
+    expect(res.status).toBe(200); // ack returned before enqueue resolved
+    expect(d.enqueue).toHaveBeenCalled();
+    resolveEnqueue!();
+  });
+
+  it('survives a rejecting enqueue on a response route (defensive .catch, no unhandled rejection)', async () => {
+    const d = depsWith({
+      log: jest.fn(),
+      enqueue: jest.fn().mockRejectedValue(new Error('boom')),
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'send-sms',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+        response: { ack: { status: 200 } },
+      }),
+    });
+    const res = await new IngressService(d).handle(baseReq);
+    expect(res.status).toBe(200); // ack returned despite the rejected enqueue
+    // The rejected enqueue is caught + logged, not thrown. Flush microtasks so the .catch handler runs.
+    await new Promise(resolve => setImmediate(resolve));
+    expect(d.log).toHaveBeenCalledWith(
+      'ingress_enqueue_unhandled',
+      expect.objectContaining({ deliveryId: 'd1', error: 'boom' }),
+    );
+  });
+
+  it('keeps the duplicate path as 200 "duplicate" regardless of a declared ack', async () => {
+    const d = depsWith({
+      events: { recordOrSkip: jest.fn().mockResolvedValue(false) },
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'send-sms',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+        response: { ack: { status: 200, body: '{"ok":true}' } },
+      }),
+    });
+    const res = await new IngressService(d).handle(baseReq);
+    expect(res.status).toBe(200);
+    expect(res.body).toBe('duplicate');
+    expect(d.enqueue).not.toHaveBeenCalled();
   });
 });

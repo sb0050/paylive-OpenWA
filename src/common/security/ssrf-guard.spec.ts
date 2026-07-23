@@ -58,6 +58,9 @@ describe('isBlockedAddress', () => {
     ['::ffff:0:7f00:1', 'IPv4-translatable loopback 127.0.0.1 (RFC6052, hex)'],
     ['::ffff:0:127.0.0.1', 'IPv4-translatable loopback (RFC6052, dotted tail)'],
     ['::ffff:0:a9fe:a9fe', 'IPv4-translatable cloud metadata 169.254.169.254 (RFC6052)'],
+    ['0:0:0:0:0:ffff:7f00:1', 'fully-expanded IPv4-mapped loopback 127.0.0.1 (hex)'],
+    ['0:0:0:0:0:ffff:127.0.0.1', 'fully-expanded IPv4-mapped loopback (dotted tail)'],
+    ['0:0:0:0:0:ffff:a9fe:a9fe', 'fully-expanded IPv4-mapped cloud metadata 169.254.169.254'],
   ])('blocks %s (%s)', ip => {
     expect(isBlockedAddress(ip)).toBe(true);
   });
@@ -71,6 +74,8 @@ describe('isBlockedAddress', () => {
     ['2002:0808:0808::', '6to4 of public 8.8.8.8 stays allowed'],
     ['64:ff9b::0808:0808', 'NAT64 of public 8.8.8.8 stays allowed'],
     ['::ffff:0:0808:0808', 'IPv4-translatable public 8.8.8.8 stays allowed'],
+    ['0:0:0:0:0:ffff:0808:0808', 'fully-expanded IPv4-mapped public 8.8.8.8 stays allowed (hex)'],
+    ['0:0:0:0:0:ffff:8.8.8.8', 'fully-expanded IPv4-mapped public 8.8.8.8 stays allowed (dotted)'],
   ])('allows %s (%s)', ip => {
     expect(isBlockedAddress(ip)).toBe(false);
   });
@@ -304,6 +309,82 @@ describe('withSafeFetch (guarded + pinned fetch)', () => {
       SsrfBlockedError,
     );
     expect(use).not.toHaveBeenCalled();
+  });
+
+  it('cancels an unread response body before tearing down the dispatcher (#887)', async () => {
+    // Status-only callers leave the body unread; if we destroy the Agent while the stream is still
+    // open, undici can emit TypeError: terminated / ECONNRESET as an uncaughtException. Cancelling
+    // the unread body before destroy closes that path.
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    (dnsPromises.lookup as jest.Mock).mockResolvedValueOnce([{ address: '93.184.216.34', family: 4 }]);
+    (undiciFetch as jest.Mock).mockResolvedValue({
+      status: 200,
+      type: 'basic',
+      bodyUsed: false,
+      body: { cancel },
+    });
+    const use = jest.fn(() => ({ ok: true, status: 200 }));
+
+    await expect(withSafeFetch('https://example.com/hook', {}, use, { guard: true })).resolves.toEqual({
+      ok: true,
+      status: 200,
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not cancel a body the caller already consumed', async () => {
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    (dnsPromises.lookup as jest.Mock).mockResolvedValueOnce([{ address: '93.184.216.34', family: 4 }]);
+    (undiciFetch as jest.Mock).mockResolvedValue({
+      status: 200,
+      type: 'basic',
+      bodyUsed: true,
+      body: { cancel },
+    });
+
+    await withSafeFetch('https://example.com/hook', {}, () => 'consumed', { guard: true });
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it('still cancels an unread body when use throws', async () => {
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    (dnsPromises.lookup as jest.Mock).mockResolvedValueOnce([{ address: '93.184.216.34', family: 4 }]);
+    (undiciFetch as jest.Mock).mockResolvedValue({
+      status: 500,
+      type: 'basic',
+      bodyUsed: false,
+      body: { cancel },
+    });
+
+    await expect(
+      withSafeFetch(
+        'https://example.com/hook',
+        {},
+        () => {
+          throw new Error('HTTP 500');
+        },
+        { guard: true },
+      ),
+    ).rejects.toThrow('HTTP 500');
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels an unread body when the response is a refused redirect (#887)', async () => {
+    // assertNoRedirect throws before `use` runs; the settle must still happen so a refused 3xx
+    // cannot reach dispatcher.destroy() with an unread body either.
+    const cancel = jest.fn().mockResolvedValue(undefined);
+    (dnsPromises.lookup as jest.Mock).mockResolvedValueOnce([{ address: '93.184.216.34', family: 4 }]);
+    (undiciFetch as jest.Mock).mockResolvedValue({
+      status: 302,
+      type: 'basic',
+      bodyUsed: false,
+      body: { cancel },
+    });
+    const use = jest.fn();
+
+    await expect(withSafeFetch('https://example.com/hook', {}, use, { guard: true })).rejects.toThrow(SsrfBlockedError);
+    expect(use).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 });
 

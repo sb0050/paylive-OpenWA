@@ -17,6 +17,7 @@ import { Webhook } from '../entities/webhook.entity';
 import { WebhookFilters } from '../filters/filter-types';
 import { IsValidWebhookFilters } from '../filters/filter-validation';
 import { IsHeaderMap } from './is-header-map.validator';
+import { ToStrictBoolean, ToStrictNumber } from '../../../common/utils/strict-boolean';
 
 const FILTERS_API_DESCRIPTION =
   'Optional smart pre-filter. When set, every condition must match (AND) for the webhook to fire. Omit or null to fire on every subscribed event.';
@@ -27,10 +28,11 @@ const FILTERS_API_EXAMPLE = {
   ],
 };
 
-// Reserved: valid webhook subscription targets that are not dispatched yet (no engine
-// emit source). Kept in WEBHOOK_EVENTS so existing subscriptions validate; tracked
-// separately so the catalog/emitter drift guard can whitelist them as intentional.
-export const WEBHOOK_RESERVED_EVENTS = ['group.join', 'group.leave', 'group.update'] as const;
+// Reserved: valid webhook subscription targets that are declared but have no engine emit
+// source yet. Currently EMPTY — the former occupants (group.join/leave/update) are now
+// dispatched by both engines. Kept as a named export so the catalog/emitter drift guard
+// can whitelist any future intentionally-undeployed event without changing its imports.
+export const WEBHOOK_RESERVED_EVENTS = [] as const;
 
 export const WEBHOOK_EVENTS = [
   'message.received',
@@ -39,10 +41,16 @@ export const WEBHOOK_EVENTS = [
   'message.failed',
   'message.revoked',
   'message.reaction',
+  'message.edited',
   'session.status',
   'session.qr',
   'session.authenticated',
   'session.disconnected',
+  'session.reconnect_loop',
+  'group.join',
+  'group.leave',
+  'group.update',
+  'call.received',
   ...WEBHOOK_RESERVED_EVENTS,
 ] as const;
 
@@ -61,7 +69,10 @@ export class CreateWebhookDto {
   @ApiPropertyOptional({
     description: "Event types to subscribe to. '*' subscribes to all events.",
     example: ['message.received', 'session.status'],
-    enum: WEBHOOK_EVENTS,
+    enum: [...WEBHOOK_EVENTS, '*'],
+    type: String,
+    isArray: true,
+    minItems: 1,
   })
   @IsOptional()
   @IsArray()
@@ -98,6 +109,7 @@ export class CreateWebhookDto {
     minimum: 0,
     maximum: 5,
   })
+  @ToStrictNumber()
   @IsOptional()
   @IsInt()
   @Min(0)
@@ -111,7 +123,13 @@ export class UpdateWebhookDto {
   @IsUrl({ require_tld: false })
   url?: string;
 
-  @ApiPropertyOptional({ description: "Event types to subscribe to. '*' subscribes to all events." })
+  @ApiPropertyOptional({
+    description: "Event types to subscribe to. '*' subscribes to all events.",
+    enum: [...WEBHOOK_EVENTS, '*'],
+    type: String,
+    isArray: true,
+    minItems: 1,
+  })
   @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
@@ -135,11 +153,13 @@ export class UpdateWebhookDto {
   filters?: WebhookFilters | null;
 
   @ApiPropertyOptional({ description: 'Enable/disable webhook' })
+  @ToStrictBoolean()
   @IsOptional()
   @IsBoolean()
   active?: boolean;
 
   @ApiPropertyOptional({ description: 'Retry count' })
+  @ToStrictNumber()
   @IsOptional()
   @IsInt()
   @Min(0)

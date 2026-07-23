@@ -13,12 +13,20 @@ const RUNAWAY_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/runaway-plugin
 const CTX_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/ctx-aware-plugin.cjs');
 const HOOK_CONFIG_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/hook-config-plugin.cjs');
 const CTX_LIFECYCLE_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/ctx-lifecycle-plugin.cjs');
+const SEARCH_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/search-plugin.cjs');
 const flushAsync = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
 
 // Run the TS bootstrap inside the worker via ts-node. The base tsconfig is nodenext; we pin the
 // worker's transpile to CommonJS (same override the jest/ts-jest config uses) so `require()` works.
 // Production loads the compiled `worker-bootstrap.js` directly and needs none of this.
-const TS_NODE_OPTS = JSON.stringify({ module: 'commonjs', moduleResolution: 'node', resolvePackageJsonExports: false });
+const TS_NODE_OPTS = JSON.stringify({
+  module: 'commonjs',
+  moduleResolution: 'node',
+  resolvePackageJsonExports: false,
+  // Same bridge as the jest/ts-jest override: TypeScript 6 rejects the legacy resolution pair
+  // outright unless the deprecation is acknowledged. Revisit before TypeScript 7.
+  ignoreDeprecations: '6.0',
+});
 
 const makeChannel = (): WorkerThreadChannel =>
   new WorkerThreadChannel({
@@ -216,6 +224,43 @@ describe('plugin worker — real worker_threads round-trip (B1)', () => {
     host.sendConfigChange({ a: 2 });
     await flushAsync();
     await expect(host.healthCheck(3000)).resolves.toEqual({ healthy: true, message: JSON.stringify({ a: 2 }) });
+
+    await host.terminate();
+  });
+
+  it('round-trips a search: the worker registers a provider and the host dispatches a query', async () => {
+    let registered = false;
+    const host = new PluginWorkerHost(
+      makeChannel(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        registered = true;
+      },
+    );
+
+    await host.load(SEARCH_FIXTURE, { pluginId: 'search-fixture', config: {} });
+    await host.runLifecycle('onEnable'); // the plugin calls ctx.registerSearchProvider here
+    await flushAsync(); // let search-provider-register land
+    expect(registered).toBe(true);
+
+    const reply = await host.dispatchSearch({ query: { q: 'hello' }, timeoutMs: 5000 });
+    expect(reply.ok).toBe(true);
+    if (reply.ok) {
+      expect(reply.results.provider).toBe('plugin:search-fixture');
+      expect(reply.results.hits).toHaveLength(1);
+      expect(reply.results.hits[0].body).toBe('match for hello');
+      expect(reply.results.hits[0].snippet).toBe('<mark>hello</mark>');
+    }
+
+    // Empty query → empty hits (structured-clone-safe SearchResults round-trip).
+    const empty = await host.dispatchSearch({ query: { q: '' }, timeoutMs: 5000 });
+    expect(empty.ok).toBe(true);
+    if (empty.ok) expect(empty.results.hits).toEqual([]);
 
     await host.terminate();
   });

@@ -2,6 +2,7 @@ import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import en from './locales/en.json';
+import de from './locales/de.json';
 import es from './locales/es.json';
 import he from './locales/he.json';
 import zhCN from './locales/zh-CN.json';
@@ -11,14 +12,16 @@ import te from './locales/te.json';
 import fr from './locales/fr.json';
 import it from './locales/it.json';
 import ptBR from './locales/pt-BR.json';
+import ko from './locales/ko.json';
 
-export const supportedLanguages = ['en', 'es', 'he', 'zh-CN', 'zh-HK', 'ar', 'te', 'fr', 'it', 'pt-BR'] as const;
+export const supportedLanguages = ['en', 'de', 'es', 'he', 'zh-CN', 'zh-HK', 'ar', 'te', 'fr', 'it', 'pt-BR', 'ko'] as const;
 export type SupportedLanguage = (typeof supportedLanguages)[number];
 
 export const rtlLanguages: SupportedLanguage[] = ['he', 'ar'];
 
 export const languageOptions: Array<{ value: SupportedLanguage; label: string; compactLabel: string }> = [
   { value: 'en', label: 'English', compactLabel: 'EN' },
+  { value: 'de', label: 'Deutsch', compactLabel: 'DE' },
   { value: 'es', label: 'Español', compactLabel: 'ES' },
   { value: 'he', label: 'עברית', compactLabel: 'עברית' },
   { value: 'zh-CN', label: '简体中文', compactLabel: '简中' },
@@ -28,6 +31,7 @@ export const languageOptions: Array<{ value: SupportedLanguage; label: string; c
   { value: 'fr', label: 'Français', compactLabel: 'FR' },
   { value: 'it', label: 'Italiano', compactLabel: 'IT' },
   { value: 'pt-BR', label: 'Português (Brasil)', compactLabel: 'PT' },
+  { value: 'ko', label: '한국어', compactLabel: 'KO' },
 ];
 
 export function resolveSupportedLanguage(lang?: string): SupportedLanguage {
@@ -52,6 +56,7 @@ void i18n
   .init({
     resources: {
       en: { translation: en },
+      de: { translation: de },
       es: { translation: es },
       he: { translation: he },
       'zh-CN': { translation: zhCN },
@@ -61,6 +66,7 @@ void i18n
       fr: { translation: fr },
       it: { translation: it },
       'pt-BR': { translation: ptBR },
+      ko: { translation: ko },
     },
     fallbackLng: 'en',
     supportedLngs: supportedLanguages as unknown as string[],

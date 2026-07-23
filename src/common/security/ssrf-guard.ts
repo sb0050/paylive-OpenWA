@@ -20,6 +20,22 @@ export class SsrfBlockedError extends Error {
 export const SSRF_BLOCKED_CLIENT_MESSAGE = 'Destination address is not allowed';
 
 /**
+ * Map an error to a client/surfaced message, redacting SSRF detail. An `SsrfBlockedError`'s message
+ * names the resolved internal IP ("… resolves to a blocked internal address: 10.0.0.5") — a recon /
+ * metadata-service probe oracle when surfaced verbatim to an HTTP response, a persisted DLQ row, or a
+ * hook payload. Log the full detail server-side (when a `logger` is supplied) and return the generic
+ * {@link SSRF_BLOCKED_CLIENT_MESSAGE} instead; any other error passes through verbatim so genuine
+ * receiver failures (5xx, timeout, bad-zip) keep their actionable text.
+ */
+export function redactSsrfError(error: unknown, logger?: { warn: (message: string) => void }, site?: string): string {
+  if (error instanceof SsrfBlockedError) {
+    logger?.warn(`SSRF guard blocked ${site ?? 'an outbound fetch'}: ${error.message}`);
+    return SSRF_BLOCKED_CLIENT_MESSAGE;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * Outbound webhook SSRF protection. Default ON; disable only with an explicit
  * WEBHOOK_SSRF_PROTECT=false (e.g. a closed network that delivers to internal sidecars — prefer
  * the SSRF_ALLOWED_HOSTS escape-hatch instead of disabling protection wholesale).
@@ -169,6 +185,20 @@ export function isBlockedAddress(ip: string): boolean {
         hextets[3] === 0 &&
         hextets[4] === 0xffff &&
         hextets[5] === 0
+      ) {
+        return isBlockedAddress(hextetsToV4(hextets[6], hextets[7]));
+      }
+      // Fully-expanded IPv4-mapped (::ffff:0:0/96 → 0:0:0:0:0:ffff:X:X): the compressed "::ffff:"
+      // form is caught by the prefix check above, but the fully-expanded literal bypasses it.
+      // Distinct from IPv4-compat (idx5 has no 0xffff) and RFC6052 (0xffff at idx4, not idx5).
+      // Classify by the embedded IPv4 (public stays allowed).
+      if (
+        hextets[0] === 0 &&
+        hextets[1] === 0 &&
+        hextets[2] === 0 &&
+        hextets[3] === 0 &&
+        hextets[4] === 0 &&
+        hextets[5] === 0xffff
       ) {
         return isBlockedAddress(hextetsToV4(hextets[6], hextets[7]));
       }
@@ -348,6 +378,31 @@ export function validatingLookup(): LookupFunction {
 }
 
 /**
+ * Cancel an unread response body before the per-request dispatcher is destroyed.
+ *
+ * Status-only callers (webhook delivery) often leave `response.body` unread. When undici then
+ * tears down the socket — or the peer resets it mid-flight — the body stream can emit an `error`
+ * (`TypeError: terminated` / `ECONNRESET`) with no listener, which becomes a process-fatal
+ * `uncaughtException` (see #887). Cancelling here drains that path safely; already-consumed
+ * bodies (`bodyUsed`) are left alone so streaming readers (media / plugin downloads) are unaffected.
+ */
+async function settleUnreadResponseBody(response: Response): Promise<void> {
+  if (response.bodyUsed || !response.body) return;
+  await response.body.cancel().catch(() => undefined);
+}
+
+/**
+ * Run `use(response)` and always settle an unread body afterwards, even if `use` throws.
+ */
+async function useAndSettleBody<T>(response: Response, use: (response: Response) => Promise<T> | T): Promise<T> {
+  try {
+    return await use(response);
+  } finally {
+    await settleUnreadResponseBody(response);
+  }
+}
+
+/**
  * Perform an SSRF-safe fetch and hand the response to `use`, then tear down the per-request
  * connection. The host is validated and resolved ONCE; the connection is pinned to the vetted IP(s)
  * via an undici dispatcher so it cannot be re-resolved to an internal address between check and
@@ -356,7 +411,9 @@ export function validatingLookup(): LookupFunction {
  * so A-record failover still works. Redirects are refused (the guard only validated the original host).
  *
  * `use` must read everything it needs from the response before returning — the dispatcher (and its
- * sockets) is destroyed once `use` settles, so a still-streaming body would be cut off.
+ * sockets) is destroyed once `use` settles, so a still-streaming body would be cut off. Unread
+ * bodies are cancelled automatically before teardown so status-only callers cannot crash the process
+ * when the peer resets the connection (#887).
  *
  * @param opts.guard - when false (the WEBHOOK_SSRF_PROTECT opt-out), skips validation/pinning and
  *   performs a plain redirect-following fetch. Defaults to true (always guard).
@@ -369,7 +426,7 @@ export async function withSafeFetch<T>(
 ): Promise<T> {
   const guard = opts.guard ?? true;
   if (!guard) {
-    return use(await undiciFetch(rawUrl, { ...init, redirect: 'follow' }));
+    return useAndSettleBody(await undiciFetch(rawUrl, { ...init, redirect: 'follow' }), use);
   }
 
   if (opts.followRedirects) {
@@ -381,7 +438,7 @@ export async function withSafeFetch<T>(
     await resolveSafeFetchTarget(rawUrl);
     const dispatcher = new Agent({ connect: { lookup: validatingLookup() } });
     try {
-      return await use(await undiciFetch(rawUrl, { ...init, redirect: 'follow', dispatcher }));
+      return await useAndSettleBody(await undiciFetch(rawUrl, { ...init, redirect: 'follow', dispatcher }), use);
     } finally {
       await dispatcher.destroy().catch(() => undefined);
     }
@@ -391,8 +448,14 @@ export async function withSafeFetch<T>(
   const dispatcher = target ? new Agent({ connect: { lookup: pinnedLookup(target) } }) : undefined;
   try {
     const response = await undiciFetch(rawUrl, { ...init, redirect: 'manual', dispatcher });
-    assertNoRedirect(response, rawUrl);
-    return await use(response);
+    try {
+      assertNoRedirect(response, rawUrl);
+      return await use(response);
+    } finally {
+      // Settle even when assertNoRedirect throws: a refused 3xx still carries an unread body,
+      // and tearing the dispatcher down with it open is the same crash path as #887.
+      await settleUnreadResponseBody(response);
+    }
   } finally {
     if (dispatcher) await dispatcher.destroy().catch(() => undefined);
   }

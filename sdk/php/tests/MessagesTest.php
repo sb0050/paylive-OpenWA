@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OpenWA\Tests;
 
+use OpenWA\Exceptions\OpenWANotFoundException;
 use PHPUnit\Framework\TestCase;
 
 class MessagesTest extends TestCase
@@ -18,6 +19,24 @@ class MessagesTest extends TestCase
         // statically configured via base_uri, so we assert on path + body.
         $this->assertSame('/api/sessions/s1/messages/send-text', $call['path']);
         $this->assertSame(['chatId' => 'a@c.us', 'text' => 'hi'], $call['body']);
+    }
+
+    public function testListReturnsMessagesPageEnvelope(): void
+    {
+        // The server responds with a {messages, total} page, not a flat array. Pin the shape so a
+        // future change — or a misunderstood "fix" that unwraps it and drops `total` — is caught.
+        $backend = (new MockBackend())->on(200, [
+            'messages' => [['id' => 'm1', 'body' => 'hi', 'chatId' => 'a@c.us']],
+            'total' => 1,
+        ]);
+        $client = $backend->makeClient();
+        $page = $client->messages->list('s1', ['limit' => 10]);
+        $this->assertArrayHasKey('messages', $page);
+        $this->assertIsArray($page['messages']);
+        $this->assertSame('m1', $page['messages'][0]['id']);
+        $this->assertSame(1, $page['total']);
+        $this->assertStringContainsString('/messages', $backend->lastCall()['path']);
+        $this->assertStringContainsString('limit=10', $backend->lastCall()['query']);
     }
 
     public static function mediaSegments(): array
@@ -58,6 +77,29 @@ class MessagesTest extends TestCase
         $this->assertStringContainsString('/messages/react', $backend->calls()[2]['url']);
         $client->messages->delete('s', ['chatId' => 'a@c.us', 'messageId' => 'm']);
         $this->assertStringContainsString('/messages/delete', $backend->calls()[3]['url']);
+    }
+
+    public function testEditMessageUsesEditPath(): void
+    {
+        $backend = (new MockBackend())->on(200, ['messageId' => 'm1', 'timestamp' => 123]);
+        $client = $backend->makeClient();
+        $result = $client->messages->editMessage('s1', ['chatId' => 'a@c.us', 'messageId' => 'm1', 'body' => 'edited']);
+        $call = $backend->lastCall();
+        $this->assertSame('POST', $call['method']);
+        $this->assertSame('/api/sessions/s1/messages/edit', $call['path']);
+        $this->assertSame(['chatId' => 'a@c.us', 'messageId' => 'm1', 'body' => 'edited'], $call['body']);
+        $this->assertSame('m1', $result['messageId']);
+    }
+
+    public function testEditMessage404MapsToNotFoundException(): void
+    {
+        $backend = (new MockBackend())->on(404, [
+            'statusCode' => 404,
+            'message' => 'Message not found',
+            'error' => 'Not Found',
+        ]);
+        $this->expectException(OpenWANotFoundException::class);
+        $backend->makeClient()->messages->editMessage('s1', ['chatId' => 'a@c.us', 'messageId' => 'missing', 'body' => 'x']);
     }
 
     public function testHistoryAndReactionsPath(): void

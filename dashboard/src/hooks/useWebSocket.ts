@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
 
 interface SessionStatusEvent {
   sessionId: string;
@@ -40,9 +41,22 @@ interface MessageReactionEvent {
   timestamp: string;
 }
 
+interface MessageEditedEvent {
+  sessionId: string;
+  messageId: string;
+  chatId: string;
+  body: string;
+  timestamp: number;
+}
+
 interface MessageRevokedEvent {
   sessionId: string;
   id: string;
+  /**
+   * Id of the ORIGINAL deleted message. Optional: whatsapp-web.js can only resolve it when the
+   * original is still in its local store, and Baileys sets it identical to `id`.
+   */
+  revokedId?: string;
   chatId: string;
   from: string;
   to: string;
@@ -58,6 +72,7 @@ interface WebSocketEvents {
   onMessageAck?: (event: MessageAckEvent) => void;
   onMessageReaction?: (event: MessageReactionEvent) => void;
   onMessageRevoked?: (event: MessageRevokedEvent) => void;
+  onMessageEdited?: (event: MessageEditedEvent) => void;
 }
 
 // Shape of the server -> client event envelope produced by the NestJS gateway.
@@ -71,9 +86,15 @@ interface ServerEventEnvelope {
   };
 }
 
-// Use the configured backend in hosted deployments, while keeping the current
-// origin fallback for Docker/nginx setups that proxy websocket traffic.
-const SOCKET_URL = import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL || window.location.origin;
+// Use the configured backend in hosted deployments (VITE_WS_URL, then
+// VITE_API_URL for split-origin), while keeping the origin fallback for
+// Docker/nginx setups that proxy websocket traffic.
+const SOCKET_URL =
+  import.meta.env.VITE_WS_URL ||
+  import.meta.env.VITE_API_URL ||
+  window.location.origin;
+// Warn when the WebSocket origin is an insecure http:// URL on a non-localhost host.
+warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
 
 export function useWebSocket(events: WebSocketEvents = {}) {
   const socketRef = useRef<Socket | null>(null);
@@ -215,11 +236,33 @@ export function useWebSocket(events: WebSocketEvents = {}) {
           events.onMessageRevoked?.({
             sessionId,
             id: String(data.id),
+            // Not String()-coerced like its neighbours: the field is optional on the wire, and
+            // String(undefined) would yield the truthy literal "undefined" and defeat the fallback.
+            revokedId: typeof data.revokedId === 'string' ? data.revokedId : undefined,
             chatId: String(data.chatId),
             from: String(data.from),
             to: String(data.to),
             body: String(data.body ?? ''),
             type: String(data.type),
+            timestamp: Number(data.timestamp),
+          });
+          break;
+        case 'message.edited':
+          // Keep optional/malformed wire fields from becoming the truthy strings "undefined"/"null"
+          // and accidentally matching an unrelated cached row.
+          if (
+            typeof data.messageId !== 'string' ||
+            !data.messageId ||
+            typeof data.chatId !== 'string' ||
+            typeof data.body !== 'string'
+          ) {
+            break;
+          }
+          events.onMessageEdited?.({
+            sessionId,
+            messageId: data.messageId,
+            chatId: data.chatId,
+            body: data.body,
             timestamp: Number(data.timestamp),
           });
           break;

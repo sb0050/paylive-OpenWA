@@ -1,31 +1,25 @@
-import { Controller, Get, Post, Put, Delete, Param, Query, Body, HttpCode, HttpStatus } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody, ApiQuery } from '@nestjs/swagger';
+import { Controller, Get, Post, Put, Delete, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody } from '@nestjs/swagger';
 import { GroupService } from './group.service';
-import { CreateGroupDto, ParticipantsDto, GroupSubjectDto, GroupDescriptionDto } from './dto/group.dto';
+import {
+  CreateGroupDto,
+  ParticipantsDto,
+  GroupSubjectDto,
+  GroupDescriptionDto,
+  JoinGroupDto,
+  GroupSettingsDto,
+} from './dto/group.dto';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 
+// NOTE: the session→groups LIST lives on the SessionController at GET /sessions/:id/groups (it
+// registered first and owns the canonical narrow projection). A bare @Get() here would collide on
+// the same path pattern (/sessions/{x}/groups) and be shadowed, so this controller owns only the
+// group sub-resource routes (:groupId/...) under the same mount.
 @ApiTags('groups')
 @Controller('sessions/:sessionId/groups')
 export class GroupController {
   constructor(private readonly groupService: GroupService) {}
-
-  @Get()
-  @ApiOperation({ summary: 'Get all groups for a session' })
-  @ApiParam({ name: 'sessionId', description: 'Session ID' })
-  @ApiResponse({ status: 200, description: 'List of groups' })
-  @ApiQuery({ name: 'limit', required: false, description: 'Max groups to return (1–1000, default 1000)' })
-  @ApiQuery({ name: 'offset', required: false, description: 'Number of groups to skip (for paging)' })
-  async findAll(
-    @Param('sessionId') sessionId: string,
-    @Query('limit') limit?: string,
-    @Query('offset') offset?: string,
-  ) {
-    return this.groupService.getGroups(sessionId, {
-      limit: limit ? parseInt(limit, 10) : undefined,
-      offset: offset ? parseInt(offset, 10) : undefined,
-    });
-  }
 
   @Get(':groupId')
   @ApiOperation({ summary: 'Get detailed group info' })
@@ -35,6 +29,49 @@ export class GroupController {
   @ApiResponse({ status: 404, description: 'Group not found' })
   async findOne(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
     return this.groupService.getGroupInfo(sessionId, groupId);
+  }
+
+  @Post('join')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Join a group via invite code' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiBody({ type: JoinGroupDto })
+  @ApiResponse({ status: 200, description: 'Joined the group' })
+  @ApiResponse({ status: 400, description: 'Invalid or expired invite code, or session is not started' })
+  async join(@Param('sessionId') sessionId: string, @Body() dto: JoinGroupDto) {
+    const groupId = await this.groupService.joinGroupViaInviteCode(sessionId, dto.inviteCode);
+    return { success: true, groupId };
+  }
+
+  @Get(':groupId/settings')
+  @ApiOperation({ summary: 'Get group settings (announce / locked / ephemeral timer)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'groupId', description: 'Group ID' })
+  @ApiResponse({ status: 200, description: 'Group settings' })
+  @ApiResponse({ status: 404, description: 'Group not found' })
+  async getSettings(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
+    return this.groupService.getGroupSettings(sessionId, groupId);
+  }
+
+  @Put(':groupId/settings')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Update group settings (announce / locked / ephemeral timer)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'groupId', description: 'Group ID' })
+  @ApiBody({ type: GroupSettingsDto })
+  @ApiResponse({ status: 200, description: 'Group settings updated' })
+  @ApiResponse({ status: 400, description: 'No setting provided, or a value is not a boolean' })
+  @ApiResponse({ status: 403, description: 'The engine refused the change (the account is not a group admin)' })
+  @ApiResponse({ status: 404, description: 'Group not found' })
+  @ApiResponse({ status: 501, description: 'The active engine does not support a requested setting' })
+  async updateSettings(
+    @Param('sessionId') sessionId: string,
+    @Param('groupId') groupId: string,
+    @Body() dto: GroupSettingsDto,
+  ) {
+    await this.groupService.updateGroupSettings(sessionId, groupId, dto);
+    return { success: true, message: 'Group settings updated' };
   }
 
   @Post()

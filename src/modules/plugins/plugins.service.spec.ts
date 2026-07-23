@@ -26,6 +26,7 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
   let pluginsDir: string;
   let loader: PluginLoaderService;
   let service: PluginsService;
+  let pluginStorage: PluginStorageService;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-svc-'));
@@ -34,12 +35,8 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     const config = {
       get: (k: string) => (k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : undefined),
     } as unknown as ConfigService;
-    loader = new PluginLoaderService(
-      config,
-      new HookManager(),
-      new PluginStorageService(config),
-      {} as unknown as ModuleRef,
-    );
+    pluginStorage = new PluginStorageService(config);
+    loader = new PluginLoaderService(config, new HookManager(), pluginStorage, {} as unknown as ModuleRef);
     service = new PluginsService(loader, config);
   });
   afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -97,6 +94,21 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     expect(fs.existsSync(path.join(pluginsDir, '.svc-plg.bak'))).toBe(false); // backup cleaned up
   });
 
+  it('preserves ctx.storage state across an in-place package update', async () => {
+    service.install({ buffer: pkg({ version: '1.0.0' }) });
+    const storage = pluginStorage.createPluginStorage('svc-plg');
+    await storage.set('cursor', { lastId: 'msg-42' });
+
+    await service.updatePackage('svc-plg', pkg({ version: '2.0.0' }));
+
+    expect(await storage.get('cursor')).toEqual({ lastId: 'msg-42' });
+    const stateFile = fs.readdirSync(path.join(pluginsDir, 'svc-plg')).find(name => /^key-.*\.json$/.test(name));
+    expect(stateFile).toBeDefined();
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(path.join(pluginsDir, 'svc-plg', stateFile as string)).mode & 0o777).toBe(0o600);
+    }
+  });
+
   it('updatePackage rejects a package whose id does not match', async () => {
     service.install({ buffer: pkg() });
     await expect(service.updatePackage('svc-plg', pkg({ id: 'other-plg' }))).rejects.toThrow(/does not match/i);
@@ -144,6 +156,19 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     resolveFirst();
     await Promise.all([p1, p2]);
     expect(calls).toBe(2);
+  });
+
+  // A literal link-local IP is rejected synchronously by the SSRF guard before any fetch/DNS, so this
+  // is fully offline. The download path follows redirects, so the guard always runs (no opt-out flag);
+  // the rejected-IP detail must be redacted from the surfaced BadRequestException (recon oracle).
+  it('installFromUrl redacts the resolved internal IP when the SSRF guard blocks the URL', async () => {
+    const err = await service.installFromUrl('https://169.254.169.254/pkg.zip').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BadRequestException);
+    const message = (err as BadRequestException).message;
+    expect(message).toMatch(/^Failed to download plugin from URL: /);
+    expect(message).not.toMatch(/169\.254\.169\.254/);
+    expect(message).toBe('Failed to download plugin from URL: Destination address is not allowed');
   });
 });
 

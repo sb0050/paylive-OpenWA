@@ -1,5 +1,5 @@
 import { Controller, Param, Post } from '@nestjs/common';
-import { ApiTags } from '@nestjs/swagger';
+import { ApiTags, ApiResponse } from '@nestjs/swagger';
 import { RequireRole } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 import { RedriveService } from './redrive.service';
@@ -14,10 +14,14 @@ export class RedriveController {
   constructor(private readonly redrive: RedriveService) {}
 
   @Post(':pluginId/:instanceId/redrive')
+  @ApiResponse({
+    status: 201,
+    description: 'One bounded batch of dead-lettered ingress deliveries re-dispatched, with remaining depth.',
+  })
   redriveInstance(
     @Param('pluginId') pluginId: string,
     @Param('instanceId') instanceId: string,
-  ): Promise<{ redriven: number }> {
+  ): Promise<{ redriven: number; remaining: number; batchSize: number }> {
     return this.redrive.redriveInstance(pluginId, instanceId);
   }
 }

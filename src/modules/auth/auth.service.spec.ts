@@ -193,6 +193,60 @@ describe('AuthService', () => {
       expect(result.name).toBe('Updated');
       expect(result.role).toBe(ApiKeyRole.OPERATOR); // unchanged
     });
+
+    it('evicts active WebSocket sockets when allowedSessions narrows', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+      const key = createMockApiKey({ allowedSessions: ['sess-A', 'sess-B'] });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.update('uuid-1', { allowedSessions: ['sess-A'] });
+
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'authorization_changed');
+    });
+
+    it('evicts active WebSocket sockets when the role changes', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+      const key = createMockApiKey({ role: ApiKeyRole.OPERATOR });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.update('uuid-1', { role: ApiKeyRole.ADMIN });
+
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'authorization_changed');
+    });
+
+    it('does not evict on a benign (name-only) update', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+      const key = createMockApiKey({ name: 'original' });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.update('uuid-1', { name: 'renamed' });
+
+      expect(evictApiKey).not.toHaveBeenCalled();
+    });
+
+    it('rejects demoting or expiring the last usable admin', async () => {
+      const key = createMockApiKey({ role: ApiKeyRole.ADMIN });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.count as jest.Mock).mockResolvedValue(0);
+
+      await expect(service.update('uuid-1', { role: ApiKeyRole.OPERATOR })).rejects.toThrow(/last active admin/i);
+      await expect(
+        service.update('uuid-1', { expiresAt: new Date(Date.now() + 60_000).toISOString() }),
+      ).rejects.toThrow(/last active admin/i);
+      expect(repository.save).not.toHaveBeenCalled();
+    });
   });
 
   // ── delete / revoke ───────────────────────────────────────────────
@@ -213,6 +267,33 @@ describe('AuthService', () => {
 
       await expect(service.delete('nonexistent')).rejects.toThrow(NotFoundException);
     });
+
+    it('evicts active WebSocket sockets authenticated with the deleted key', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+
+      const key = createMockApiKey();
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.remove as jest.Mock).mockResolvedValue(key);
+
+      await service.delete('uuid-1');
+
+      expect(repository.remove).toHaveBeenCalledWith(key);
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'deleted');
+    });
+
+    it('rejects deleting the last usable admin but allows it when another usable admin exists', async () => {
+      const key = createMockApiKey({ role: ApiKeyRole.ADMIN });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.remove as jest.Mock).mockResolvedValue(key);
+      (repository.count as jest.Mock).mockResolvedValueOnce(0).mockResolvedValueOnce(1);
+
+      await expect(service.delete('uuid-1')).rejects.toThrow(/last active admin/i);
+      await expect(service.delete('uuid-1')).resolves.toBeUndefined();
+      expect(repository.remove).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('revoke', () => {
@@ -224,6 +305,48 @@ describe('AuthService', () => {
       const result = await service.revoke('uuid-1');
 
       expect(result.isActive).toBe(false);
+    });
+
+    it('evicts active WebSocket sockets authenticated with the revoked key', async () => {
+      const evictApiKey = jest.fn();
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockReturnValue({ evictApiKey });
+
+      const key = createMockApiKey({ isActive: true });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      await service.revoke('uuid-1');
+
+      expect(key.isActive).toBe(false);
+      expect(evictApiKey).toHaveBeenCalledWith('uuid-1', 'revoked');
+    });
+
+    it('does not roll back the revoke if WebSocket eviction throws (best-effort)', async () => {
+      jest
+        .spyOn((service as unknown as { moduleRef: { get: (...a: unknown[]) => unknown } }).moduleRef, 'get')
+        .mockImplementation(() => {
+          throw new Error('gateway unavailable');
+        });
+
+      const key = createMockApiKey({ isActive: true });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.save as jest.Mock).mockImplementation(k => Promise.resolve(k));
+
+      const result = await service.revoke('uuid-1');
+
+      expect(result.isActive).toBe(false); // revoke still succeeded
+    });
+
+    it('rejects revoking the last usable admin', async () => {
+      const key = createMockApiKey({ role: ApiKeyRole.ADMIN, isActive: true });
+      (repository.findOne as jest.Mock).mockResolvedValue(key);
+      (repository.count as jest.Mock).mockResolvedValue(0);
+
+      await expect(service.revoke('uuid-1')).rejects.toThrow(/last active admin/i);
+      expect(repository.save).not.toHaveBeenCalled();
+      expect(key.isActive).toBe(true);
     });
   });
 

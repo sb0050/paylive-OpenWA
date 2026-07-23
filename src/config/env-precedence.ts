@@ -44,6 +44,20 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'REDIS_ENABLED',
   'REDIS_HOST',
   'REDIS_PORT',
+  // Engine launch options the dashboard saves (data/.env.generated). Compose blank-forwards these so a
+  // dashboard edit is not shadowed by a pinned container default; the app layer (configuration.ts)
+  // supplies the sane default when nothing is set.
+  'PUPPETEER_HEADLESS',
+  'SESSION_DATA_PATH',
+  'PUPPETEER_ARGS',
+  // Rate-limit values are blank-forwarded by Compose so a host value can take precedence without an
+  // empty forward masking the lower-priority loaded .env / data/.env.generated value.
+  'RATE_LIMIT_SHORT_TTL',
+  'RATE_LIMIT_SHORT_LIMIT',
+  'RATE_LIMIT_MEDIUM_TTL',
+  'RATE_LIMIT_MEDIUM_LIMIT',
+  'RATE_LIMIT_LONG_TTL',
+  'RATE_LIMIT_LONG_LIMIT',
 ];
 
 export function clearBlankEnv(env: NodeJS.ProcessEnv, keys: string[]): void {

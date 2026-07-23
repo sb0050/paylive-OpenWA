@@ -29,6 +29,7 @@ function createMockEngine() {
     reactToMessage: jest.fn().mockResolvedValue(undefined),
     getMessageReactions: jest.fn().mockResolvedValue([]),
     deleteMessage: jest.fn().mockResolvedValue(undefined),
+    editMessage: jest.fn().mockResolvedValue(mockEngineResult),
     getChatHistory: jest.fn().mockResolvedValue([]),
     sendChatState: jest.fn().mockResolvedValue(undefined),
   };
@@ -59,6 +60,7 @@ describe('MessageService', () => {
       save: jest.fn().mockImplementation(msg => Promise.resolve(msg)),
       findOne: jest.fn().mockResolvedValue(null),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
+      delete: jest.fn().mockResolvedValue({ affected: 1 }),
       createQueryBuilder: jest.fn(),
     };
 
@@ -67,13 +69,15 @@ describe('MessageService', () => {
     sessionService = {
       getEngine: jest.fn().mockReturnValue(mockEngine),
       findOne: jest.fn().mockResolvedValue({ id: 'sess-1', phone: '628123456789' }),
+      recordOutboundMessageEdit: jest.fn().mockResolvedValue(undefined),
     };
 
     hookManager = {
-      execute: jest.fn().mockResolvedValue({
-        continue: true,
-        data: { sessionId: 'sess-1', input: { chatId: '628123456789@c.us', text: 'Hello' }, type: 'text' },
-      }),
+      // Echo the input straight back so the message:sending gate is a pass-through by default; specific
+      // tests override with continue:false (block) or a modified input.
+      execute: jest
+        .fn()
+        .mockImplementation((_event: string, data: unknown) => Promise.resolve({ continue: true, data })),
     };
 
     templateService = {
@@ -188,6 +192,17 @@ describe('MessageService', () => {
       expect(hookManager.execute).not.toHaveBeenCalledWith('message:sent', expect.anything(), expect.anything());
     });
 
+    it('emits message:persisted after saving an outbound message', async () => {
+      await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hello' });
+
+      const calls = (hookManager.execute as jest.Mock).mock.calls.filter(
+        ([ev]: unknown[]) => ev === 'message:persisted',
+      ) as unknown[][];
+      expect(calls).toHaveLength(1);
+      expect(calls[0][1]).toMatchObject({ sessionId: 'sess-1', message: { chatId: '628123456789@c.us' } });
+      expect(calls[0][2]).toMatchObject({ sessionId: 'sess-1', source: 'MessageService' });
+    });
+
     it('should throw BadRequestException when plugin blocks sending', async () => {
       (hookManager.execute as jest.Mock).mockResolvedValueOnce({ continue: false, data: {} });
 
@@ -290,6 +305,64 @@ describe('MessageService', () => {
     });
   });
 
+  // ── send-hook chokepoint ──────────────────────────────────────────
+
+  describe('send-hook chokepoint (message:sending gate + message:failed across all senders)', () => {
+    it('runs the message:sending gate for a media send (sendImage) tagged with the media type', async () => {
+      await service.sendImage('sess-1', { chatId: '628@c.us', url: 'https://e.com/i.jpg', caption: 'hi' });
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:sending',
+        expect.objectContaining({ type: 'image' }),
+        expect.any(Object),
+      );
+    });
+
+    it('runs the message:sending gate for an extended send (sendPoll)', async () => {
+      await service.sendPoll('sess-1', { chatId: '628@c.us', name: 'Q?', options: ['a', 'b'] });
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:sending',
+        expect.objectContaining({ type: 'poll' }),
+        expect.any(Object),
+      );
+    });
+
+    it('lets a plugin block a media send (continue:false) before the engine is called', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({ continue: false, data: {} });
+      await expect(service.sendImage('sess-1', { chatId: '628@c.us', url: 'https://e.com/i.jpg' })).rejects.toThrow(
+        'Message sending blocked by plugin',
+      );
+      expect(mockEngine.sendImageMessage).not.toHaveBeenCalled();
+    });
+
+    it('threads a plugin-modified media input through to the engine', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: {
+          sessionId: 'sess-1',
+          type: 'image',
+          input: { chatId: '999@c.us', url: 'https://e.com/mod.jpg', caption: 'edited' },
+        },
+      });
+      await service.sendImage('sess-1', { chatId: '628@c.us', url: 'https://e.com/i.jpg', caption: 'orig' });
+      expect(mockEngine.sendImageMessage).toHaveBeenCalledWith(
+        '999@c.us',
+        expect.objectContaining({ data: 'https://e.com/mod.jpg', caption: 'edited' }),
+      );
+    });
+
+    it('fires message:failed when a media send fails (previously only sendText did)', async () => {
+      mockEngine.sendImageMessage.mockRejectedValueOnce(new Error('engine down'));
+      await expect(service.sendImage('sess-1', { chatId: '628@c.us', url: 'https://e.com/i.jpg' })).rejects.toThrow(
+        'engine down',
+      );
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:failed',
+        expect.objectContaining({ type: 'image', error: 'engine down' }),
+        expect.any(Object),
+      );
+    });
+  });
+
   // ── sendImage ─────────────────────────────────────────────────────
 
   describe('sendImage', () => {
@@ -343,6 +416,24 @@ describe('MessageService', () => {
       await expect(
         service.sendImage('sess-1', { chatId: '628123456789@c.us', url: 'http://127.0.0.1/x.png' }),
       ).rejects.toMatchObject({ response: { message: 'Destination address is not allowed' } });
+    });
+
+    it('does not leak the SSRF internal address into the message:failed hook payload (media sends now route there)', async () => {
+      mockEngine.sendImageMessage.mockRejectedValueOnce(
+        new SsrfBlockedError('Host x resolves to a blocked internal address: 169.254.169.254'),
+      );
+
+      await expect(
+        service.sendImage('sess-1', { chatId: '628123456789@c.us', url: 'http://127.0.0.1/x.png' }),
+      ).rejects.toThrow();
+
+      const calls = (hookManager.execute as jest.Mock).mock.calls as [string, { error?: string }, unknown][];
+      const failedCall = calls.find(c => c[0] === 'message:failed');
+      expect(failedCall).toBeDefined();
+      // The hook payload (now delivered to plugins for media sends) carries the generic message, NOT
+      // the resolved internal IP that the raw SsrfBlockedError.message contains.
+      expect(failedCall![1].error).toBe('Destination address is not allowed');
+      expect(failedCall![1].error).not.toContain('169.254.169.254');
     });
 
     it('rejects a base64 image over the media cap before sending or persisting', async () => {
@@ -566,6 +657,24 @@ describe('MessageService', () => {
       expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'voice' }));
     });
 
+    it('labels the message:sending gate "voice" for a voice note (matches the persisted/failed type)', async () => {
+      await service.sendAudio('sess-1', { chatId: 'test@c.us', url: 'https://example.com/voice', ptt: true });
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:sending',
+        expect.objectContaining({ type: 'voice' }),
+        expect.any(Object),
+      );
+    });
+
+    it('labels the message:sending gate "audio" for a plain (non-ptt) audio send', async () => {
+      await service.sendAudio('sess-1', { chatId: 'test@c.us', url: 'https://example.com/audio.ogg' });
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:sending',
+        expect.objectContaining({ type: 'audio' }),
+        expect.any(Object),
+      );
+    });
+
     it('persists a plain audio send (no ptt) as type "audio"', async () => {
       await service.sendAudio('sess-1', { chatId: 'test@c.us', url: 'https://example.com/audio.ogg' });
       expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'audio' }));
@@ -749,6 +858,51 @@ describe('MessageService', () => {
         }),
       ).rejects.toThrow('mimetype is required when using base64 data');
     });
+
+    it('prefers base64 over url when both are provided (#670)', async () => {
+      // When both are sent, base64 is the explicit local payload and must win over `url` — otherwise
+      // a stale `url` is fetched and silently shadows the image. This aligns the send selection with
+      // the base64-first persisted metadata and the `@ValidateIf((o) => !o.base64)` intent on `url`.
+      await service.sendImage('sess-1', {
+        chatId: '628123456789@c.us',
+        url: 'https://example.com/img.jpg',
+        base64: 'iVBORw0KGgoAAAAN...',
+        mimetype: 'image/png',
+      });
+
+      expect(mockEngine.sendImageMessage).toHaveBeenCalledWith(
+        '628123456789@c.us',
+        expect.objectContaining({ data: 'iVBORw0KGgoAAAAN...' }),
+      );
+      expect(mockEngine.sendImageMessage).not.toHaveBeenCalledWith(
+        '628123456789@c.us',
+        expect.objectContaining({ data: 'https://example.com/img.jpg' }),
+      );
+    });
+
+    it('strips a data-URI prefix before passing base64 bytes to the engine', async () => {
+      await service.sendImage('sess-1', {
+        chatId: '628123456789@c.us',
+        base64: 'data:image/png;base64,QUJD',
+        mimetype: 'image/png',
+      });
+
+      expect(mockEngine.sendImageMessage).toHaveBeenCalledWith(
+        '628123456789@c.us',
+        expect.objectContaining({ data: 'QUJD' }),
+      );
+    });
+
+    it('rejects a data URI with no encoded payload', async () => {
+      await expect(
+        service.sendImage('sess-1', {
+          chatId: '628123456789@c.us',
+          base64: 'data:image/png;base64,',
+          mimetype: 'image/png',
+        }),
+      ).rejects.toThrow('Either url or base64 must be provided');
+      expect(mockEngine.sendImageMessage).not.toHaveBeenCalled();
+    });
   });
 
   // ── reactToMessage / deleteMessage ────────────────────────────────
@@ -840,6 +994,147 @@ describe('MessageService', () => {
       });
 
       expect(mockEngine.deleteMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', false);
+    });
+  });
+
+  describe('editMessage', () => {
+    it('edits via the engine, delegates the stored-row update, and returns the engine result', async () => {
+      const res = await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'edited');
+      // Persistence is delegated to the session's per-message mutation queue (serialized with the
+      // inbound edit path) — the service no longer writes the row directly.
+      expect(sessionService.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited');
+      expect(repository.update).not.toHaveBeenCalled();
+      expect(res).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
+    });
+
+    it('still succeeds when the delegated stored-row update is a no-op (the engine edit already happened)', async () => {
+      // recordOutboundMessageEdit is best-effort by contract (never rejects); a missing row or a
+      // failed write is logged inside the session service, not surfaced here.
+      const res = await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(res).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
+    });
+
+    it('propagates the engine not-found error as-is (MessageNotFoundError → 404)', async () => {
+      mockEngine.editMessage.mockRejectedValueOnce(new NotFoundException('Message wa-msg-1 not found'));
+      await expect(
+        service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(sessionService.recordOutboundMessageEdit).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException when the session is not started', async () => {
+      (sessionService.getEngine as jest.Mock).mockReturnValue(undefined);
+      await expect(
+        service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockEngine.editMessage).not.toHaveBeenCalled();
+    });
+
+    // An edit replaces the text the recipient sees, so it belongs to the same moderation
+    // chokepoint as every other sender rather than going out unseen by plugins.
+    it('runs the message:sending gate tagged as an edit', async () => {
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:sending',
+        expect.objectContaining({ type: 'edit' }),
+        expect.any(Object),
+      );
+    });
+
+    it('lets a plugin block an edit before the engine is called', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({ continue: false, data: {} });
+
+      await expect(
+        service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
+      ).rejects.toThrow('Message sending blocked by plugin');
+
+      expect(mockEngine.editMessage).not.toHaveBeenCalled();
+      expect(sessionService.recordOutboundMessageEdit).not.toHaveBeenCalled();
+    });
+
+    it('threads a plugin-rewritten edit body through to the engine and the stored row', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { input: { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'redacted' } },
+      });
+
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'secret' });
+
+      expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'redacted');
+      expect(sessionService.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'redacted');
+    });
+  });
+
+  /**
+   * The empty id is the engine's "sent, but I couldn't read the id back" signal (#757). It has to reach
+   * the DB as NULL: UQ_messages_sessionId_waMessageId is NOT partial, so '' collides with the next
+   * id-less send in the same session, while NULLs stay exempt. In the bulk path that violation is
+   * swallowed into a warning, so the row would vanish with nothing surfacing.
+   */
+  describe('saveOutgoingMessage id normalization (#757)', () => {
+    it('stores an empty engine id as NULL rather than an empty string', async () => {
+      await service.saveOutgoingMessage('sess-1', { waMessageId: '', chatId: '621@c.us', type: 'text' });
+
+      expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ waMessageId: undefined }));
+    });
+
+    it('leaves a real id untouched', async () => {
+      await service.saveOutgoingMessage('sess-1', {
+        waMessageId: 'true_621@c.us_ABC',
+        chatId: '621@c.us',
+        type: 'text',
+      });
+
+      expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ waMessageId: 'true_621@c.us_ABC' }));
+    });
+  });
+
+  describe('persistSentState vs the own-send echo (dedup race)', () => {
+    it('merges state onto the echo row, then drops the redundant PENDING row', async () => {
+      // The engine's message_create echo (onMessageCreate) won the insert race, so the SENT-state save
+      // collides on UNIQUE(sessionId, waMessageId). The echo row carries only a media-less marker —
+      // the merge must land status/timestamp/metadata on it BEFORE the placeholder is deleted, or the
+      // payload is lost. The send still succeeds.
+      (repository.save as jest.Mock)
+        .mockImplementationOnce(msg => Promise.resolve(msg)) // saveOutgoingMessage (PENDING)
+        .mockRejectedValueOnce(new Error('UNIQUE constraint failed: messages.sessionId, messages.waMessageId'));
+
+      const result = await service.sendText('sess-1', { chatId: '621@c.us', text: 'hi' });
+
+      expect(result.messageId).toBe('wa-msg-1'); // send reported success
+      expect(repository.update).toHaveBeenCalledWith(
+        { sessionId: 'sess-1', waMessageId: 'wa-msg-1' },
+        expect.objectContaining({ status: MessageStatus.SENT, timestamp: 1706868000 }),
+      );
+      expect(repository.delete).toHaveBeenCalledWith({ id: 'msg-uuid-1' });
+    });
+
+    it('merges the media payload onto the echo row for a media send (no data loss after reload)', async () => {
+      (repository.save as jest.Mock)
+        .mockImplementationOnce(msg => Promise.resolve(msg))
+        .mockRejectedValueOnce(new Error('UNIQUE constraint failed: messages.sessionId, messages.waMessageId'));
+
+      await service.sendImage('sess-1', { chatId: '621@c.us', base64: 'QUJD', mimetype: 'image/png' });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const patch = (repository.update as jest.Mock).mock.calls[0]?.[1] as Record<string, unknown> | undefined;
+      expect((patch?.metadata as { media?: { data?: string } } | undefined)?.media?.data).toBe('QUJD');
+      expect(repository.delete).toHaveBeenCalledWith({ id: 'msg-uuid-1' });
+    });
+
+    it('does NOT delete anything on a transient (non-unique) persist error', async () => {
+      (repository.save as jest.Mock)
+        .mockImplementationOnce(msg => Promise.resolve(msg))
+        .mockRejectedValueOnce(new Error('SQLITE_BUSY: database is locked'));
+
+      const result = await service.sendText('sess-1', { chatId: '621@c.us', text: 'hi' });
+
+      expect(result.messageId).toBe('wa-msg-1'); // transient persist faults never fail the send
+      expect(repository.delete).not.toHaveBeenCalled();
     });
   });
 });

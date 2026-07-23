@@ -156,6 +156,39 @@ docker compose pull            # Get latest image
 docker compose up -d
 ```
 
+### Issue: Dashboard Renders a Blank White Screen
+
+**Symptoms:**
+- The API is healthy (`curl http://<host>:2785/api/health` returns `200`) but the dashboard is blank
+- The startup log says `🖥️ Dashboard: serving bundled UI at …` — the UI *is* being served
+- The browser console shows script-loading errors; DevTools → Network shows the `/assets/*.js`
+  requests going to `https://` even though you opened the page over `http://`
+- You reach the instance directly over plain HTTP (a host:port allocation, a private network, a
+  panel like Pterodactyl) rather than through a TLS-terminating reverse proxy
+
+**Cause:** In production OpenWA sends the CSP `upgrade-insecure-requests` directive, which tells the
+browser to upgrade every sub-resource fetch to HTTPS. That is correct behind a TLS proxy. Over plain
+HTTP the browser upgrades the dashboard's own script requests to `https://`, the non-TLS server
+cannot answer them, no JavaScript runs, and React never mounts — a blank page. The failure happens
+in the browser, so the server log stays clean.
+
+**Solution:**
+
+```bash
+# Opt out, then fully restart the container (not just reload)
+CSP_UPGRADE_INSECURE_REQUESTS=false
+
+# Confirm it actually reached the process
+docker compose exec openwa printenv NODE_ENV CSP_UPGRADE_INSECURE_REQUESTS
+```
+
+A production boot that serves the dashboard with the opt-out unset prints a warning naming this
+setting. If you are behind a TLS proxy, ignore that warning — the directive is doing its job.
+
+> The alternative is to front OpenWA with a TLS-terminating reverse proxy (the shipped
+> `docker-compose.yml` topology), which serves the dashboard over HTTPS and makes the upgrade a
+> no-op.
+
 ### Issue: Session Won't Connect
 
 **Symptoms:**
@@ -185,17 +218,43 @@ ls -la ./data/.wwebjs_auth/session-{sessionId}/
 | Auth folder corrupted | Delete and rescan |
 | Browser crash | Restart container |
 | Network issues | Check firewall/proxy |
-| WhatsApp blocked | Use proxy |
+| WhatsApp blocked | Set a per-session proxy (`proxyUrl`) |
 
 ```bash
 # Clear auth and restart
 rm -rf ./data/.wwebjs_auth/session-{sessionId}
 docker compose restart openwa
-
-# If using proxy
-export PROXY_URL=http://proxy:8080
-docker compose up -d
 ```
+
+Proxy egress (if WhatsApp is blocked on your network) is configured **per session** via the
+`proxyUrl`/`proxyType` fields on `POST /api/sessions` — it is **not** an environment variable, and an
+unreachable proxy silently blocks the WhatsApp WebSocket (see the *No QR code appears, or `/start`
+returns `504`* entry below).
+
+### Issue: No QR code appears, or `POST /api/sessions/:id/start` returns `504`
+
+**Symptoms:**
+- `POST /api/sessions/:id/start` returns `504 Gateway Timeout`
+  (`WhatsApp Web authentication timed out...`)
+- No QR code is ever produced — `GET /api/sessions/:id/qr` never has one
+- Engine log shows `Session engine failed: auth timeout` after ~30s
+
+**Cause:** The session was created with a `proxyUrl` that doesn't resolve to a real, reachable proxy
+(e.g. the `http://proxy.example.com:8080` placeholder copied from an example). The engine launches
+Chromium pinned to that proxy, the WhatsApp WebSocket can never connect, no QR is produced, and the
+auth poll times out.
+
+**Fix:** Don't set a proxy unless your network actually requires one. Recreate the session without
+`proxyUrl`, or set it to a real, reachable proxy server:
+
+```bash
+# No proxy needed (the common case):
+curl -X POST "$BASE/api/sessions" -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{ "name": "my-bot" }'
+```
+
+> ℹ️ Proxy egress for the `whatsapp-web.js` engine is configured **per session** via the
+> `proxyUrl`/`proxyType` fields on `POST /api/sessions` — not via environment variables.
 
 ### Issue: Session stuck at `authenticating`, never reaches `ready`
 
@@ -333,9 +392,51 @@ specific failure (Chromium can't resolve its home directory on a read-only rootf
 immediately above this one for the fix. The bundled image already handles this; it only resurfaces on a
 custom container that drops the `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` setup or the writable `/tmp` tmpfs.
 
+**Cause D — Debian 12 OS Chromium SIGTRAP in non-root Pods.**
+If `Code: null` happens on Kubernetes, and the host kernel logs or `dmesg` shows `Trace/breakpoint trap (core dumped)` with exit code 133, the underlying Debian 12 OS `chromium` package has crashed due to strict non-root or seccomp constraints (even with `--no-zygote` or `Unconfined` seccomp). 
+*Fix:* On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (Chrome for Testing has no linux-arm64 build, so arm64 keeps Debian's `chromium`, which ships a native arm64 binary.) The official `Dockerfile` implements this mixed approach.
+
 **Quick triage:** run `docker stats openwa-api`, click **Start**, and watch which resource spikes toward its
 limit the instant before the failure — that tells you A vs B. If neither moves and you see the crashpad
-`--database` line, it's C.
+`--database` line, it's C. If running in K8s as non-root with the Debian `chromium` package, it is likely D.
+
+### Issue: `Execution context was destroyed` on the first start after an upgrade
+
+> **Engine:** This issue applies to the `whatsapp-web.js` engine only (Chromium/Puppeteer-based). It does not affect `ENGINE_TYPE=baileys`.
+
+**Symptoms:** A `whatsapp-web.js` session that was already authenticated fails within seconds of
+**Start** after upgrading OpenWA — no QR is produced — and the session's `lastError` / container log
+show:
+
+```text
+Protocol error (Runtime.callFunctionOn): Execution context was destroyed.
+```
+
+**Cause:** The session's persistent browser profile (`<SESSION_DATA_PATH>/session-<name>`, created by
+whatsapp-web.js's `LocalAuth`) was built with a different Chromium/Chrome binary than the one the new
+image runs. A browser profile carries binary-bound state (page caches, GPU shader caches, IndexedDB /
+Local Storage version markers) that is not safely portable across Chromium major versions or binary
+flavours; loading the stale profile destroys the page context during `Client.inject()`. The dominant
+trigger today is the **v0.8.12** amd64 switch from Debian's `chromium` package to Chrome for Testing
+(#663), but the same symptom can follow any future change to the bundled browser binary. The error
+reads like a Puppeteer bug and gives no hint that the profile is the cause — the adapter now logs an
+advisory when it detects this error.
+
+**Fix:** delete the affected session's profile dir and start the session again to scan a new QR. The
+profile cannot be salvaged — clearing only the cache subdirs (`Cache`, `GPUCache`, `Code Cache`, …) is
+**not** enough, the taint is deeper than the caches — so a one-time re-authentication is required.
+
+The profile dir is named after the session **name**, while the REST API addresses a session by its
+**id** (a UUID) — so the two placeholders below are different values:
+
+```bash
+docker exec openwa-api rm -rf /app/data/sessions/session-<name>
+# then POST /sessions/<id>/force-kill and POST /sessions/<id>/start (the session's UUID id), and scan the new QR
+```
+
+Re-creating the session (`DELETE /sessions/<id>`) also purges its profile dir; create it again and
+scan. Messages are unaffected — they live in the database, not the browser profile — so nothing is lost
+except the WhatsApp pairing, which must be re-scanned.
 
 ### Issue: Frequent Disconnections
 
@@ -671,6 +772,8 @@ npm run migration:revert
 npm run migration:run:main
 ```
 
+**PostgreSQL crash-loop on boot after upgrade** — if logs show `column "id" is of type uuid but default expression is of type character varying` or `foreign key constraint ... cannot be implemented ... incompatible types: character varying and uuid`, the deployment was previously bootstrapped with `DATABASE_SYNCHRONIZE=true` (native `uuid` columns vs the migrations' `varchar`). A guard migration converts the columns automatically on the next boot; for large `messages` tables, run the migration against the stopped app (`npm run migration:run`) during a maintenance window. See [14.5 / 14.9 — PostgreSQL crash-loop after upgrading a `DATABASE_SYNCHRONIZE=true` deployment](./14-migration-guide.md). `DATABASE_SYNCHRONIZE=true` is unsupported on PostgreSQL for production.
+
 ## 12.6 Docker Issues
 
 ### Issue: Volume Permissions
@@ -866,33 +969,13 @@ Remember OpenWA is **single-port**: the Dashboard, REST API, and Socket.IO all s
 
 **Q: How to backup sessions automatically?**
 ```bash
-#!/bin/bash
-# backup-cron.sh - Add to crontab: 0 */6 * * * /path/to/backup-cron.sh
-
-BACKUP_DIR="/backups/openwa"
-DATE=$(date +%Y%m%d-%H%M%S)
-
-# Create backup directory
-mkdir -p "$BACKUP_DIR/$DATE"
-
-# Backup database
-if [ "$DATABASE_ADAPTER" = "postgresql" ]; then
-    pg_dump $DATABASE_URL > "$BACKUP_DIR/$DATE/database.sql"
-else
-    cp ./data/openwa.db "$BACKUP_DIR/$DATE/"
-fi
-
-# Backup auth sessions
-# whatsapp-web.js engine:
-cp -r ./data/.wwebjs_auth "$BACKUP_DIR/$DATE/"
-# Baileys engine (ENGINE_TYPE=baileys): back up BAILEYS_AUTH_DIR (default: ./data/baileys)
-# cp -r ./data/baileys "$BACKUP_DIR/$DATE/"
-
-# Keep only last 7 days
-find "$BACKUP_DIR" -type d -mtime +7 -exec rm -rf {} \;
-
-echo "Backup completed: $BACKUP_DIR/$DATE"
+# Add to crontab, for example: 0 */6 * * * cd /path/to/openwa && ./scripts/backup.sh
+BACKUP_DIR=/backups/openwa ./scripts/backup.sh
 ```
+
+The shipped script also covers `main.sqlite`, the selected data store, whatsapp-web.js state,
+`BAILEYS_AUTH_DIR` (default `./data/baileys`), media, plugin packages/state, and generated secrets. Apply
+retention/encryption to completed archives externally; see the [backup and restore runbooks](./11-operational-runbooks.md#runbook-database-backup).
 
 ### Webhook Questions
 
@@ -906,17 +989,22 @@ available_events:
   - message.failed       # Receipt resolved to failed
   - message.revoked      # Message deleted
   - message.reaction     # Reaction added, changed, or removed
+  - message.edited       # Message body or media caption edited
 
   # Session
   - session.status       # Session status change
   - session.qr           # New QR code generated
   - session.authenticated  # Session authenticated
   - session.disconnected   # Session disconnected
+  - session.reconnect_loop # Every 5th consecutive reconnect attempt (payload: sessionId, attempts, nextDelayMs)
 
-  # Groups (reserved but NOT currently emitted — accepted in events list, never delivered)
-  - group.join           # reserved, not emitted
-  - group.leave          # reserved, not emitted
-  - group.update         # reserved, not emitted
+  # Groups
+  - group.join           # Participant(s) added/joined
+  - group.leave          # Participant(s) left/removed
+  - group.update         # Group subject/description/announce/locked changed
+
+  # Calls
+  - call.received        # Incoming call ringing (payload: callId, from, isVideo, isGroup, timestamp)
 ```
 
 **Q: Webhook payload format?**

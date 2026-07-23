@@ -23,6 +23,7 @@ jest.mock('fs', () => {
     chmodSync: jest.fn(),
     existsSync: jest.fn().mockReturnValue(false),
     readFileSync: jest.fn().mockReturnValue(''),
+    createReadStream: jest.fn(() => jest.requireActual<typeof import('stream')>('stream').Readable.from([])),
   };
 });
 
@@ -37,6 +38,12 @@ import { MessageBatch, BatchStatus } from '../message/entities/message-batch.ent
 import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { LidMapping } from '../../engine/identity/lid-mapping.entity';
+import { PluginInstance } from '../integration/entities/plugin-instance.entity';
+import { ConversationMapping } from '../integration/entities/conversation-mapping.entity';
+import { IngressEvent } from '../integration/entities/ingress-event.entity';
+import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
+import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
+import { AuditAction } from '../audit/entities/audit-log.entity';
 
 describe('InfraController access control (Vuln 2)', () => {
   const reflector = new Reflector();
@@ -60,7 +67,13 @@ describe('InfraController access control (Vuln 2)', () => {
   ] as const;
 
   it.each(adminOnly)('%s requires the ADMIN role', method => {
-    const handler = InfraController.prototype[method as keyof InfraController] as object;
+    // The handler is only ever a lookup key for reflector metadata — it is never invoked, so there is
+    // no `this` to lose. unbound-method (tightened in typescript-eslint 8.65) cannot tell the two
+    // apart, and the cast below does not satisfy it either.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const handler = InfraController.prototype[method as keyof InfraController] as unknown as (
+      ...args: unknown[]
+    ) => unknown;
     const role = reflector.get<ApiKeyRole | undefined>(REQUIRED_ROLE_KEY, handler);
     expect(role).toBe(ApiKeyRole.ADMIN);
   });
@@ -89,14 +102,63 @@ describe('InfraController.importStorage filePath validation (Vuln 3)', () => {
     );
     expect(storage.importFromStream).not.toHaveBeenCalled();
   });
+
+  it('guards and opens the same cwd-resolved path returned by storage export', async () => {
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/srv/openwa');
+    (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === '/srv/openwa/data/exports/export.tar.gz');
+    (fs.createReadStream as jest.Mock).mockClear();
+    const storage = {
+      importFromStream: jest.fn().mockResolvedValue(3),
+      getCurrentStorageType: jest.fn(() => 'local'),
+    };
+    try {
+      const result = await buildController(storage).importStorage({ filePath: 'data/exports/export.tar.gz' });
+      expect(fs.createReadStream).toHaveBeenCalledWith('/srv/openwa/data/exports/export.tar.gz');
+      expect(storage.importFromStream).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ imported: true, count: 3, storageType: 'local' });
+    } finally {
+      cwdSpy.mockRestore();
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+    }
+  });
 });
 
-describe('InfraController.getStatus queue job counts (F-18)', () => {
+describe('InfraController.getStatus DB health (active SELECT 1 probe, not just isInitialized)', () => {
+  const build = (query: jest.Mock) => {
+    // engine.type=baileys skips the wa-web-version registry fetch (no network in unit tests).
+    const config = { get: (k: string, def?: unknown) => (k === 'engine.type' ? 'baileys' : def) };
+    const ds = { isInitialized: true, query };
+    const cache = { isAvailable: jest.fn().mockResolvedValue(false), refreshS3Availability: jest.fn() };
+    return new InfraController(
+      config as never,
+      ds as never,
+      ds as never,
+      { create: jest.fn() } as never,
+      { isDockerAvailable: () => false, getRunningBuiltinServices: jest.fn() } as never,
+      cache as never,
+      { refreshS3Availability: jest.fn() } as never,
+      {} as never,
+      undefined as never,
+    );
+  };
+
+  it('reports connected:true when SELECT 1 succeeds', async () => {
+    const status = await build(jest.fn().mockResolvedValue([{ '1': 1 }])).getStatus();
+    expect(status.database.connected).toBe(true);
+  });
+
+  it('reports connected:false when the DB is initialized but SELECT 1 fails (backend died post-init)', async () => {
+    const status = await build(jest.fn().mockRejectedValue(new Error('ECONNRESET'))).getStatus();
+    expect(status.database.connected).toBe(false);
+  });
+});
+
+describe('InfraController.getStatus queue job counts', () => {
   function buildStatusController(opts: { queueEnabled: boolean; queue?: { getJobCounts: jest.Mock } }) {
     const configService = {
       get: (key: string, def?: unknown) => (key === 'queue.enabled' ? opts.queueEnabled : def),
     };
-    const dataSource = { isInitialized: true } as unknown;
+    const dataSource = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) } as unknown;
     const engineFactory = { create: jest.fn() };
     const dockerService = { isDockerAvailable: () => false, getRunningBuiltinServices: jest.fn() };
     const cacheService = { isAvailable: jest.fn().mockResolvedValue(false), refreshS3Availability: jest.fn() };
@@ -295,6 +357,14 @@ describe('InfraController.saveConfig env-name correctness and merge (#226)', () 
     expect(env).not.toContain('S3_SECRET_KEY=');
   });
 
+  it('defaults PUPPETEER_ARGS to the full Docker sandbox flag set when browserArgs is empty', () => {
+    // Once compose blank-forwards PUPPETEER_ARGS this saved value wins at runtime, so the default must
+    // keep --disable-dev-shm-usage (the Docker /dev/shm tab-crash guard) — NOT the old 2-flag set.
+    const env = written({ engine: { headless: true, sessionDataPath: './data/sessions', browserArgs: '' } });
+    expect(env).toContain('PUPPETEER_ARGS=--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu');
+    expect(env).not.toContain('PUPPETEER_ARGS=--no-sandbox --disable-gpu');
+  });
+
   it('writes STORAGE_LOCAL_PATH (the name the backend reads) for local storage', () => {
     const env = written({ storage: { type: 'local', localPath: './data/media' } });
     expect(env).toContain('STORAGE_LOCAL_PATH=./data/media');
@@ -359,9 +429,9 @@ describe('InfraController.saveConfig rejects values that would inject extra env 
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.writeFileSync as jest.Mock).mockClear();
 
-    const result = newController().saveConfig({ engine: { browserArgs: malicious } });
-
-    expect(result.saved).toBe(false);
+    // A newline-injected value is rejected outright with a 4xx (BadRequestException), not masked as a
+    // {saved:false} 200 — and nothing is written.
+    expect(() => newController().saveConfig({ engine: { browserArgs: malicious } })).toThrow(BadRequestException);
     expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
   });
 
@@ -416,9 +486,8 @@ describe('InfraController.saveConfig engine selection (persist ENGINE_TYPE — I
 
   it('rejects an unknown engine type and writes nothing', () => {
     (fs.writeFileSync as jest.Mock).mockClear();
-    const res = newController().saveConfig({ engine: { type: 'bogus' } });
-    expect(res.saved).toBe(false);
-    expect(res.message).toMatch(/unknown engine/i);
+    // Rejected as a 4xx (BadRequestException naming the bad engine), not a {saved:false} 200.
+    expect(() => newController().saveConfig({ engine: { type: 'bogus' } })).toThrow(/unknown engine/i);
     expect(fs.writeFileSync as jest.Mock).not.toHaveBeenCalled();
   });
 });
@@ -434,9 +503,19 @@ describe('InfraController.importData round-trips export-data (no silent message/
 
   beforeEach(async () => {
     ds = new DataSource({
-      type: 'sqlite',
+      type: 'better-sqlite3',
       database: ':memory:',
-      entities: [Session, Webhook, Message, MessageBatch],
+      entities: [
+        Session,
+        Webhook,
+        Message,
+        MessageBatch,
+        PluginInstance,
+        ConversationMapping,
+        IngressEvent,
+        WebhookDeliveryFailure,
+        IntegrationDeliveryFailure,
+      ],
       synchronize: true,
     });
     await ds.initialize();
@@ -471,6 +550,7 @@ describe('InfraController.importData round-trips export-data (no silent message/
         sessionId: 's1',
         waMessageId: 'WA1',
         chatId: 'c1@s.whatsapp.net',
+        chatName: 'Support Chat',
         from: 'a@s.whatsapp.net',
         to: 'b@s.whatsapp.net',
         body: 'hello',
@@ -515,12 +595,62 @@ describe('InfraController.importData round-trips export-data (no silent message/
     const m = await ds.getRepository(Message).findOneByOrFail({ id: 'm1' });
     expect(m.body).toBe('hello');
     expect(m.waMessageId).toBe('WA1');
+    expect(m.chatName).toBe('Support Chat');
     expect(m.from).toBe('a@s.whatsapp.net');
     expect(m.to).toBe('b@s.whatsapp.net');
     expect(m.metadata).toEqual({ ack: 2 });
     const b = await ds.getRepository(MessageBatch).findOneByOrFail({ id: 'b1' });
     expect(b.batchId).toBe('BATCH1');
     expect(b.status).toBe(BatchStatus.COMPLETED);
+  });
+
+  it('round-trips plugin instances + integration delivery failures (Integration Fabric + DLQ)', async () => {
+    await seedSession('s1');
+    await ds.getRepository(PluginInstance).save(
+      ds.getRepository(PluginInstance).create({
+        id: 'chatwoot:acct1',
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        sessionScope: 's1',
+        secret: 'hmac-secret',
+        verifyToken: null,
+        config: { baseUrl: 'https://x' },
+        enabled: true,
+      }),
+    );
+    await ds.getRepository(IntegrationDeliveryFailure).save(
+      ds.getRepository(IntegrationDeliveryFailure).create({
+        direction: 'outbound',
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        sessionId: 's1',
+        deliveryId: 'd1',
+        attempts: 3,
+        lastError: 'boom',
+        payload: { foo: 'bar' },
+        redriven: false,
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect(dump.counts.pluginInstances).toBe(1);
+    expect(dump.counts.integrationDeliveryFailures).toBe(1);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(res.counts.pluginInstances).toBe(1);
+    expect(res.counts.integrationDeliveryFailures).toBe(1);
+
+    expect(await ds.getRepository(PluginInstance).count()).toBe(1);
+    expect(await ds.getRepository(IntegrationDeliveryFailure).count()).toBe(1);
+    const pi = await ds.getRepository(PluginInstance).findOneByOrFail({ id: 'chatwoot:acct1' });
+    expect(pi.secret).toBe('hmac-secret'); // ingress HMAC secret survives a SQLite→Postgres migration
+    expect(pi.config).toEqual({ baseUrl: 'https://x' });
+    const dlf = await ds.getRepository(IntegrationDeliveryFailure).findOneByOrFail({ deliveryId: 'd1' });
+    expect(dlf.lastError).toBe('boom');
+    expect(dlf.payload).toEqual({ foo: 'bar' });
   });
 
   it('rolls back and reports imported:false when a row fails — existing data is preserved', async () => {
@@ -655,7 +785,7 @@ describe('InfraController.import/export preserves every data-DB table', () => {
 
   beforeEach(async () => {
     ds = new DataSource({
-      type: 'sqlite',
+      type: 'better-sqlite3',
       database: ':memory:',
       entities: [Session, Webhook, Message, MessageBatch, Template, BaileysStoredMessage, LidMapping],
       synchronize: true,
@@ -799,7 +929,7 @@ describe('InfraController.getConfig (#226)', () => {
   });
 });
 
-describe('InfraController.getStatus engine (F7 — reads the real engine.puppeteer.* keys)', () => {
+describe('InfraController.getStatus engine (reads the real engine.puppeteer.* keys)', () => {
   // Pin the WA-Web version so getStatus does not fire the wa-version registry fetch (no network in tests).
   const savedWebVer = process.env.WWEBJS_WEB_VERSION;
   beforeAll(() => (process.env.WWEBJS_WEB_VERSION = 'off'));
@@ -817,7 +947,7 @@ describe('InfraController.getStatus engine (F7 — reads the real engine.puppete
     };
     const config = { get: (key: string, def?: unknown) => (key in map ? map[key] : def) };
     const cache = { isAvailable: () => Promise.resolve(false) };
-    const ds = { isInitialized: true };
+    const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
     const controller = new InfraController(
       config as never,
       ds as never,
@@ -848,7 +978,7 @@ describe('InfraController.getStatus storage (reads the real storage.localPath ke
   const buildController = (map: Record<string, unknown>) => {
     const config = { get: (key: string, def?: unknown) => (key in map ? map[key] : def) };
     const cache = { isAvailable: () => Promise.resolve(false) };
-    const ds = { isInitialized: true };
+    const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
     return new InfraController(
       config as never,
       ds as never,
@@ -979,5 +1109,196 @@ describe('InfraController.requestRestart constrains teardown to managed profiles
     expect(removed).toEqual(['postgres', 'redis']);
     expect(removed).not.toContain('');
     expect(removed).not.toContain('evil');
+  });
+});
+
+// C002: the infra module exposed sensitive ADMIN operations (credential config write, restart/Docker
+// orchestration, full-DB + storage export/import) with no audit trail. Each now emits an AuditAction.
+describe('InfraController C002 audit trail (light-dependency handlers)', () => {
+  const makeAudit = (): { logInfo: jest.Mock } => ({ logInfo: jest.fn().mockResolvedValue(null) });
+
+  // Positional constructor: (config, mainDs, dataDs, engineFactory, dockerService, cacheService,
+  // storageService, shutdownService, webhookQueue?, auditService?). auditService is the last @Optional arg.
+  const build = (
+    audit: { logInfo: jest.Mock },
+    overrides: Partial<{
+      config: unknown;
+      dataDs: unknown;
+      engineFactory: unknown;
+      dockerService: unknown;
+      storageService: unknown;
+      shutdownService: unknown;
+    }> = {},
+  ): InfraController =>
+    new InfraController(
+      (overrides.config ?? {}) as never,
+      {} as never,
+      (overrides.dataDs ?? {}) as never,
+      (overrides.engineFactory ?? {}) as never,
+      (overrides.dockerService ?? {}) as never,
+      {} as never,
+      (overrides.storageService ?? {}) as never,
+      (overrides.shutdownService ?? {}) as never,
+      undefined as never,
+      audit as never,
+    );
+
+  it('saveConfig emits INFRA_CONFIG_SAVED without leaking secret values into the metadata', () => {
+    const audit = makeAudit();
+    build(audit).saveConfig({ database: { type: 'postgres', host: 'db', password: 'topsecret' } } as never);
+    expect(audit.logInfo).toHaveBeenCalledTimes(1);
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { sections: string[] } }]>;
+    const [action, ctx] = calls[0];
+    expect(action).toBe(AuditAction.INFRA_CONFIG_SAVED);
+    expect(ctx.metadata.sections).toContain('database');
+    // Only section names + profiles are recorded — never a secret value.
+    expect(JSON.stringify(ctx)).not.toContain('topsecret');
+  });
+
+  it('saveConfig does NOT emit when the payload is rejected (unknown engine)', () => {
+    const audit = makeAudit();
+    const controller = build(audit, { engineFactory: { getAvailableEngines: () => [{ id: 'baileys' }] } });
+    expect(() => controller.saveConfig({ engine: { type: 'bogus' } })).toThrow(BadRequestException);
+    expect(audit.logInfo).not.toHaveBeenCalled();
+  });
+
+  it('requestRestart emits INFRA_RESTART_REQUESTED with the requested profiles', async () => {
+    const audit = makeAudit();
+    const controller = build(audit, {
+      config: { get: () => undefined },
+      dockerService: { isDockerAvailable: () => false },
+      shutdownService: { shutdown: jest.fn() },
+    });
+    await controller.requestRestart({ profiles: ['postgres'], profilesToRemove: [] });
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { profiles: string[] } }]>;
+    expect(calls[0][0]).toBe(AuditAction.INFRA_RESTART_REQUESTED);
+    expect(calls[0][1].metadata.profiles).toEqual(['postgres']);
+  });
+
+  it('exportData emits INFRA_DATA_EXPORTED with per-table counts', async () => {
+    const audit = makeAudit();
+    const controller = build(audit, {
+      config: { get: (k: string, d?: unknown) => (k === 'dataDatabase.type' ? 'sqlite' : d) },
+      dataDs: { query: jest.fn().mockResolvedValue([]) },
+    });
+    await controller.exportData();
+    const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { counts: { sessions: number } } }]>;
+    expect(calls[0][0]).toBe(AuditAction.INFRA_DATA_EXPORTED);
+    expect(calls[0][1].metadata.counts.sessions).toBe(0);
+  });
+
+  it('importStorage emits INFRA_STORAGE_IMPORTED with the imported file count', async () => {
+    const audit = makeAudit();
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/srv/openwa');
+    (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === '/srv/openwa/data/exports/x.tar.gz');
+    try {
+      const storageService = { importFromStream: jest.fn().mockResolvedValue(5), getCurrentStorageType: () => 'local' };
+      await build(audit, { storageService }).importStorage({ filePath: 'data/exports/x.tar.gz' });
+      const calls = audit.logInfo.mock.calls as Array<
+        [AuditAction, { metadata: { count: number; storageType: string } }]
+      >;
+      expect(calls[0][0]).toBe(AuditAction.INFRA_STORAGE_IMPORTED);
+      expect(calls[0][1].metadata).toEqual({ count: 5, storageType: 'local' });
+    } finally {
+      cwdSpy.mockRestore();
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+    }
+  });
+
+  it('exportStorage emits INFRA_STORAGE_EXPORTED', async () => {
+    const audit = makeAudit();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-audit-'));
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue(cwd);
+    process.env.STORAGE_EXPORT_TTL_MS = '30';
+    try {
+      const storageService = { createExportStream: jest.fn().mockResolvedValue(Readable.from([Buffer.from('x')])) };
+      await build(audit, { storageService }).exportStorage();
+      const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { download: string } }]>;
+      expect(calls[0][0]).toBe(AuditAction.INFRA_STORAGE_EXPORTED);
+      expect(typeof calls[0][1].metadata.download).toBe('string');
+    } finally {
+      cwdSpy.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      delete process.env.STORAGE_EXPORT_TTL_MS;
+    }
+  });
+});
+
+describe('InfraController C002 audit trail — import emits only on a committed restore', () => {
+  let ds: DataSource;
+  const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
+  const build = (audit: { logInfo: jest.Mock }): InfraController =>
+    new InfraController(
+      cfg as never,
+      {} as never,
+      ds,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      undefined as never,
+      audit as never,
+    );
+
+  beforeEach(async () => {
+    ds = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [
+        Session,
+        Webhook,
+        Message,
+        MessageBatch,
+        PluginInstance,
+        ConversationMapping,
+        IngressEvent,
+        WebhookDeliveryFailure,
+        IntegrationDeliveryFailure,
+      ],
+      synchronize: true,
+    });
+    await ds.initialize();
+  });
+
+  afterEach(async () => {
+    await ds.destroy();
+  });
+
+  const seedSession = (id: string) =>
+    ds.getRepository(Session).save(
+      ds.getRepository(Session).create({
+        id,
+        name: `session-${id}`,
+        status: SessionStatus.READY,
+        phone: null,
+        pushName: null,
+        config: {},
+        proxyUrl: null,
+        proxyType: null,
+        connectedAt: null,
+        lastActiveAt: null,
+      }),
+    );
+
+  it('emits INFRA_DATA_EXPORTED then INFRA_DATA_IMPORTED across a successful round-trip', async () => {
+    await seedSession('s1');
+    const audit = { logInfo: jest.fn().mockResolvedValue(null) };
+    const controller = build(audit);
+    const dump = await controller.exportData();
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.imported).toBe(true);
+    const actions = (audit.logInfo.mock.calls as Array<[AuditAction, unknown]>).map(c => c[0]);
+    expect(actions).toContain(AuditAction.INFRA_DATA_EXPORTED);
+    expect(actions).toContain(AuditAction.INFRA_DATA_IMPORTED);
+  });
+
+  it('does NOT emit INFRA_DATA_IMPORTED when an empty backup is refused (no data changed)', async () => {
+    await seedSession('s1');
+    const audit = { logInfo: jest.fn().mockResolvedValue(null) };
+    const res = await build(audit).importData({ tables: {} });
+    expect(res.imported).toBe(false);
+    const actions = (audit.logInfo.mock.calls as Array<[AuditAction, unknown]>).map(c => c[0]);
+    expect(actions).not.toContain(AuditAction.INFRA_DATA_IMPORTED);
   });
 });
