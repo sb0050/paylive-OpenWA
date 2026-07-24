@@ -135,7 +135,7 @@ Phase 3 (Advanced)
 ├── Label management
 ├── Status/Stories
 ├── Proxy per session
-├── Horizontal scaling
+├── Horizontal scaling design reference
 └── Metrics & monitoring
 ```
 
@@ -220,13 +220,14 @@ quadrantChart
 ```mermaid
 flowchart TB
     subgraph Runtime["Runtime & Framework"]
-        N[Node.js 20 LTS] --> |"TypeScript support, async/await"| NE[NestJS]
+        N[Node.js 22 LTS] --> |"TypeScript support, async/await"| NE[NestJS]
         NE --> |"Modular, scalable, DI"| API[REST API]
     end
     
-    subgraph Engine["WhatsApp Engine"]
+    subgraph Engine["WhatsApp Engine (pluggable)"]
         WW[whatsapp-web.js] --> |"Puppeteer based"| P[More stealth]
         P --> |"Real browser fingerprint"| S[Lower ban risk]
+        BA[baileys] --> |"Browser-free / WebSocket"| BL[Lower resource usage]
     end
     
     subgraph Storage["Data Storage"]
@@ -236,8 +237,8 @@ flowchart TB
     
     subgraph Frontend["Dashboard"]
         R[React] --> V[Vite]
-        V --> S[shadcn/ui]
-        S --> L[Lucide Icons]
+        V --> C[Bespoke CSS]
+        C --> L[Lucide Icons]
         L --> UI[Modern UI]
     end
 ```
@@ -246,17 +247,17 @@ flowchart TB
 
 | Layer | Technology | Rationale |
 |-------|------------|-----------|
-| Runtime | Node.js 20 LTS | Stable, long-term support |
+| Runtime | Node.js 22 LTS | Stable, long-term support |
 | Language | TypeScript | Type safety, better developer experience |
 | Framework | NestJS | Enterprise-grade, modular |
-| WA Engine | whatsapp-web.js | Mature, active community |
-| Browser | Puppeteer/Chrome | Real browser, stealth |
+| WA Engine | whatsapp-web.js (default) or baileys | Pluggable via `ENGINE_TYPE` env var; wwebjs = Puppeteer/stealth, baileys = browser-free |
+| Browser | Puppeteer/Chrome | Used by default (whatsapp-web.js) engine; not required for baileys engine |
 | Database | SQLite (default) / PostgreSQL | Zero-config default, PostgreSQL for scaling |
 | Cache | Redis | Fast, pub/sub support |
 | Queue | Bull | Reliable job processing |
 | Dashboard | React + Vite | Fast, modern |
-| Styling | Tailwind CSS | Utility-first CSS |
-| UI Components | shadcn/ui + Lucide | Accessible, polished |
+| Styling | Bespoke CSS modules/stylesheets | Lightweight dashboard styling without Tailwind |
+| UI Components | Custom React components + Lucide | Accessible, polished |
 | Container | Docker | Portable, consistent |
 
 ## 1.9 Constraints & Assumptions
@@ -265,7 +266,7 @@ flowchart TB
 
 1. **Technical**
    - WhatsApp Web protocol can change at any time
-   - Puppeteer requires significant resources (~300-500MB RAM per session)
+   - Puppeteer requires significant resources (~300-500MB RAM per session) when using the default whatsapp-web.js engine; the baileys engine is browser-free and has a much lower footprint
    - WhatsApp rate limiting
 
 2. **Legal**

@@ -1,33 +1,25 @@
-import {
-  Controller,
-  Get,
-  Post,
-  Put,
-  Delete,
-  Param,
-  Body,
-  HttpCode,
-  HttpStatus,
-  BadRequestException,
-  NotFoundException,
-} from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody } from '@nestjs/swagger';
-import { SessionService } from '../session/session.service';
-import { CreateGroupDto, ParticipantsDto, GroupSubjectDto, GroupDescriptionDto } from './dto/group.dto';
+import { GroupService } from './group.service';
+import {
+  CreateGroupDto,
+  ParticipantsDto,
+  GroupSubjectDto,
+  GroupDescriptionDto,
+  JoinGroupDto,
+  GroupSettingsDto,
+} from './dto/group.dto';
+import { RequireRole } from '../auth/decorators/auth.decorators';
+import { ApiKeyRole } from '../auth/entities/api-key.entity';
 
+// NOTE: the session→groups LIST lives on the SessionController at GET /sessions/:id/groups (it
+// registered first and owns the canonical narrow projection). A bare @Get() here would collide on
+// the same path pattern (/sessions/{x}/groups) and be shadowed, so this controller owns only the
+// group sub-resource routes (:groupId/...) under the same mount.
 @ApiTags('groups')
 @Controller('sessions/:sessionId/groups')
 export class GroupController {
-  constructor(private readonly sessionService: SessionService) {}
-
-  @Get()
-  @ApiOperation({ summary: 'Get all groups for a session' })
-  @ApiParam({ name: 'sessionId', description: 'Session ID' })
-  @ApiResponse({ status: 200, description: 'List of groups' })
-  async findAll(@Param('sessionId') sessionId: string) {
-    const engine = this.getEngine(sessionId);
-    return engine.getGroups();
-  }
+  constructor(private readonly groupService: GroupService) {}
 
   @Get(':groupId')
   @ApiOperation({ summary: 'Get detailed group info' })
@@ -36,25 +28,64 @@ export class GroupController {
   @ApiResponse({ status: 200, description: 'Group details with participants' })
   @ApiResponse({ status: 404, description: 'Group not found' })
   async findOne(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
-    const engine = this.getEngine(sessionId);
-    const group = await engine.getGroupInfo(groupId);
-    if (!group) {
-      throw new NotFoundException(`Group ${groupId} not found`);
-    }
-    return group;
+    return this.groupService.getGroupInfo(sessionId, groupId);
+  }
+
+  @Post('join')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Join a group via invite code' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiBody({ type: JoinGroupDto })
+  @ApiResponse({ status: 200, description: 'Joined the group' })
+  @ApiResponse({ status: 400, description: 'Invalid or expired invite code, or session is not started' })
+  async join(@Param('sessionId') sessionId: string, @Body() dto: JoinGroupDto) {
+    const groupId = await this.groupService.joinGroupViaInviteCode(sessionId, dto.inviteCode);
+    return { success: true, groupId };
+  }
+
+  @Get(':groupId/settings')
+  @ApiOperation({ summary: 'Get group settings (announce / locked / ephemeral timer)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'groupId', description: 'Group ID' })
+  @ApiResponse({ status: 200, description: 'Group settings' })
+  @ApiResponse({ status: 404, description: 'Group not found' })
+  async getSettings(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
+    return this.groupService.getGroupSettings(sessionId, groupId);
+  }
+
+  @Put(':groupId/settings')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Update group settings (announce / locked / ephemeral timer)' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'groupId', description: 'Group ID' })
+  @ApiBody({ type: GroupSettingsDto })
+  @ApiResponse({ status: 200, description: 'Group settings updated' })
+  @ApiResponse({ status: 400, description: 'No setting provided, or a value is not a boolean' })
+  @ApiResponse({ status: 403, description: 'The engine refused the change (the account is not a group admin)' })
+  @ApiResponse({ status: 404, description: 'Group not found' })
+  @ApiResponse({ status: 501, description: 'The active engine does not support a requested setting' })
+  async updateSettings(
+    @Param('sessionId') sessionId: string,
+    @Param('groupId') groupId: string,
+    @Body() dto: GroupSettingsDto,
+  ) {
+    await this.groupService.updateGroupSettings(sessionId, groupId, dto);
+    return { success: true, message: 'Group settings updated' };
   }
 
   @Post()
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Create a new group' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiBody({ type: CreateGroupDto })
   @ApiResponse({ status: 201, description: 'Group created' })
   async create(@Param('sessionId') sessionId: string, @Body() dto: CreateGroupDto) {
-    const engine = this.getEngine(sessionId);
-    return engine.createGroup(dto.name, dto.participants);
+    return this.groupService.createGroup(sessionId, dto.name, dto.participants);
   }
 
   @Post(':groupId/participants')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Add participants to a group' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
@@ -66,12 +97,12 @@ export class GroupController {
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    const engine = this.getEngine(sessionId);
-    await engine.addParticipants(groupId, dto.participants);
+    await this.groupService.addParticipants(sessionId, groupId, dto.participants);
     return { success: true, message: 'Participants added' };
   }
 
   @Delete(':groupId/participants')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Remove participants from a group' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
@@ -82,12 +113,12 @@ export class GroupController {
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    const engine = this.getEngine(sessionId);
-    await engine.removeParticipants(groupId, dto.participants);
+    await this.groupService.removeParticipants(sessionId, groupId, dto.participants);
     return { success: true, message: 'Participants removed' };
   }
 
   @Post(':groupId/participants/promote')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Promote participants to admin' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
@@ -99,12 +130,12 @@ export class GroupController {
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    const engine = this.getEngine(sessionId);
-    await engine.promoteParticipants(groupId, dto.participants);
+    await this.groupService.promoteParticipants(sessionId, groupId, dto.participants);
     return { success: true, message: 'Participants promoted to admin' };
   }
 
   @Post(':groupId/participants/demote')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Demote participants from admin' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
@@ -116,12 +147,12 @@ export class GroupController {
     @Param('groupId') groupId: string,
     @Body() dto: ParticipantsDto,
   ) {
-    const engine = this.getEngine(sessionId);
-    await engine.demoteParticipants(groupId, dto.participants);
+    await this.groupService.demoteParticipants(sessionId, groupId, dto.participants);
     return { success: true, message: 'Participants demoted from admin' };
   }
 
   @Put(':groupId/subject')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Change group name/subject' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
@@ -132,12 +163,12 @@ export class GroupController {
     @Param('groupId') groupId: string,
     @Body() dto: GroupSubjectDto,
   ) {
-    const engine = this.getEngine(sessionId);
-    await engine.setGroupSubject(groupId, dto.subject);
+    await this.groupService.setGroupSubject(sessionId, groupId, dto.subject);
     return { success: true, message: 'Group subject updated' };
   }
 
   @Put(':groupId/description')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Change group description' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
@@ -148,20 +179,19 @@ export class GroupController {
     @Param('groupId') groupId: string,
     @Body() dto: GroupDescriptionDto,
   ) {
-    const engine = this.getEngine(sessionId);
-    await engine.setGroupDescription(groupId, dto.description);
+    await this.groupService.setGroupDescription(sessionId, groupId, dto.description);
     return { success: true, message: 'Group description updated' };
   }
 
   @Post(':groupId/leave')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Leave a group' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiResponse({ status: 200, description: 'Left the group' })
   @HttpCode(HttpStatus.OK)
   async leave(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
-    const engine = this.getEngine(sessionId);
-    await engine.leaveGroup(groupId);
+    await this.groupService.leaveGroup(sessionId, groupId);
     return { success: true, message: 'Left the group' };
   }
 
@@ -173,8 +203,7 @@ export class GroupController {
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiResponse({ status: 200, description: 'Group invite code' })
   async getInviteCode(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
-    const engine = this.getEngine(sessionId);
-    const inviteCode = await engine.getGroupInviteCode(groupId);
+    const inviteCode = await this.groupService.getGroupInviteCode(sessionId, groupId);
     return {
       inviteCode,
       inviteLink: `https://chat.whatsapp.com/${inviteCode}`,
@@ -182,26 +211,18 @@ export class GroupController {
   }
 
   @Post(':groupId/invite-code/revoke')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Revoke group invite code and generate new one' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'groupId', description: 'Group ID' })
   @ApiResponse({ status: 200, description: 'New invite code generated' })
   async revokeInviteCode(@Param('sessionId') sessionId: string, @Param('groupId') groupId: string) {
-    const engine = this.getEngine(sessionId);
-    const newCode = await engine.revokeGroupInviteCode(groupId);
+    const newCode = await this.groupService.revokeGroupInviteCode(sessionId, groupId);
     return {
       inviteCode: newCode,
       inviteLink: `https://chat.whatsapp.com/${newCode}`,
       message: 'Invite code revoked and new one generated',
     };
-  }
-
-  private getEngine(sessionId: string) {
-    const engine = this.sessionService.getEngine(sessionId);
-    if (!engine) {
-      throw new BadRequestException('Session is not started');
-    }
-    return engine;
   }
 }

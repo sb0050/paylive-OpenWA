@@ -52,13 +52,13 @@ flowchart TB
     
     M1 --> A1[Watch releases & issues]
     M2 --> A2[Engine interface pattern]
-    M3 --> A3[Baileys as backup]
+    M3 --> A3[Baileys engine available - ENGINE_TYPE env]
     M4 --> A4[< 24h patch capability]
 ```
 
 **Action Items:**
 1. Subscribe to `whatsapp-web.js` releases
-2. Design the engine abstraction layer
+2. Engine abstraction layer — implemented (pluggable `ENGINE_TYPE`: `whatsapp-web.js` default, `baileys` alternative)
 3. Document fallback procedures
 4. Maintain relationships with library maintainers
 
@@ -194,7 +194,7 @@ flowchart TB
 
 ### Dependency Security
 - [ ] npm audit clean
-- [ ] Snyk scan passed
+- [ ] Dependabot alerts reviewed
 - [ ] Dependencies up to date
 - [ ] No known vulnerabilities
 ```
@@ -289,6 +289,8 @@ Dependencies (`whatsapp-web.js`, Puppeteer, NestJS, etc.) may have vulnerabiliti
 
 **Mitigation Strategies:**
 
+> **Current state:** the real dependency check is an inline `npm audit --audit-level=critical` step in `ci.yml` (runs on push / PR — not on a daily schedule), plus Dependabot PRs (`.github/dependabot.yml`: npm for `/` and `/dashboard`, weekly). There is **no** standalone `security.yml` and **no** Snyk integration. The workflow below is a recommended enhancement to add scheduled scanning.
+
 ```yaml
 # .github/workflows/security.yml
 name: Security Scan
@@ -318,10 +320,10 @@ jobs:
 
 | Action | Frequency |
 |--------|-----------|
-| npm audit | Daily (automated) |
-| Snyk scan | Daily (automated) |
-| Minor updates | Weekly |
-| Major updates | Monthly (with testing) |
+| npm audit (`--audit-level=critical`, inline in CI) | Every push / PR |
+| Snyk scan | Not configured (planned) |
+| Dependabot PRs (npm: `/` and `/dashboard`) | Weekly |
+| Major updates | Reviewed manually |
 | Security patches | Immediate |
 
 ---
@@ -431,7 +433,7 @@ flowchart TB
     M2 --> C1[Notify users]
     C1 --> C2[Switch to maintenance mode]
     C2 --> C3[Evaluate alternatives]
-    C3 --> |Baileys viable| C4[Implement Baileys engine]
+    C3 --> |Baileys viable| C4[Switch to Baileys engine - set ENGINE_TYPE=baileys]
     C3 --> |No alternatives| C5[Project pause/EOL]
 ```
 

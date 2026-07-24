@@ -7,11 +7,31 @@ import {
   createColumnHelper,
   type VisibilityState,
 } from '@tanstack/react-table';
-import { Plus, Copy, RefreshCw, Trash2, Eye, EyeOff, Loader2, X, Check, KeyRound, AlertTriangle } from 'lucide-react';
+import {
+  Plus,
+  Copy,
+  RefreshCw,
+  Trash2,
+  Eye,
+  EyeOff,
+  Loader2,
+  X,
+  Check,
+  KeyRound,
+  AlertTriangle,
+  AlertCircle,
+} from 'lucide-react';
 import type { ApiKey } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
-import { useApiKeysQuery, useCreateApiKeyMutation, useDeleteApiKeyMutation, useRevokeApiKeyMutation } from '../hooks/queries';
+import {
+  useApiKeysQuery,
+  useCreateApiKeyMutation,
+  useDeleteApiKeyMutation,
+  useRevokeApiKeyMutation,
+} from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
+import { useToast } from '../components/Toast';
+import { copyToClipboard } from '../utils/clipboard';
 import './ApiKeys.css';
 
 const roleNames = ['admin', 'operator', 'viewer'] as const;
@@ -30,8 +50,9 @@ const columnHelper = createColumnHelper<ApiKey>();
 
 export function ApiKeys() {
   const { t } = useTranslation();
+  const toast = useToast();
   useDocumentTitle(t('apiKeys.title'));
-  const { data: apiKeys = [], isLoading: loading } = useApiKeysQuery();
+  const { data: apiKeys = [], isLoading: loading, isError: apiKeysError } = useApiKeysQuery();
   const createMutation = useCreateApiKeyMutation();
   const deleteMutation = useDeleteApiKeyMutation();
   const revokeMutation = useRevokeApiKeyMutation();
@@ -61,6 +82,7 @@ export function ApiKeys() {
       setNewKey({ name: '', role: 'operator' });
     } catch (err) {
       console.error('Failed to create:', err);
+      toast.error(t('apiKeys.createBtn'), err instanceof Error ? err.message : t('common.unknownError'));
     }
   };
 
@@ -69,6 +91,7 @@ export function ApiKeys() {
       await revokeMutation.mutateAsync(id);
     } catch (err) {
       console.error('Failed to revoke:', err);
+      toast.error(t('apiKeys.actions.revoke'), err instanceof Error ? err.message : t('common.unknownError'));
     }
   };
 
@@ -77,6 +100,7 @@ export function ApiKeys() {
       await deleteMutation.mutateAsync(id);
     } catch (err) {
       console.error('Failed to delete:', err);
+      toast.error(t('apiKeys.actions.delete'), err instanceof Error ? err.message : t('common.unknownError'));
     }
   };
 
@@ -96,10 +120,11 @@ export function ApiKeys() {
     });
   };
 
-  const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 2000);
+  const handleCopy = async (text: string, id: string) => {
+    if (await copyToClipboard(text)) {
+      setCopied(id);
+      setTimeout(() => setCopied(null), 2000);
+    }
   };
 
   const columns = useMemo(
@@ -116,7 +141,11 @@ export function ApiKeys() {
           return (
             <span className="key-cell">
               <code>{visibleKeys.has(apiKey.id) ? apiKey.keyPrefix + '...' : apiKey.keyPrefix + '****'}</code>
-              <button className="icon-btn-sm" onClick={() => toggleKeyVisibility(apiKey.id)}>
+              <button
+                className="icon-btn-sm"
+                onClick={() => toggleKeyVisibility(apiKey.id)}
+                aria-label={visibleKeys.has(apiKey.id) ? t('common.hideApiKey') : t('common.showApiKey')}
+              >
                 {visibleKeys.has(apiKey.id) ? <EyeOff size={14} /> : <Eye size={14} />}
               </button>
             </span>
@@ -151,13 +180,8 @@ export function ApiKeys() {
           const apiKey = info.row.original;
           return (
             <span className="actions-cell">
-              <button
-                className="icon-btn"
-                onClick={() => copyToClipboard(apiKey.keyPrefix, apiKey.id)}
-                title={t('apiKeys.actions.copy')}
-              >
-                {copied === apiKey.id ? <Check size={16} /> : <Copy size={16} />}
-              </button>
+              {/* No per-row copy: the full key only exists once (post-creation modal); the row
+                  only has the prefix, so a copy button here could only copy a useless fragment. */}
               {apiKey.isActive && (
                 <button
                   className="icon-btn"
@@ -179,7 +203,7 @@ export function ApiKeys() {
         },
       }),
     ],
-    [visibleKeys, copied, t],
+    [visibleKeys, t],
   );
 
   const table = useReactTable({
@@ -213,6 +237,13 @@ export function ApiKeys() {
           </button>
         }
       />
+
+      {apiKeysError && (
+        <div className="error-banner" role="alert">
+          <AlertCircle size={20} />
+          <span className="error-banner-text">{t('dashboard.loadError')}</span>
+        </div>
+      )}
 
       {showModal && (
         <div
@@ -251,7 +282,7 @@ export function ApiKeys() {
                     >
                       {createdKey}
                     </code>
-                    <button className="btn-primary" onClick={() => copyToClipboard(createdKey, 'modal')}>
+                    <button className="btn-primary" onClick={() => void handleCopy(createdKey, 'modal')}>
                       {copied === 'modal' ? <Check size={16} /> : <Copy size={16} />}
                     </button>
                   </div>
@@ -281,8 +312,12 @@ export function ApiKeys() {
                 <button className="btn-secondary" onClick={() => setShowModal(false)}>
                   {t('common.cancel')}
                 </button>
-                <button className="btn-primary" onClick={handleCreate}>
-                  {t('common.create')}
+                <button
+                  className="btn-primary"
+                  onClick={handleCreate}
+                  disabled={createMutation.isPending || !newKey.name}
+                >
+                  {createMutation.isPending ? <Loader2 className="animate-spin" size={16} /> : t('common.create')}
                 </button>
               </div>
             )}
@@ -342,9 +377,7 @@ export function ApiKeys() {
           <div className="modal confirm-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <h2>
-                {confirmAction.type === 'delete'
-                  ? t('apiKeys.confirm.deleteTitle')
-                  : t('apiKeys.confirm.revokeTitle')}
+                {confirmAction.type === 'delete' ? t('apiKeys.confirm.deleteTitle') : t('apiKeys.confirm.revokeTitle')}
               </h2>
               <button className="btn-icon" onClick={() => setConfirmAction(null)}>
                 <X size={20} />
@@ -357,9 +390,7 @@ export function ApiKeys() {
               <p className="confirm-message">
                 <Trans
                   i18nKey={
-                    confirmAction.type === 'delete'
-                      ? 'apiKeys.confirm.deleteMessage'
-                      : 'apiKeys.confirm.revokeMessage'
+                    confirmAction.type === 'delete' ? 'apiKeys.confirm.deleteMessage' : 'apiKeys.confirm.revokeMessage'
                   }
                   values={{ name: confirmAction.name }}
                   components={{ strong: <strong /> }}
@@ -371,9 +402,7 @@ export function ApiKeys() {
                 {t('common.cancel')}
               </button>
               <button className="btn-danger" onClick={confirmAndExecute}>
-                {confirmAction.type === 'delete'
-                  ? t('apiKeys.confirm.delete')
-                  : t('apiKeys.confirm.revoke')}
+                {confirmAction.type === 'delete' ? t('apiKeys.confirm.delete') : t('apiKeys.confirm.revoke')}
               </button>
             </div>
           </div>

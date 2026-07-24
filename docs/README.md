@@ -16,12 +16,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.8-blue.svg" alt="Version"/>
+  <img src="https://img.shields.io/github/package-json/v/rmyndharis/OpenWA?label=version&color=blue" alt="Version"/>
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"/>
   <img src="https://img.shields.io/badge/node-22_LTS-brightgreen.svg" alt="Node"/>
-  <img src="https://img.shields.io/badge/NestJS-11.x-red.svg" alt="NestJS"/>
+  <img src="https://img.shields.io/github/package-json/dependency-version/rmyndharis/OpenWA/@nestjs/core?label=NestJS&color=red" alt="NestJS"/>
   <img src="https://img.shields.io/badge/docker-ready-blue.svg" alt="Docker"/>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript"/>
+  <img src="https://img.shields.io/github/package-json/dependency-version/rmyndharis/OpenWA/dev/typescript?label=TypeScript&color=3178C6" alt="TypeScript"/>
 </p>
 
 ---
@@ -56,6 +56,19 @@
 | 21  | [Glossary](./21-glossary.md)                                     | Terms and definitions                             |
 | 22  | [n8n Integration](./22-n8n-integration.md)                       | n8n community nodes for OpenWA                    |
 | 23  | [Community Integrations](./23-community-integrations.md)         | Third-party adapters built on the OpenWA API      |
+| 23-S| [Plugin Sandboxing](./23-plugin-sandboxing.md)                   | Worker isolation, capabilities, and plugin limits |
+| 24  | [MCP Integration](./24-mcp-integration.md)                       | Model Context Protocol tools and auth model       |
+| 25  | [Integration Fabric](./25-integration-fabric.md)                | Inbound webhook substrate for plugin integrations |
+| 26  | [Global Search](./26-global-search.md)                          | Cross-session message search and the provider model |
+
+**Examples**
+
+| Example | Description |
+| ------- | ----------- |
+| [Session Phone-Number Pairing](./examples/session-phone-number-pairing.md) | Link an existing WhatsApp account by phone number instead of scanning QR |
+| [Chat History Limits](./examples/chat-history-limits.md) | Understand local message history vs bounded live WhatsApp history |
+| [Webhook Signature Verification](./examples/webhook-signature-verification.md) | Verify signed OpenWA webhook deliveries in Node.js and Python |
+| [n8n Appointment Booking Workflow](./examples/n8n-appointment-booking.md) | Build an appointment-booking flow with OpenWA and n8n |
 
 ## Quick Start
 
@@ -83,7 +96,7 @@ Access:
 - Swagger: `http://localhost:2785/api/docs`
 - Health: `http://localhost:2785/api/health`
 
-### Option B: Docker (Traefik + API + Dashboard)
+### Option B: Docker (single container: API + Dashboard)
 
 ```bash
 # Clone repository
@@ -94,12 +107,11 @@ cd OpenWA
 docker compose up -d
 ```
 
-Access:
+Access (the dashboard is bundled into the API and served on the same port):
 
-- Dashboard: `http://localhost:2886`
+- Dashboard: `http://localhost:2785`
 - API: `http://localhost:2785/api`
 - Swagger: `http://localhost:2785/api/docs`
-- Traefik (optional): `http://localhost:2886/api`
 
 ### API Key
 
@@ -108,9 +120,10 @@ OpenWA seeds a default API key on first run and writes it to:
 - `data/.api-key` (development)
 - `/app/data/.api-key` inside the API container when using Docker
 
-The startup logs also print the initial key. Local development uses
-`dev-admin-key` when no keys exist; production creates a random `owa_k1_...`
-admin key. Use an admin key to create additional keys with
+The startup logs also print the initial key. By default a cryptographically
+random `owa_k1_...` admin key is generated on first run in all environments; set
+`ALLOW_DEV_API_KEY=true` to seed the well-known `dev-admin-key` for local
+development only. Use an admin key to create additional keys with
 `POST /api/auth/api-keys` (see
 [API Specification](./06-api-specification.md#api-key-management)).
 
@@ -172,7 +185,7 @@ socket.on('message', msg => {
 | WebSocket Events (Socket.IO)    | Ready                         |
 | Multi-session Support           | Ready                         |
 | Web Dashboard                   | Ready                         |
-| Docker + Traefik Deployment     | Ready                         |
+| Docker Deployment               | Ready                         |
 | Webhooks with HMAC Signature    | Ready                         |
 | SQLite / PostgreSQL Storage     | Ready                         |
 | API Key Authentication & Roles  | Ready                         |
@@ -181,16 +194,18 @@ socket.on('message', msg => {
 | Audit Logging                   | Ready                         |
 | Groups / Contacts / Labels API  | Ready                         |
 | Channels / Status / Catalog API | Experimental (engine-limited) |
+| Pluggable Engine (wwebjs / Baileys) | Ready (set `ENGINE_TYPE`)  |
+| Plugin Extension System         | Ready                         |
 | Queue-based Webhook Retries     | Optional (QUEUE_ENABLED=true) |
 
 ## Tech Stack
 
 | Layer     | Technology                    |
 | --------- | ----------------------------- |
-| Runtime   | Node.js 20 LTS                |
+| Runtime   | Node.js 22 LTS                |
 | Framework | NestJS 11.x                   |
-| Language  | TypeScript 5.x                |
-| WA Engine | whatsapp-web.js               |
+| Language  | TypeScript 6.x                |
+| WA Engine | Pluggable (`ENGINE_TYPE`): whatsapp-web.js (default) or Baileys |
 | WebSocket | Socket.IO                     |
 | Database  | SQLite (default) / PostgreSQL |
 | ORM       | TypeORM                       |
@@ -203,7 +218,7 @@ socket.on('message', msg => {
 OpenWA/
 ├── src/                    # Backend source code
 ├── dashboard/              # Frontend dashboard
-├── docker-compose.yml      # Traefik + API + Dashboard
+├── docker-compose.yml      # API (serves bundled dashboard) + optional datastores
 ├── docker-compose.dev.yml  # Dev-only compose
 ├── docs/                  # Project documentation
 └── data/                   # Local runtime data (sessions, media, api key)
@@ -223,6 +238,6 @@ MIT License.
 
 **Start Reading: [01 - Project Overview](./01-project-overview.md)**
 
-_OpenWA Documentation · Last updated: 2026-02-05_
+_OpenWA Documentation · Last updated: 2026-06-18_
 
 </div>

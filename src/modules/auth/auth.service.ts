@@ -1,22 +1,63 @@
-import { Injectable, NotFoundException, UnauthorizedException, OnModuleInit } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException, UnauthorizedException, OnModuleInit } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { createHash, randomBytes } from 'crypto';
-import { existsSync, writeFileSync, readFileSync } from 'fs';
+import { IsNull, MoreThan, Not, Repository } from 'typeorm';
+import { randomBytes } from 'crypto';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { writeSecretFile } from '../../common/utils/secret-file';
+import { ipMatches } from '../../common/utils/ip';
+import { hashApiKey } from './api-key-hash';
 import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 import { CreateApiKeyDto, UpdateApiKeyDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
+import { EventsGateway, type ApiKeyEvictionReason } from '../events/events.gateway';
 
 const API_KEY_FILE = join(process.cwd(), 'data', '.api-key');
+
+/**
+ * Resolves the API key to seed on first boot (when no keys exist yet).
+ * Precedence: an explicit `API_MASTER_KEY` always wins; otherwise a
+ * cryptographically random `owa_k1_` key is generated — the secure default,
+ * including in non-production. The legacy fixed `dev-admin-key` is used only when
+ * a developer explicitly opts in with `ALLOW_DEV_API_KEY=true`, never by default.
+ */
+export function resolveSeedApiKey(): string {
+  if (process.env.API_MASTER_KEY) {
+    return process.env.API_MASTER_KEY;
+  }
+  if (process.env.ALLOW_DEV_API_KEY === 'true') {
+    return 'dev-admin-key';
+  }
+  return `owa_k1_${randomBytes(32).toString('hex')}`;
+}
+
+/**
+ * The line to print for the API key in the startup banner. The full raw key is shown ONLY when it was
+ * just created (first run, when the operator needs to capture it once). On every subsequent boot the
+ * key is masked to a short non-secret fingerprint, so the live admin key is not re-written to the log
+ * pipeline (Docker/Loki/CloudWatch) on each restart — it stays in `data/.api-key` (0600) and the
+ * dashboard. A placeholder (e.g. "(check dashboard for keys)") is passed through unchanged.
+ */
+export function bannerKeyLine(displayKey: string, isNewKey: boolean): string {
+  if (isNewKey) return displayKey;
+  if (displayKey.startsWith('(')) return displayKey;
+  return `${displayKey.slice(0, 8)}… (full key in data/.api-key or the dashboard)`;
+}
 
 @Injectable()
 export class AuthService implements OnModuleInit {
   private readonly logger = createLogger('AuthService');
 
+  /** Coalesce per-request usage-stat writes to at most one DB write per key per window. */
+  private static readonly STAT_FLUSH_INTERVAL_MS = 60_000;
+  /** keyId -> usage increments observed but not yet persisted (flushed on the next windowed write). */
+  private readonly pendingUsage = new Map<string, number>();
+
   constructor(
     @InjectRepository(ApiKey, 'main')
     private readonly apiKeyRepository: Repository<ApiKey>,
+    private readonly moduleRef: ModuleRef,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -26,17 +67,14 @@ export class AuthService implements OnModuleInit {
     let isNewKey = false;
 
     if (count === 0) {
-      // Use env var if set, otherwise auto-generate predictable key in development, random key in production
-      displayKey =
-        process.env.API_MASTER_KEY ||
-        (process.env.NODE_ENV === 'production' ? `owa_k1_${randomBytes(32).toString('hex')}` : 'dev-admin-key');
+      displayKey = resolveSeedApiKey();
 
       await this.seedApiKey(displayKey, 'Default Admin Key', ApiKeyRole.ADMIN);
       isNewKey = true;
 
-      // Save raw key to file for startup script to read
+      // Save raw key to file for startup script to read (owner-only — it's the raw admin key).
       try {
-        writeFileSync(API_KEY_FILE, displayKey, 'utf-8');
+        writeSecretFile(API_KEY_FILE, displayKey);
       } catch (err) {
         this.logger.warn('Could not save API key file', { error: String(err) });
       }
@@ -56,7 +94,8 @@ export class AuthService implements OnModuleInit {
 
     // Always show the welcome banner on startup
     const apiBaseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 2785}`;
-    const dashboardUrl = process.env.DASHBOARD_URL || `http://localhost:${process.env.DASHBOARD_PORT || 2886}`;
+    // The dashboard is served by NestJS at the same origin as the API now, so default to it.
+    const dashboardUrl = process.env.DASHBOARD_URL || apiBaseUrl;
 
     this.logger.log('');
     this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -71,7 +110,7 @@ export class AuthService implements OnModuleInit {
     } else {
       this.logger.log('  🔑 API Key:');
     }
-    this.logger.log(`     ${displayKey}`);
+    this.logger.log(`     ${bannerKeyLine(displayKey, isNewKey)}`);
     this.logger.log('');
     this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     this.logger.log('');
@@ -134,18 +173,54 @@ export class AuthService implements OnModuleInit {
   async update(id: string, dto: UpdateApiKeyDto): Promise<ApiKey> {
     const apiKey = await this.findOne(id);
 
+    const removesOrSchedulesLastAdmin =
+      (dto.role !== undefined && dto.role !== ApiKeyRole.ADMIN) ||
+      (dto.expiresAt !== undefined && dto.expiresAt !== null);
+    if (removesOrSchedulesLastAdmin) {
+      await this.assertNotLastUsableAdmin(apiKey);
+    }
+
+    // Capture the authorization-relevant fields BEFORE applying the change. Only a change to role,
+    // allowedIps, allowedSessions, or expiry can widen or restrict what an already-connected WebSocket
+    // socket may see, so only those trigger eviction of live /events sockets — a benign rename must
+    // NOT disconnect clients. REST enforces the new state immediately; without eviction a live socket
+    // keeps streaming events for sessions/IPs the key just lost until it resubscribes or drops.
+    const before = {
+      role: apiKey.role,
+      allowedIps: apiKey.allowedIps,
+      allowedSessions: apiKey.allowedSessions,
+      expiresAt: apiKey.expiresAt,
+    };
+
     if (dto.name) apiKey.name = dto.name;
     if (dto.role) apiKey.role = dto.role;
     if (dto.allowedIps !== undefined) apiKey.allowedIps = dto.allowedIps;
     if (dto.allowedSessions !== undefined) apiKey.allowedSessions = dto.allowedSessions;
     if (dto.expiresAt !== undefined) apiKey.expiresAt = dto.expiresAt ? new Date(dto.expiresAt) : null;
 
-    return this.apiKeyRepository.save(apiKey);
+    const saved = await this.apiKeyRepository.save(apiKey);
+
+    // Compare membership, not order: a pure reorder of allowedIps/allowedSessions is a no-op for the
+    // .includes()-based enforcement, so sort before stringify to avoid a spurious eviction on a reorder.
+    const ordered = (v: string[] | null) => (v ? [...v].sort() : v);
+    const authzChanged =
+      saved.role !== before.role ||
+      saved.expiresAt?.getTime() !== before.expiresAt?.getTime() ||
+      JSON.stringify(ordered(saved.allowedIps)) !== JSON.stringify(ordered(before.allowedIps)) ||
+      JSON.stringify(ordered(saved.allowedSessions)) !== JSON.stringify(ordered(before.allowedSessions));
+    if (authzChanged) {
+      this.evictActiveSockets(id, 'authorization_changed');
+    }
+    return saved;
   }
 
   async delete(id: string): Promise<void> {
     const apiKey = await this.findOne(id);
+    await this.assertNotLastUsableAdmin(apiKey);
+    // Drop any un-flushed usage accumulator so a deleted key leaves nothing behind in the Map.
+    this.pendingUsage.delete(id);
     await this.apiKeyRepository.remove(apiKey);
+    this.evictActiveSockets(id, 'deleted');
     this.logger.log(`API key deleted: ${apiKey.name}`, {
       keyId: id,
       action: 'api_key_deleted',
@@ -154,8 +229,54 @@ export class AuthService implements OnModuleInit {
 
   async revoke(id: string): Promise<ApiKey> {
     const apiKey = await this.findOne(id);
+    await this.assertNotLastUsableAdmin(apiKey);
+    // A revoked key fails validation before its next flush, so its accumulator would orphan —
+    // drop it here.
+    this.pendingUsage.delete(id);
     apiKey.isActive = false;
-    return this.apiKeyRepository.save(apiKey);
+    const saved = await this.apiKeyRepository.save(apiKey);
+    // Kick any WebSocket connections already authenticated with this key: without this, a revoked
+    // key keeps receiving events on already-subscribed sockets until they happen to disconnect.
+    this.evictActiveSockets(id, 'revoked');
+    return saved;
+  }
+
+  private async assertNotLastUsableAdmin(target: ApiKey): Promise<void> {
+    const now = new Date();
+    const targetIsUsableAdmin =
+      target.role === ApiKeyRole.ADMIN && target.isActive && (!target.expiresAt || target.expiresAt > now);
+    if (!targetIsUsableAdmin) return;
+
+    const otherUsableAdmins = await this.apiKeyRepository.count({
+      where: [
+        { id: Not(target.id), role: ApiKeyRole.ADMIN, isActive: true, expiresAt: IsNull() },
+        { id: Not(target.id), role: ApiKeyRole.ADMIN, isActive: true, expiresAt: MoreThan(now) },
+      ],
+    });
+    if (otherUsableAdmins === 0) {
+      throw new ConflictException('Cannot remove the last active admin key');
+    }
+  }
+
+  /**
+   * Disconnect every WebSocket socket authenticated with the given key id. Resolved lazily via
+   * ModuleRef (not constructor injection) to avoid a static DI cycle between AuthModule and
+   * EventsModule. Best-effort: if the WS gateway isn't loaded (or has no sockets for the key),
+   * this is a silent no-op.
+   */
+  private evictActiveSockets(keyId: string, reason: ApiKeyEvictionReason = 'revoked'): void {
+    try {
+      const gateway = this.moduleRef.get(EventsGateway, { strict: false });
+      if (gateway) {
+        gateway.evictApiKey(keyId, reason);
+      }
+    } catch (error) {
+      // Eviction is best-effort: the key's DB state is already authoritative (validateApiKey
+      // rejects it), so a failure here must never roll back the revoke/delete.
+      this.logger.warn(`Failed to evict WebSocket sockets for key ${keyId}`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async validateApiKey(rawKey: string, clientIp?: string, sessionId?: string): Promise<ApiKey> {
@@ -196,69 +317,36 @@ export class AuthService implements OnModuleInit {
       }
     }
 
-    // Update usage stats
+    // Update usage stats — coalesced. Validation above is unchanged/synchronous; only
+    // the stat WRITE is throttled to at most once per key per window. usageCount stays
+    // accurate via an in-memory accumulator; the returned object reflects the true count.
+    const pending = (this.pendingUsage.get(apiKey.id) ?? 0) + 1;
+    const previousLastUsedAt = apiKey.lastUsedAt;
     apiKey.lastUsedAt = new Date();
-    apiKey.usageCount += 1;
-    await this.apiKeyRepository.save(apiKey);
+    apiKey.usageCount += pending; // DB value + all not-yet-persisted increments (incl. this request)
+
+    const due =
+      !previousLastUsedAt ||
+      apiKey.lastUsedAt.getTime() - previousLastUsedAt.getTime() >= AuthService.STAT_FLUSH_INTERVAL_MS;
+    if (due) {
+      this.pendingUsage.delete(apiKey.id);
+      await this.apiKeyRepository.save(apiKey);
+    } else {
+      this.pendingUsage.set(apiKey.id, pending);
+    }
 
     return apiKey;
   }
 
   private hashKey(rawKey: string): string {
-    return createHash('sha256').update(rawKey).digest('hex');
+    return hashApiKey(rawKey, process.env.API_KEY_PEPPER);
   }
 
   private isIpAllowed(clientIp: string, allowedIps: string[]): boolean {
-    // Phase 3 Security Audit: Support both exact match and CIDR notation
-    for (const entry of allowedIps) {
-      if (entry.includes('/')) {
-        // CIDR notation (e.g., "10.0.0.0/24")
-        if (this.ipInCidr(clientIp, entry)) {
-          return true;
-        }
-      } else {
-        // Exact match
-        if (clientIp === entry) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Check if an IPv4 address is within a CIDR range
-   * @param ip - Client IP address (e.g., "192.168.1.100")
-   * @param cidr - CIDR notation (e.g., "192.168.1.0/24")
-   */
-  private ipInCidr(ip: string, cidr: string): boolean {
-    try {
-      const [range, bitsStr] = cidr.split('/');
-      const bits = parseInt(bitsStr, 10);
-
-      if (isNaN(bits) || bits < 0 || bits > 32) {
-        return false;
-      }
-
-      const mask = ~(2 ** (32 - bits) - 1);
-      const ipNum = this.ipToNumber(ip);
-      const rangeNum = this.ipToNumber(range);
-
-      return (ipNum & mask) === (rangeNum & mask);
-    } catch (error) {
-      this.logger.warn(`Invalid CIDR format: ${cidr}`, { error: String(error) });
-      return false;
-    }
-  }
-
-  /**
-   * Convert IPv4 address string to 32-bit number
-   */
-  private ipToNumber(ip: string): number {
-    const parts = ip.split('.');
-    if (parts.length !== 4) return 0;
-
-    return parts.reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
+    // Delegate to the shared, hardened matcher (also used by the throttler and the API-key guard's IP
+    // resolution): it handles both an exact IP entry and CIDR notation, and — unlike the previous local
+    // parser — rejects a malformed octet instead of coercing it into range.
+    return allowedIps.some(entry => ipMatches(clientIp, entry));
   }
 
   hasPermission(apiKey: ApiKey, requiredRole: ApiKeyRole): boolean {

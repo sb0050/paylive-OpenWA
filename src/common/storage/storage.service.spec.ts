@@ -75,6 +75,22 @@ describe('StorageService (local) path traversal protection', () => {
     await expect(service.getFile('../secret.txt')).rejects.toThrow();
   });
 
+  it('deletes a file within the storage root', async () => {
+    await service.putFile('sub/gone.txt', Buffer.from('bye'));
+    await service.deleteFile('sub/gone.txt');
+    expect(fs.existsSync(path.join(localPath, 'sub/gone.txt'))).toBe(false);
+  });
+
+  it('deleting an already-missing file resolves without throwing', async () => {
+    await expect(service.deleteFile('never-existed.txt')).resolves.toBeUndefined();
+  });
+
+  it('rejects deleting a file outside the storage root', async () => {
+    fs.writeFileSync(path.join(baseDir, 'secret.txt'), 'topsecret');
+    await expect(service.deleteFile('../secret.txt')).rejects.toThrow();
+    expect(fs.existsSync(path.join(baseDir, 'secret.txt'))).toBe(true);
+  });
+
   it('imports safe entries but refuses tar entries that escape the storage root', async () => {
     const gz = await makeTarGz([
       { name: 'safe.txt', data: 'good' },
@@ -86,5 +102,159 @@ describe('StorageService (local) path traversal protection', () => {
     expect(fs.readFileSync(path.join(localPath, 'safe.txt'), 'utf8')).toBe('good');
     expect(fs.existsSync(path.join(baseDir, 'evil.txt'))).toBe(false);
     expect(count).toBe(1);
+  });
+});
+
+function makeLocalService(): { service: StorageService; baseDir: string; localPath: string } {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-storage-'));
+  const localPath = path.join(baseDir, 'media');
+  const configService = {
+    get: (key: string) => (key === 'storage.type' ? 'local' : key === 'storage.localPath' ? localPath : undefined),
+  } as unknown as ConfigService;
+  return { service: new StorageService(configService), baseDir, localPath };
+}
+
+describe('StorageService put/getFile containment is backend-agnostic', () => {
+  // Force S3 routing with a stub client so the assertion proves the guard runs BEFORE any S3 call
+  // (i.e. it lives in put/getFile, so the otherwise-unguarded S3 backend is contained too).
+  function s3Stub(service: StorageService): jest.Mock {
+    const sendMock = jest.fn();
+    const internal = service as unknown as { storageType: string; s3Client: unknown; s3Available: boolean };
+    internal.storageType = 's3';
+    internal.s3Client = { send: sendMock };
+    internal.s3Available = true;
+    return sendMock;
+  }
+
+  it('putFile rejects an unsafe key before reaching the S3 backend', async () => {
+    const { service, baseDir } = makeLocalService();
+    const sendMock = s3Stub(service);
+
+    await expect(service.putFile('../evil', Buffer.from('x'))).rejects.toThrow();
+    expect(sendMock).not.toHaveBeenCalled();
+
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  });
+
+  it('getFile rejects an unsafe key before reaching the S3 backend', async () => {
+    const { service, baseDir } = makeLocalService();
+    const sendMock = s3Stub(service);
+
+    await expect(service.getFile('../../etc/passwd')).rejects.toThrow();
+    expect(sendMock).not.toHaveBeenCalled();
+
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  });
+});
+
+describe('StorageService getFileCount (S3 size)', () => {
+  it('sums the real Size of each S3 object instead of estimating', async () => {
+    const { service, baseDir } = makeLocalService();
+    const sendMock = jest.fn().mockResolvedValue({
+      Contents: [
+        { Key: 'media/a.jpg', Size: 1000 },
+        { Key: 'media/b.jpg', Size: 2500 },
+      ],
+    });
+    const internal = service as unknown as {
+      storageType: string;
+      s3Client: unknown;
+      s3Bucket: string;
+      s3Available: boolean;
+    };
+    internal.storageType = 's3';
+    internal.s3Client = { send: sendMock };
+    internal.s3Bucket = 'test-bucket';
+    internal.s3Available = true;
+
+    const result = await service.getFileCount();
+
+    expect(result.count).toBe(2);
+    expect(result.sizeBytes).toBe(3500); // real object sizes, not files.length * 100000
+
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  });
+});
+
+describe('StorageService import resource caps (decompression-bomb defense)', () => {
+  let baseDir: string;
+  let localPath: string;
+  let service: StorageService;
+
+  beforeEach(() => {
+    ({ service, baseDir, localPath } = makeLocalService());
+  });
+
+  afterEach(() => {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+    delete process.env.STORAGE_IMPORT_MAX_BYTES;
+    delete process.env.STORAGE_IMPORT_MAX_ENTRIES;
+  });
+
+  it('aborts an entry that exceeds the per-entry byte cap, writing nothing', async () => {
+    process.env.STORAGE_IMPORT_MAX_BYTES = '8';
+    const gz = await makeTarGz([{ name: 'bomb.bin', data: 'far-more-than-eight-bytes' }]);
+
+    await expect(service.importFromStream(Readable.from(gz))).rejects.toThrow(/byte|cap|exceed|large/i);
+    expect(fs.existsSync(path.join(localPath, 'bomb.bin'))).toBe(false);
+  });
+
+  it('aborts when the archive exceeds the max entry count', async () => {
+    process.env.STORAGE_IMPORT_MAX_ENTRIES = '1';
+    const gz = await makeTarGz([
+      { name: 'a.txt', data: 'a' },
+      { name: 'b.txt', data: 'b' },
+    ]);
+
+    await expect(service.importFromStream(Readable.from(gz))).rejects.toThrow(/entr/i);
+  });
+
+  it('aborts a large multi-chunk entry mid-stream (the payload spans several stream chunks)', async () => {
+    process.env.STORAGE_IMPORT_MAX_BYTES = '1024';
+    // 256 KiB easily spans multiple 64 KiB stream chunks, so this proves the running accumulator
+    // aborts mid-stream rather than only after the whole entry is buffered.
+    const gz = await makeTarGz([{ name: 'big.bin', data: 'x'.repeat(256 * 1024) }]);
+
+    await expect(service.importFromStream(Readable.from(gz))).rejects.toThrow(/byte|cap|exceed|large/i);
+    expect(fs.existsSync(path.join(localPath, 'big.bin'))).toBe(false);
+  });
+
+  it('imports normally within the (generous default) caps', async () => {
+    const gz = await makeTarGz([{ name: 'ok.txt', data: 'fine' }]);
+    const count = await service.importFromStream(Readable.from(gz));
+    expect(count).toBe(1);
+  });
+});
+
+describe('StorageService local traversal (async + bounded)', () => {
+  let baseDir: string;
+  let service: StorageService;
+
+  beforeEach(() => {
+    ({ service, baseDir } = makeLocalService());
+  });
+
+  afterEach(() => {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+    delete process.env.STORAGE_LIST_MAX_FILES;
+  });
+
+  it('lists files across nested subdirectories (async traversal)', async () => {
+    await service.putFile('a.txt', Buffer.from('a'));
+    await service.putFile('sub/b.txt', Buffer.from('b'));
+    await service.putFile('sub/deep/c.txt', Buffer.from('c'));
+
+    const files = await service.listFiles();
+    expect(files.sort()).toEqual(['a.txt', 'sub/b.txt', 'sub/deep/c.txt']);
+  });
+
+  it('stops at the STORAGE_LIST_MAX_FILES cap instead of enumerating a huge tree', async () => {
+    process.env.STORAGE_LIST_MAX_FILES = '5';
+    for (let i = 0; i < 20; i++) {
+      await service.putFile(`file${i}.txt`, Buffer.from('x'));
+    }
+
+    const files = await service.listFiles();
+    expect(files.length).toBe(5); // capped, not 20
   });
 });

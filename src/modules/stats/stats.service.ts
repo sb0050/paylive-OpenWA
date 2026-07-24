@@ -5,6 +5,42 @@ import { Session, SessionStatus } from '../session/entities/session.entity';
 import { Message, MessageStatus } from '../message/entities/message.entity';
 import { CacheService } from '../../common/cache';
 
+/**
+ * SQL for the time-series timestamp bucket, per DB dialect. SQLite has strftime(); Postgres has
+ * neither strftime nor a case-insensitive bare `m.createdAt` (unquoted it folds to lowercase and
+ * misses the quoted "createdAt" column) — so it needs to_char() with a quoted column. The hour
+ * format yields an identical zero-padded, chronologically-sortable label on both engines, so the
+ * GROUP BY/ORDER BY on the alias and the downstream map() are unchanged.
+ */
+export function timeSeriesTimestampSql(dbType: string, interval: 'hour' | 'day'): string {
+  if (dbType === 'postgres') {
+    const fmt = interval === 'hour' ? 'YYYY-MM-DD HH24:00:00' : 'YYYY-MM-DD';
+    return `to_char(m."createdAt", '${fmt}')`;
+  }
+  const fmt = interval === 'hour' ? '%Y-%m-%d %H:00:00' : '%Y-%m-%d';
+  return `strftime('${fmt}', m.createdAt)`;
+}
+
+/** SQL for the integer hour-of-day (0-23) bucket, per DB dialect. */
+export function hourBucketSql(dbType: string): string {
+  return dbType === 'postgres'
+    ? `CAST(EXTRACT(HOUR FROM m."createdAt") AS INTEGER)`
+    : `CAST(strftime('%H', m.createdAt) AS INTEGER)`;
+}
+
+/**
+ * SQL for the most-recent-activity timestamp (MAX of createdAt) as an identical text format on both
+ * engines. SQLite's MAX over a `datetime` column returns the stored text; Postgres returns a timestamp
+ * the driver hydrates to a JS Date (serialized to a different ISO string). to_char/strftime pin both
+ * to `YYYY-MM-DD HH:MM:SS`, matching the format the time-series buckets already use, so the lastActive
+ * field is stable regardless of the backing database.
+ */
+export function maxCreatedAtSql(dbType: string): string {
+  return dbType === 'postgres'
+    ? `to_char(MAX(m."createdAt"), 'YYYY-MM-DD HH24:MI:SS')`
+    : `strftime('%Y-%m-%d %H:%M:%S', MAX(m.createdAt))`;
+}
+
 export interface OverviewStats {
   sessions: {
     active: number;
@@ -29,13 +65,13 @@ export interface MessageStats {
   timeSeries: TimeSeriesPoint[];
   byType: Record<string, number>;
   bySession: Array<{ sessionId: string; name: string; sent: number; received: number }>;
-  topChats: Array<{ chatId: string; messageCount: number }>;
+  topChats: Array<{ chatId: string; chatName: string | null; messageCount: number }>;
 }
 
 export interface SessionStats {
   session: { id: string; name: string; status: string };
   messages: { sent: number; received: number; today: number; failed: number };
-  topChats: Array<{ chatId: string; count: number; lastActive: string }>;
+  topChats: Array<{ chatId: string; chatName: string | null; count: number; lastActive: string }>;
   hourlyActivity: Array<{ hour: number; sent: number; received: number }>;
 }
 
@@ -48,6 +84,11 @@ export class StatsService {
     private readonly messageRepo: Repository<Message>,
     private readonly cacheService: CacheService,
   ) {}
+
+  /** The data-connection dialect ('sqlite' | 'postgres'), used to pick portable date SQL. */
+  private get dataDbType(): string {
+    return this.messageRepo.manager.dataSource.options.type;
+  }
 
   async getOverview(): Promise<OverviewStats> {
     // Get session stats
@@ -118,12 +159,15 @@ export class StatsService {
     // Time series - using raw query for SQLite compatibility
     const timeSeries = await this.getTimeSeries(since, interval);
 
-    // By type
+    // By type. Rows with no body AND no metadata are content-less system/event rows (e.g. @lid
+    // privacy-user events the engine maps to `unknown`) — counting them would put a misleading
+    // "unknown" slice in the by-type chart, so they're excluded from the aggregation.
     const byTypeRaw = await this.messageRepo
       .createQueryBuilder('m')
       .select('m.type', 'type')
       .addSelect('COUNT(*)', 'count')
       .where('m.createdAt >= :since', { since })
+      .andWhere("(m.body IS NOT NULL AND m.body != '') OR m.metadata IS NOT NULL")
       .groupBy('m.type')
       .getRawMany<{ type: string; count: string }>();
 
@@ -167,11 +211,14 @@ export class StatsService {
       .createQueryBuilder('m')
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'messageCount')
+      .addSelect('MAX(m.chatName)', 'chatName')
       .where('m.createdAt >= :since', { since })
       .groupBy('m.chatId')
-      .orderBy('messageCount', 'DESC')
+      // Order by the aggregate expression, not the "messageCount" alias: Postgres folds an unquoted
+      // ORDER BY messageCount to lowercase and 42703s against the quoted alias (SQLite tolerated it).
+      .orderBy('COUNT(*)', 'DESC')
       .limit(10)
-      .getRawMany<{ chatId: string; messageCount: string }>();
+      .getRawMany<{ chatId: string; messageCount: string; chatName: string | null }>();
 
     return {
       timeSeries,
@@ -179,6 +226,7 @@ export class StatsService {
       bySession,
       topChats: topChats.map(c => ({
         chatId: c.chatId,
+        chatName: c.chatName ?? null,
         messageCount: parseInt(c.messageCount),
       })),
     };
@@ -221,12 +269,13 @@ export class StatsService {
       .createQueryBuilder('m')
       .select('m.chatId', 'chatId')
       .addSelect('COUNT(*)', 'count')
-      .addSelect('MAX(m.createdAt)', 'lastActive')
+      .addSelect(maxCreatedAtSql(this.dataDbType), 'lastActive')
+      .addSelect('MAX(m.chatName)', 'chatName')
       .where('m.sessionId = :sessionId', { sessionId })
       .groupBy('m.chatId')
       .orderBy('count', 'DESC')
       .limit(10)
-      .getRawMany<{ chatId: string; count: string; lastActive: string }>();
+      .getRawMany<{ chatId: string; count: string; lastActive: string; chatName: string | null }>();
 
     // Hourly activity (last 24h)
     const hourlyActivity = await this.getHourlyActivity(sessionId);
@@ -236,6 +285,7 @@ export class StatsService {
       messages: { sent, received, today: todayCount, failed },
       topChats: topChats.map(c => ({
         chatId: c.chatId,
+        chatName: c.chatName ?? null,
         count: parseInt(c.count),
         lastActive: c.lastActive,
       })),
@@ -256,21 +306,22 @@ export class StatsService {
   }
 
   private async getTimeSeries(since: Date, interval: 'hour' | 'day'): Promise<TimeSeriesPoint[]> {
-    // SQLite-compatible time series query
-    const formatStr = interval === 'hour' ? '%Y-%m-%d %H:00:00' : '%Y-%m-%d';
-
+    // Alias the bucket as `bucket`, not `timestamp`: `timestamp` is a reserved type keyword in
+    // PostgreSQL, so `GROUP BY timestamp` is not read as the output alias and the query 500s
+    // ("column m.createdAt must appear in the GROUP BY"). SQLite tolerates it, hence the dialect-only
+    // bug. The API field stays `timestamp` (mapped below).
     const raw = await this.messageRepo
       .createQueryBuilder('m')
-      .select(`strftime('${formatStr}', m.createdAt)`, 'timestamp')
+      .select(timeSeriesTimestampSql(this.dataDbType, interval), 'bucket')
       .addSelect(`SUM(CASE WHEN m.direction = 'outgoing' THEN 1 ELSE 0 END)`, 'sent')
       .addSelect(`SUM(CASE WHEN m.direction = 'incoming' THEN 1 ELSE 0 END)`, 'received')
       .where('m.createdAt >= :since', { since })
-      .groupBy('timestamp')
-      .orderBy('timestamp', 'ASC')
-      .getRawMany<{ timestamp: string; sent: string; received: string }>();
+      .groupBy('bucket')
+      .orderBy('bucket', 'ASC')
+      .getRawMany<{ bucket: string; sent: string; received: string }>();
 
     return raw.map(r => ({
-      timestamp: r.timestamp,
+      timestamp: r.bucket,
       sent: parseInt(r.sent || '0'),
       received: parseInt(r.received || '0'),
     }));
@@ -281,7 +332,7 @@ export class StatsService {
 
     const raw = await this.messageRepo
       .createQueryBuilder('m')
-      .select(`CAST(strftime('%H', m.createdAt) AS INTEGER)`, 'hour')
+      .select(hourBucketSql(this.dataDbType), 'hour')
       .addSelect(`SUM(CASE WHEN m.direction = 'outgoing' THEN 1 ELSE 0 END)`, 'sent')
       .addSelect(`SUM(CASE WHEN m.direction = 'incoming' THEN 1 ELSE 0 END)`, 'received')
       .where('m.sessionId = :sessionId', { sessionId })
