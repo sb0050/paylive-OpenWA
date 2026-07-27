@@ -1,15 +1,25 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { SessionService } from '../session/session.service';
+import { StatusStoreService } from '../status-store/status-store.service';
+import { StorageService } from '../../common/storage/storage.service';
 import type { Status, StatusResult, StatusPostOptions } from '../../engine/interfaces/whatsapp-engine.interface';
 import { assertBase64WithinMediaCap, stripBase64DataUri } from '../message/media-cap.util';
 import { HookManager, applySendingGate } from '../../core/hooks';
 
+/** Stored status media is only ever an image or video; a sender-declared mimetype outside that is
+ * served as inert octet-stream so the media endpoint can't be turned into active content (HTML/JS)
+ * on the API origin. */
+const SAFE_STATUS_MIMETYPE = /^(image|video)\//;
+
 @Injectable()
 export class StatusService {
-  // HookManager comes from the @Global() HooksModule, so no module import is needed here.
+  // HookManager comes from the @Global() HooksModule, StorageService from the @Global()
+  // StorageModule — neither needs a module import here.
   constructor(
     private readonly sessionService: SessionService,
     private readonly hookManager: HookManager,
+    private readonly store: StatusStoreService,
+    private readonly storageService: StorageService,
   ) {}
 
   /**
@@ -40,20 +50,35 @@ export class StatusService {
     return { mimetype: media.mimetype, data };
   }
 
+  // Reads come from the store (StatusStoreService ingests status broadcasts as they arrive, plus a
+  // best-effort seed on connect), not the engine — Baileys never implemented
+  // `getContactStatuses`/`getContactStatus`, so both engines now answer reads identically from the
+  // same 24h-TTL store.
   async getStatuses(sessionId: string): Promise<Status[]> {
-    const engine = this.sessionService.getEngine(sessionId);
-    if (!engine) {
-      throw new NotFoundException(`Session ${sessionId} not found or not connected`);
-    }
-    return engine.getContactStatuses();
+    return this.store.list(sessionId);
   }
 
   async getContactStatus(sessionId: string, contactId: string): Promise<Status[]> {
-    const engine = this.sessionService.getEngine(sessionId);
-    if (!engine) {
-      throw new NotFoundException(`Session ${sessionId} not found or not connected`);
+    return this.store.listByContact(sessionId, contactId);
+  }
+
+  async getStatusMedia(sessionId: string, statusId: string): Promise<{ buffer: Buffer; mimetype: string }> {
+    const media = await this.store.getMedia(sessionId, statusId);
+    if (!media) {
+      throw new NotFoundException('Status media not found or expired');
     }
-    return engine.getContactStatus(contactId);
+    try {
+      const buffer = await this.storageService.getFile(media.path);
+      const mimetype = SAFE_STATUS_MIMETYPE.test(media.mimetype) ? media.mimetype : 'application/octet-stream';
+      return { buffer, mimetype };
+    } catch (error) {
+      // The row outlived its file: purgeExpired (or a concurrent delete) removed it between the
+      // DB read and this read. That's "gone", not a server fault — surface a 404.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new NotFoundException('Status media not found or expired');
+      }
+      throw error;
+    }
   }
 
   async postTextStatus(sessionId: string, text: string, options: StatusPostOptions): Promise<StatusResult> {

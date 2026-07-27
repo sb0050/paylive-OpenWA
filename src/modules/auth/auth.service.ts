@@ -1,9 +1,16 @@
-import { ConflictException, Injectable, NotFoundException, UnauthorizedException, OnModuleInit } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+  UnauthorizedException,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, MoreThan, Not, Repository } from 'typeorm';
 import { randomBytes } from 'crypto';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { writeSecretFile } from '../../common/utils/secret-file';
 import { ipMatches } from '../../common/utils/ip';
@@ -12,6 +19,7 @@ import { ApiKey, ApiKeyRole } from './entities/api-key.entity';
 import { CreateApiKeyDto, UpdateApiKeyDto } from './dto';
 import { createLogger } from '../../common/services/logger.service';
 import { EventsGateway, type ApiKeyEvictionReason } from '../events/events.gateway';
+import { KeyedAsyncLock } from '../integration/ordering-lock';
 
 const API_KEY_FILE = join(process.cwd(), 'data', '.api-key');
 
@@ -46,13 +54,28 @@ export function bannerKeyLine(displayKey: string, isNewKey: boolean): string {
 }
 
 @Injectable()
-export class AuthService implements OnModuleInit {
+export class AuthService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('AuthService');
 
   /** Coalesce per-request usage-stat writes to at most one DB write per key per window. */
   private static readonly STAT_FLUSH_INTERVAL_MS = 60_000;
+  /** Upper bound for the best-effort usage-stat flush on shutdown — teardown must not stall on a wedged DB. */
+  private static readonly SHUTDOWN_FLUSH_TIMEOUT_MS = 5_000;
   /** keyId -> usage increments observed but not yet persisted (flushed on the next windowed write). */
   private readonly pendingUsage = new Map<string, number>();
+
+  /**
+   * Serializes every last-usable-admin check with the mutation it guards, in ONE critical section.
+   * The check is check-then-act across awaits: without serialization, two concurrent requests that
+   * demote/delete/revoke the last two admins both pass the check before either writes — leaving zero
+   * usable admins, a total management lockout (the boot seed only fires on an EMPTY table, not on
+   * zero admins). The guarded invariant is global ("count of OTHER usable admins"), so the lock key
+   * must be a single global key too: keying per target key id would serialize nothing — the racing
+   * requests target DIFFERENT keys. An in-process mutex is sufficient under the single-process
+   * deployment contract.
+   */
+  private readonly adminCapabilityLock = new KeyedAsyncLock();
+  private static readonly ADMIN_CAPABILITY_LOCK_KEY = 'admin-capability';
 
   constructor(
     @InjectRepository(ApiKey, 'main')
@@ -79,17 +102,9 @@ export class AuthService implements OnModuleInit {
         this.logger.warn('Could not save API key file', { error: String(err) });
       }
     } else {
-      // Read saved API key from file if exists
-      if (existsSync(API_KEY_FILE)) {
-        try {
-          displayKey = readFileSync(API_KEY_FILE, 'utf-8').trim();
-        } catch (error) {
-          this.logger.warn(`Failed to read API key file: ${API_KEY_FILE}`, { error: String(error) });
-          displayKey = '(check dashboard for keys)';
-        }
-      } else {
-        displayKey = '(check dashboard for keys)';
-      }
+      // Read the saved bootstrap key from the file — but only while it still resolves to a LIVE
+      // key; a revoked/rotated/deleted key must not be advertised in the banner.
+      displayKey = (await this.readLiveBootstrapKey()) ?? '(check dashboard for keys)';
     }
 
     // Always show the welcome banner on startup
@@ -114,6 +129,97 @@ export class AuthService implements OnModuleInit {
     this.logger.log('');
     this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     this.logger.log('');
+  }
+
+  /**
+   * Best-effort flush of the coalesced usage-stat counters on teardown. Nest runs onModuleDestroy
+   * before the TypeORM connection closes (the DataSource is destroyed in onApplicationShutdown, the
+   * last lifecycle hook), so the DB is still writable here. Bounded so a wedged DB cannot stall
+   * shutdown past the grace window; whatever is still unflushed after the bound is dropped — the
+   * counters are advisory statistics, authentication never depends on them.
+   */
+  async onModuleDestroy(): Promise<void> {
+    if (this.pendingUsage.size === 0) return;
+    this.logger.log(`Flushing usage stats for ${this.pendingUsage.size} API key(s) before shutdown`);
+    const timeout = new Promise<'timeout'>(resolve =>
+      setTimeout(() => resolve('timeout'), AuthService.SHUTDOWN_FLUSH_TIMEOUT_MS).unref(),
+    );
+    const result = await Promise.race([this.flushPendingUsage().then(() => 'done' as const), timeout]);
+    if (result === 'timeout') {
+      this.logger.warn('Usage-stat shutdown flush exceeded its time bound; remaining deltas dropped');
+    }
+  }
+
+  /** Persist every accumulated usage delta with an atomic increment; entries that fail stay pending. */
+  private async flushPendingUsage(): Promise<void> {
+    for (const [keyId, delta] of [...this.pendingUsage.entries()]) {
+      if (delta <= 0) {
+        this.pendingUsage.delete(keyId);
+        continue;
+      }
+      try {
+        // Atomic UPDATE ... SET usageCount = usageCount + delta — no read-modify-write race with a
+        // concurrent windowed save, unlike reloading the row and saving it back.
+        await this.apiKeyRepository.increment({ id: keyId }, 'usageCount', delta);
+        this.pendingUsage.delete(keyId);
+      } catch (error) {
+        this.logger.warn('Usage-stat flush failed for a key; delta kept pending', {
+          keyId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  /**
+   * Read the bootstrap key file for the startup banner — only while it still points at a LIVE key.
+   * The file is written once at first boot; when that key is later revoked, rotated, or deleted, the
+   * file (and the banner quoting it) would otherwise keep advertising a dead credential. A stale file
+   * is removed here too, so a backup restore that lost the key self-heals on the next boot.
+   * Returns null when the file is absent, unreadable, empty, or stale.
+   */
+  private async readLiveBootstrapKey(): Promise<string | null> {
+    if (!existsSync(API_KEY_FILE)) return null;
+    let rawKey: string;
+    try {
+      rawKey = readFileSync(API_KEY_FILE, 'utf-8').trim();
+    } catch (error) {
+      this.logger.warn(`Failed to read API key file: ${API_KEY_FILE}`, { error: String(error) });
+      return null;
+    }
+    if (!rawKey) return null;
+    const stored = await this.apiKeyRepository.findOne({ where: { keyHash: this.hashKey(rawKey) } });
+    const live = Boolean(stored && stored.isActive && (!stored.expiresAt || stored.expiresAt > new Date()));
+    if (live) return rawKey;
+    this.removeBootstrapKeyFile('it no longer resolves to an active key');
+    return null;
+  }
+
+  /**
+   * Remove the bootstrap key file when it still holds the key being revoked or deleted, so the next
+   * boot's banner cannot point the operator at a dead credential. The file is an operator
+   * convenience (banner + backup scripts); it is never read for seeding or authentication, so
+   * removing it cannot break first-boot seeding — seeding writes it only when no keys exist.
+   */
+  private removeBootstrapKeyFileIfMatching(apiKey: ApiKey): void {
+    try {
+      if (!existsSync(API_KEY_FILE)) return;
+      const fileKey = readFileSync(API_KEY_FILE, 'utf-8').trim();
+      if (!fileKey || this.hashKey(fileKey) !== apiKey.keyHash) return;
+      this.removeBootstrapKeyFile('its key was revoked or deleted');
+    } catch (error) {
+      this.logger.warn(`Failed to inspect API key file: ${API_KEY_FILE}`, { error: String(error) });
+    }
+  }
+
+  private removeBootstrapKeyFile(reason: string): void {
+    try {
+      unlinkSync(API_KEY_FILE);
+      this.logger.log(`Removed stale bootstrap API key file (${reason}): ${API_KEY_FILE}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; // already gone
+      this.logger.warn(`Failed to remove stale API key file: ${API_KEY_FILE}`, { error: String(error) });
+    }
   }
 
   private async seedApiKey(rawKey: string, name: string, role: ApiKeyRole): Promise<ApiKey> {
@@ -176,50 +282,69 @@ export class AuthService implements OnModuleInit {
     const removesOrSchedulesLastAdmin =
       (dto.role !== undefined && dto.role !== ApiKeyRole.ADMIN) ||
       (dto.expiresAt !== undefined && dto.expiresAt !== null);
-    if (removesOrSchedulesLastAdmin) {
-      await this.assertNotLastUsableAdmin(apiKey);
-    }
 
-    // Capture the authorization-relevant fields BEFORE applying the change. Only a change to role,
-    // allowedIps, allowedSessions, or expiry can widen or restrict what an already-connected WebSocket
-    // socket may see, so only those trigger eviction of live /events sockets — a benign rename must
-    // NOT disconnect clients. REST enforces the new state immediately; without eviction a live socket
-    // keeps streaming events for sessions/IPs the key just lost until it resubscribes or drops.
-    const before = {
-      role: apiKey.role,
-      allowedIps: apiKey.allowedIps,
-      allowedSessions: apiKey.allowedSessions,
-      expiresAt: apiKey.expiresAt,
+    const applyAndSave = async (): Promise<ApiKey> => {
+      if (removesOrSchedulesLastAdmin) {
+        await this.assertNotLastUsableAdmin(apiKey);
+      }
+
+      // Capture the authorization-relevant fields BEFORE applying the change. Only a change to role,
+      // allowedIps, allowedSessions, or expiry can widen or restrict what an already-connected WebSocket
+      // socket may see, so only those trigger eviction of live /events sockets — a benign rename must
+      // NOT disconnect clients. REST enforces the new state immediately; without eviction a live socket
+      // keeps streaming events for sessions/IPs the key just lost until it resubscribes or drops.
+      const before = {
+        role: apiKey.role,
+        allowedIps: apiKey.allowedIps,
+        allowedSessions: apiKey.allowedSessions,
+        expiresAt: apiKey.expiresAt,
+      };
+
+      if (dto.name) apiKey.name = dto.name;
+      if (dto.role) apiKey.role = dto.role;
+      if (dto.allowedIps !== undefined) apiKey.allowedIps = dto.allowedIps;
+      if (dto.allowedSessions !== undefined) apiKey.allowedSessions = dto.allowedSessions;
+      if (dto.expiresAt !== undefined) apiKey.expiresAt = dto.expiresAt ? new Date(dto.expiresAt) : null;
+
+      const saved = await this.apiKeyRepository.save(apiKey);
+
+      // Compare membership, not order: a pure reorder of allowedIps/allowedSessions is a no-op for the
+      // .includes()-based enforcement, so sort before stringify to avoid a spurious eviction on a reorder.
+      const ordered = (v: string[] | null) => (v ? [...v].sort() : v);
+      const authzChanged =
+        saved.role !== before.role ||
+        saved.expiresAt?.getTime() !== before.expiresAt?.getTime() ||
+        JSON.stringify(ordered(saved.allowedIps)) !== JSON.stringify(ordered(before.allowedIps)) ||
+        JSON.stringify(ordered(saved.allowedSessions)) !== JSON.stringify(ordered(before.allowedSessions));
+      if (authzChanged) {
+        this.evictActiveSockets(id, 'authorization_changed');
+      }
+      return saved;
     };
 
-    if (dto.name) apiKey.name = dto.name;
-    if (dto.role) apiKey.role = dto.role;
-    if (dto.allowedIps !== undefined) apiKey.allowedIps = dto.allowedIps;
-    if (dto.allowedSessions !== undefined) apiKey.allowedSessions = dto.allowedSessions;
-    if (dto.expiresAt !== undefined) apiKey.expiresAt = dto.expiresAt ? new Date(dto.expiresAt) : null;
-
-    const saved = await this.apiKeyRepository.save(apiKey);
-
-    // Compare membership, not order: a pure reorder of allowedIps/allowedSessions is a no-op for the
-    // .includes()-based enforcement, so sort before stringify to avoid a spurious eviction on a reorder.
-    const ordered = (v: string[] | null) => (v ? [...v].sort() : v);
-    const authzChanged =
-      saved.role !== before.role ||
-      saved.expiresAt?.getTime() !== before.expiresAt?.getTime() ||
-      JSON.stringify(ordered(saved.allowedIps)) !== JSON.stringify(ordered(before.allowedIps)) ||
-      JSON.stringify(ordered(saved.allowedSessions)) !== JSON.stringify(ordered(before.allowedSessions));
-    if (authzChanged) {
-      this.evictActiveSockets(id, 'authorization_changed');
-    }
-    return saved;
+    // Run check+write inside the shared critical section ONLY when this update can strip the last
+    // usable admin; every other update (rename, promotion, non-admin keys) stays lock-free.
+    return removesOrSchedulesLastAdmin && AuthService.isUsableAdmin(apiKey)
+      ? this.adminCapabilityLock.run(AuthService.ADMIN_CAPABILITY_LOCK_KEY, applyAndSave)
+      : applyAndSave();
   }
 
   async delete(id: string): Promise<void> {
     const apiKey = await this.findOne(id);
-    await this.assertNotLastUsableAdmin(apiKey);
-    // Drop any un-flushed usage accumulator so a deleted key leaves nothing behind in the Map.
-    this.pendingUsage.delete(id);
-    await this.apiKeyRepository.remove(apiKey);
+    const removeKey = async (): Promise<void> => {
+      await this.assertNotLastUsableAdmin(apiKey);
+      // Drop any un-flushed usage accumulator so a deleted key leaves nothing behind in the Map.
+      this.pendingUsage.delete(id);
+      await this.apiKeyRepository.remove(apiKey);
+      this.removeBootstrapKeyFileIfMatching(apiKey);
+    };
+    // A target that is not a usable admin can skip the lock: it is not counted as one, so removing
+    // it cannot strand the system — some other usable admin (or none at all) exists independently.
+    if (AuthService.isUsableAdmin(apiKey)) {
+      await this.adminCapabilityLock.run(AuthService.ADMIN_CAPABILITY_LOCK_KEY, removeKey);
+    } else {
+      await removeKey();
+    }
     this.evictActiveSockets(id, 'deleted');
     this.logger.log(`API key deleted: ${apiKey.name}`, {
       keyId: id,
@@ -229,23 +354,32 @@ export class AuthService implements OnModuleInit {
 
   async revoke(id: string): Promise<ApiKey> {
     const apiKey = await this.findOne(id);
-    await this.assertNotLastUsableAdmin(apiKey);
-    // A revoked key fails validation before its next flush, so its accumulator would orphan —
-    // drop it here.
-    this.pendingUsage.delete(id);
-    apiKey.isActive = false;
-    const saved = await this.apiKeyRepository.save(apiKey);
+    const revokeKey = async (): Promise<ApiKey> => {
+      await this.assertNotLastUsableAdmin(apiKey);
+      // A revoked key fails validation before its next flush, so its accumulator would orphan —
+      // drop it here.
+      this.pendingUsage.delete(id);
+      apiKey.isActive = false;
+      const saved = await this.apiKeyRepository.save(apiKey);
+      this.removeBootstrapKeyFileIfMatching(apiKey);
+      return saved;
+    };
+    const saved = AuthService.isUsableAdmin(apiKey)
+      ? await this.adminCapabilityLock.run(AuthService.ADMIN_CAPABILITY_LOCK_KEY, revokeKey)
+      : await revokeKey();
     // Kick any WebSocket connections already authenticated with this key: without this, a revoked
     // key keeps receiving events on already-subscribed sockets until they happen to disconnect.
     this.evictActiveSockets(id, 'revoked');
     return saved;
   }
 
+  private static isUsableAdmin(key: ApiKey, now = new Date()): boolean {
+    return key.role === ApiKeyRole.ADMIN && key.isActive && (!key.expiresAt || key.expiresAt > now);
+  }
+
   private async assertNotLastUsableAdmin(target: ApiKey): Promise<void> {
     const now = new Date();
-    const targetIsUsableAdmin =
-      target.role === ApiKeyRole.ADMIN && target.isActive && (!target.expiresAt || target.expiresAt > now);
-    if (!targetIsUsableAdmin) return;
+    if (!AuthService.isUsableAdmin(target, now)) return;
 
     const otherUsableAdmins = await this.apiKeyRepository.count({
       where: [
@@ -330,7 +464,19 @@ export class AuthService implements OnModuleInit {
       apiKey.lastUsedAt.getTime() - previousLastUsedAt.getTime() >= AuthService.STAT_FLUSH_INTERVAL_MS;
     if (due) {
       this.pendingUsage.delete(apiKey.id);
-      await this.apiKeyRepository.save(apiKey);
+      try {
+        await this.apiKeyRepository.save(apiKey);
+      } catch (error) {
+        // Lost-update safe: a failed windowed write must not drop the accumulated increments —
+        // merge them back (accumulate, never overwrite, in case a concurrent path re-added a
+        // delta) so the next windowed write or the shutdown flush persists them. Validation
+        // itself succeeded, so a stat-write failure must not fail the request.
+        this.pendingUsage.set(apiKey.id, (this.pendingUsage.get(apiKey.id) ?? 0) + pending);
+        this.logger.warn('Usage-stat write failed; delta kept pending for the next flush', {
+          keyId: apiKey.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     } else {
       this.pendingUsage.set(apiKey.id, pending);
     }

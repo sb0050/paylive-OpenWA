@@ -279,9 +279,11 @@ WWEBJS_WEB_VERSION=2.3000.1040641150-alpha
 ```
 
 Restart the container after changing it. Browse newer versions at
-[wppconnect-team/wa-version](https://github.com/wppconnect-team/wa-version) (the `html/` folder). Set
-`WWEBJS_WEB_VERSION=latest`, `auto`, or `off` (or leave it unset) to use whatsapp-web.js
-auto-version behavior.
+[wppconnect-team/wa-version](https://github.com/wppconnect-team/wa-version) (the `html/` folder). With
+`WWEBJS_WEB_VERSION` unset, `latest`, or `auto` (the default), OpenWA auto-resolves a settled build
+from that registry and pins its HTML — note this HTML is fetched from a third-party repository and
+executed inside the `web.whatsapp.com` origin without an integrity check. Set
+`WWEBJS_WEB_VERSION=off` to disable pinning and use the first-party build served by WhatsApp.
 
 ### Issue: QR generation times out on slow first boot (WSL2 / low-resource)
 
@@ -719,19 +721,19 @@ cache:
 **Solutions:**
 
 ```bash
-# Check for long-running queries
-sqlite3 ./data/openwa.db ".timeout 30000"
-
-# Increase timeout in configuration
-DATABASE_SQLITE_BUSY_TIMEOUT=30000
+# Check for long-running queries (default SQLite file; override with DATABASE_NAME)
+sqlite3 ./data/openwa.sqlite ".timeout 30000"
 
 # Check WAL mode
-sqlite3 ./data/openwa.db "PRAGMA journal_mode;"
-# Should return: wal
+sqlite3 ./data/openwa.sqlite "PRAGMA journal_mode;"
+# Default is: delete (rollback journal) — OpenWA does not force WAL
 
-# Enable WAL mode
-sqlite3 ./data/openwa.db "PRAGMA journal_mode=WAL;"
+# Optionally enable WAL mode to reduce writer/reader lock contention
+sqlite3 ./data/openwa.sqlite "PRAGMA journal_mode=WAL;"
 ```
+
+There is no `DATABASE_SQLITE_BUSY_TIMEOUT`-style env knob — busy handling comes from the
+`better-sqlite3` driver defaults. If locks persist under concurrent sessions, migrate to PostgreSQL.
 
 **When to Migrate to PostgreSQL:**
 

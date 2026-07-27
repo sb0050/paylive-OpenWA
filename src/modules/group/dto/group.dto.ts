@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsArray,
   ArrayNotEmpty,
+  ArrayMaxSize,
   IsString,
   IsNotEmpty,
   MaxLength,
@@ -12,40 +13,67 @@ import {
 } from 'class-validator';
 import { ToStrictBoolean, ToStrictNumber } from '../../../common/utils/strict-boolean';
 
+// Field caps shared with the agent-tool input schemas (src/core/agent-tools/tools/group.tools.ts)
+// so MCP and REST enforce the same limits on the equivalent operations.
+export const GROUP_NAME_MAX_LENGTH = 100;
+export const GROUP_DESCRIPTION_MAX_LENGTH = 1024;
+
+/**
+ * Max participants accepted in one group-create or participant-batch request. The engine works the
+ * list sequentially (one WhatsApp round-trip per participant, with an honest per-participant
+ * result), so an unbounded array turns a single HTTP call into minutes of serial engine work.
+ * 256 stays well inside WhatsApp's own group-size limit while keeping one request's work bounded;
+ * larger imports batch across requests.
+ */
+export const GROUP_PARTICIPANTS_MAX = 256;
+
 export class CreateGroupDto {
-  @ApiProperty({ description: 'Group subject/name', maxLength: 100 })
+  @ApiProperty({ description: 'Group subject/name', maxLength: GROUP_NAME_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
-  @MaxLength(100)
+  @MaxLength(GROUP_NAME_MAX_LENGTH)
   name: string;
 
-  @ApiProperty({ description: 'Participant WhatsApp IDs (e.g. 628123456789@c.us)', type: [String] })
+  @ApiProperty({
+    description: 'Participant WhatsApp IDs (e.g. 628123456789@c.us)',
+    type: [String],
+    maxItems: GROUP_PARTICIPANTS_MAX,
+  })
   @IsArray()
   @ArrayNotEmpty()
+  @ArrayMaxSize(GROUP_PARTICIPANTS_MAX)
   @IsString({ each: true })
   participants: string[];
 }
 
 export class ParticipantsDto {
-  @ApiProperty({ description: 'Participant WhatsApp IDs (e.g. 628123456789@c.us)', type: [String] })
+  @ApiProperty({
+    description: 'Participant WhatsApp IDs (e.g. 628123456789@c.us)',
+    type: [String],
+    maxItems: GROUP_PARTICIPANTS_MAX,
+  })
   @IsArray()
   @ArrayNotEmpty()
+  @ArrayMaxSize(GROUP_PARTICIPANTS_MAX)
   @IsString({ each: true })
   participants: string[];
 }
 
 export class GroupSubjectDto {
-  @ApiProperty({ description: 'New group subject/name', maxLength: 100 })
+  @ApiProperty({ description: 'New group subject/name', maxLength: GROUP_NAME_MAX_LENGTH })
   @IsString()
   @IsNotEmpty()
-  @MaxLength(100)
+  @MaxLength(GROUP_NAME_MAX_LENGTH)
   subject: string;
 }
 
 export class GroupDescriptionDto {
-  @ApiProperty({ description: 'New group description (may be empty to clear it)', maxLength: 1024 })
+  @ApiProperty({
+    description: 'New group description (may be empty to clear it)',
+    maxLength: GROUP_DESCRIPTION_MAX_LENGTH,
+  })
   @IsString()
-  @MaxLength(1024)
+  @MaxLength(GROUP_DESCRIPTION_MAX_LENGTH)
   description: string;
 }
 

@@ -14,18 +14,21 @@ import { TemplateService } from '../template/template.service';
 import { renderTemplate } from '../../common/utils/template-render';
 import { createLogger } from '../../common/services/logger.service';
 import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
-import { userPart } from '../../engine/identity/wa-id';
+import { parseWaId } from '../../engine/identity/wa-id';
 import { resolveFeatureFlags } from '../../config/feature-flags';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
 
 export interface GetMessagesOptions {
   chatId?: string;
-  /** Filter by sender. A phone matches stored `@c.us`/`@s.whatsapp.net` ids AND any lid resolving to it. */
+  /** Filter by sender. A phone matches stored `@c.us`/`@s.whatsapp.net` ids AND any lid resolving to it. Group messages match on `author` (the real sender) as well as `from` (which holds the group JID). */
   from?: string;
   limit?: number;
   offset?: number;
 }
+
+/** Default cap on a rendered template's final text; overridable via TEMPLATE_RENDER_MAX_CHARS. */
+export const DEFAULT_TEMPLATE_RENDER_MAX_CHARS = 64 * 1024;
 
 /**
  * Outbound sends are executed directly against the WhatsApp engine, not via a BullMQ queue.
@@ -141,6 +144,10 @@ export class MessageService {
    * existing {@link sendText} path so plugin hooks, persistence, and status
    * tracking are reused. Throws NotFoundException when the template cannot be
    * resolved by id or name.
+   *
+   * The FINAL rendered text is capped at template.renderMaxChars (default 64 KiB): caller-supplied
+   * variables can inflate a small template unboundedly, so an over-cap render is rejected with a
+   * 400 naming the limit rather than truncated silently or pushed to the engine/DB as-is.
    */
   async sendTemplate(sessionId: string, dto: SendTemplateMessageDto): Promise<MessageResponseDto> {
     const template = await this.templateService.resolve(sessionId, {
@@ -153,6 +160,15 @@ export class MessageService {
       .filter((segment): segment is string => segment != null && segment.length > 0)
       .map(segment => renderTemplate(segment, vars));
     const text = segments.join('\n\n');
+
+    const maxChars =
+      this.configService?.get<number>('template.renderMaxChars', DEFAULT_TEMPLATE_RENDER_MAX_CHARS) ??
+      DEFAULT_TEMPLATE_RENDER_MAX_CHARS;
+    if (text.length > maxChars) {
+      throw new BadRequestException(
+        `Rendered template is ${text.length} characters, over the ${maxChars}-character limit`,
+      );
+    }
 
     return this.sendText(sessionId, { chatId: dto.chatId, text });
   }
@@ -296,7 +312,17 @@ export class MessageService {
       // Resolve the filter through the lid->phone table so a phone matches not just the stored
       // `<phone>@c.us` id but also any lid that resolves to the same person - turning the prior
       // silent miss (a lid-stored author vs a phone filter) into a hit.
-      query.andWhere('message.from IN (:...froms)', { froms: this.resolveJidCandidates(from) });
+      // A group message stores the real sender in `author` (`from` holds the group JID), so match
+      // BOTH columns against the same candidate set or the filter skips every group message the
+      // person wrote. Query plan: neither `from` nor `author` is indexed - the predicate applies
+      // within the (sessionId, createdAt)-narrowed scan exactly as the from-only filter did, so the
+      // OR costs nothing the old plan didn't already pay. No new index: per-session narrowing
+      // dominates selectivity and a single btree cannot serve an OR across two columns anyway.
+      const froms = this.resolveJidCandidates(from);
+      query.andWhere('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
+        froms,
+        authorFroms: froms,
+      });
     }
 
     const [messages, total] = await query.getManyAndCount();
@@ -304,12 +330,32 @@ export class MessageService {
   }
 
   /**
-   * Expand a JID filter into every stored id that refers to the same chat/person: the literal input (so
-   * an exact group/lid filter still matches), the user-part in both user dialects (`@c.us` /
+   * Expand a user JID filter into every stored id that refers to the same person: the literal input
+   * (so an exact lid filter still matches), the user-part in both user dialects (`@c.us` /
    * `@s.whatsapp.net`), and every lid the resolution table maps to that phone.
+   *
+   * Scoped by chat kind. For a non-user kind (group/status/newsletter/broadcast) the stored id can
+   * only ever be the literal JID, so no candidates are generated: expanding a group or channel id's
+   * digits into the user dialects (or probing the lid table with them) could mis-resolve the filter
+   * onto an unrelated entity whose phone digits happen to match — fail closed on the literal id.
+   * A `@lid` input forward-resolves to its phone instead of minting `<lid-digits>@c.us` (the lid's
+   * digits are NOT a phone), so rows stored under the resolved form still match a raw-lid filter.
    */
   private resolveJidCandidates(value: string): string[] {
-    const phone = userPart(value);
+    const parsed = parseWaId(value);
+    if (parsed.kind !== 'user' && parsed.kind !== 'lid' && parsed.kind !== 'unknown') {
+      return [value];
+    }
+    if (parsed.kind === 'lid') {
+      const candidates = new Set<string>([value]);
+      const resolved = this.lidMappingStore.getCached(parsed.userPart);
+      if (resolved) {
+        candidates.add(`${resolved}@c.us`);
+        candidates.add(`${resolved}@s.whatsapp.net`);
+      }
+      return [...candidates];
+    }
+    const phone = parsed.userPart;
     const candidates = new Set<string>([value, `${phone}@c.us`, `${phone}@s.whatsapp.net`]);
     for (const lid of this.lidMappingStore.lidsForPhone(phone)) {
       candidates.add(`${lid}@lid`);
@@ -536,12 +582,20 @@ export class MessageService {
       metadata: data.metadata,
     });
     const saved = await this.messageRepository.save(message);
-    // Fire-and-forget: a plugin handler must never break the send path. The built-in FTS search provider
-    // is DB-synced and does NOT consume this; it exists for plugin providers (Spec 2) + general use.
-    void this.hookManager
-      .execute('message:persisted', { sessionId, message: saved }, { sessionId, source: 'MessageService' })
-      .catch(() => undefined);
+    this.emitPersisted(sessionId, saved);
     return saved;
+  }
+
+  // Fire-and-forget: a plugin handler must never break the send path. The built-in FTS search provider
+  // is DB-synced and does NOT consume this; it exists for plugin providers (Spec 2) + general use.
+  // Emitted for EVERY persisted state of an outbound row — the initial PENDING write AND each later
+  // transition (SENT / FAILED / merge) — so a provider's copy never stays stuck at PENDING (#906).
+  // The payload is a shallow snapshot: the same entity instance is mutated as the send progresses
+  // (PENDING → SENT/FAILED), and fire-and-forget execution must still see the state at emission time.
+  private emitPersisted(sessionId: string, message: Message): void {
+    void this.hookManager
+      .execute('message:persisted', { sessionId, message: { ...message } }, { sessionId, source: 'MessageService' })
+      .catch(() => undefined);
   }
 
   /**
@@ -556,6 +610,8 @@ export class MessageService {
     }
     message.status = MessageStatus.FAILED;
     await this.messageRepository.save(message);
+    // Reconcile the earlier PENDING emission (#906): a provider must see the terminal FAILED state.
+    this.emitPersisted(message.sessionId, message);
   }
 
   /**
@@ -573,6 +629,8 @@ export class MessageService {
     message.timestamp = result.timestamp;
     try {
       await this.messageRepository.save(message);
+      // Reconcile the earlier PENDING emission with the finalized row (#906).
+      this.emitPersisted(message.sessionId, message);
     } catch (persistError) {
       if (result.id && isUniqueConstraintError(persistError)) {
         // The engine's own-send echo (onMessageCreate) won the race and already persisted a row with
@@ -598,6 +656,19 @@ export class MessageService {
             }),
           );
         await this.messageRepository.delete({ id: message.id }).catch(() => undefined);
+        // Reconcile provider indexes (#906): upsert the surviving echo row (now carrying our SENT
+        // state + media) and drop the ghost PENDING document this redundant row produced earlier.
+        const surviving = await this.messageRepository
+          .findOne({ where: { sessionId: message.sessionId, waMessageId: result.id } })
+          .catch(() => null);
+        if (surviving) this.emitPersisted(message.sessionId, surviving);
+        void this.hookManager
+          .execute(
+            'message:deleted',
+            { sessionId: message.sessionId, message: { ...message } },
+            { sessionId: message.sessionId, source: 'MessageService' },
+          )
+          .catch(() => undefined);
       } else {
         this.logger.warn(`Persisting SENT state failed after a successful send (id=${result.id})`, {
           error: persistError instanceof Error ? persistError.message : String(persistError),
@@ -634,12 +705,25 @@ export class MessageService {
    * engine to fetch an unbounded number of messages. When `deep` is true the ceiling is raised to 2000
    * (for reaching weeks/months back on whatsapp-web.js, which can load earlier messages on demand) and
    * media is forced off — downloading base64 for up to 2000 messages would be an enormous, slow payload.
+   *
+   * An optional `signal` (HTTP client disconnect) is threaded to the engine, which checks it between
+   * media downloads. Callers without cancellation keep the exact three-argument engine call shape.
    */
-  async getChatHistory(sessionId: string, chatId: string, limit = 50, includeMedia = false, deep = false) {
+  async getChatHistory(
+    sessionId: string,
+    chatId: string,
+    limit = 50,
+    includeMedia = false,
+    deep = false,
+    signal?: AbortSignal,
+  ) {
     const engine = this.getEngine(sessionId);
     const ceiling = deep ? MessageService.MAX_DEEP_CHAT_HISTORY_LIMIT : MessageService.MAX_CHAT_HISTORY_LIMIT;
     const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(Math.trunc(limit), 1), ceiling) : 50;
-    return engine.getChatHistory(chatId, safeLimit, deep ? false : includeMedia);
+    const media = deep ? false : includeMedia;
+    return signal
+      ? engine.getChatHistory(chatId, safeLimit, media, undefined, signal)
+      : engine.getChatHistory(chatId, safeLimit, media);
   }
 
   // ========== Delete Message ==========

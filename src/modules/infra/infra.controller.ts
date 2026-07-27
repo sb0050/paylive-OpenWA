@@ -5,14 +5,15 @@ import {
   Post,
   Body,
   BadRequestException,
+  ConflictException,
   HttpException,
   HttpCode,
   HttpStatus,
+  OnApplicationBootstrap,
   Optional,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBody, ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
-import { IsArray, IsBoolean, IsIn, IsNumber, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { ApiTags, ApiOperation, ApiResponse, ApiBody, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsArray, IsOptional, IsString } from 'class-validator';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '../queue/queue-names';
@@ -33,7 +34,11 @@ import { createLogger } from '../../common/services/logger.service';
 import { isMissingTableError } from '../../common/utils/db-errors';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
+import { SessionService } from '../session/session.service';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { ImportStorageDto } from './dto/import-storage.dto';
+import { SaveConfigDto } from './dto/save-config.dto';
+import { assertNoDefaultSecretsInProduction } from '../../config/bootstrap-security';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
@@ -62,190 +67,10 @@ interface InfraStatus {
   };
 }
 
-class DatabaseConfigDto {
-  @ApiProperty({ enum: ['sqlite', 'postgres'] })
-  @IsIn(['sqlite', 'postgres'])
-  type!: 'sqlite' | 'postgres';
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  builtIn?: boolean;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  host?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  port?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  username?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  password?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  database?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  schema?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsNumber()
-  poolSize?: number;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  sslEnabled?: boolean;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  sslRejectUnauthorized?: boolean;
-}
-
-class RedisConfigDto {
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  enabled?: boolean;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  builtIn?: boolean;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  host?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  port?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  password?: string;
-}
-
-class QueueConfigDto {
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  enabled?: boolean;
-}
-
-class StorageConfigDto {
-  @ApiProperty({ enum: ['local', 's3'] })
-  @IsIn(['local', 's3'])
-  type!: 'local' | 's3';
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  builtIn?: boolean;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  localPath?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  s3Bucket?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  s3Region?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  s3AccessKey?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  s3SecretKey?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  s3Endpoint?: string;
-}
-
-class EngineConfigDto {
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  type?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  headless?: boolean;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  sessionDataPath?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  browserArgs?: string;
-}
-
-class SaveConfigDto {
-  @ApiPropertyOptional({ type: () => DatabaseConfigDto })
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => DatabaseConfigDto)
-  database?: DatabaseConfigDto;
-
-  @ApiPropertyOptional({ type: () => RedisConfigDto })
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => RedisConfigDto)
-  redis?: RedisConfigDto;
-
-  @ApiPropertyOptional({ type: () => QueueConfigDto })
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => QueueConfigDto)
-  queue?: QueueConfigDto;
-
-  @ApiPropertyOptional({ type: () => StorageConfigDto })
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => StorageConfigDto)
-  storage?: StorageConfigDto;
-
-  @ApiPropertyOptional({ type: () => EngineConfigDto })
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => EngineConfigDto)
-  engine?: EngineConfigDto;
-}
+// The PUT /infra/config body DTOs live in ./dto/save-config.dto.ts: as *.dto.ts classes they are
+// covered by the input-coercion drift gate (src/common/utils/dto-strict-coercion.spec.ts), which
+// controller-local classes escape, and their boolean/numeric fields carry the @ToStrictBoolean /
+// @ToStrictNumber transforms that keep a form-encoded 'false' from being coerced to `true`.
 
 class RestartDto {
   @ApiPropertyOptional({ type: [String] })
@@ -302,6 +127,8 @@ interface MessageRow {
   waMessageId: string | null;
   chatId: string;
   chatName: string | null;
+  /** Group participant JID (nullable; added to messages after chatName — keep the import list in sync). */
+  author: string | null;
   from: string;
   to: string;
   body: string | null;
@@ -311,6 +138,12 @@ interface MessageRow {
   metadata: string | Record<string, unknown> | null;
   status: string;
   createdAt: string;
+  /**
+   * Postgres-only STORED generated tsvector (FTS). Present in `SELECT *` rows read from a Postgres
+   * source (and in backups made before it was stripped) but never a real payload column: export drops
+   * it, and the import's explicit column list ignores it. Declared so both directions type-check.
+   */
+  body_ts?: unknown;
 }
 
 interface MessageBatchRow {
@@ -392,7 +225,9 @@ interface IngressEventRow {
   pluginId: string;
   providerDeliveryId: string;
   route: string;
-  payload: string | Record<string, unknown>;
+  // Retired to NULL once the dispatch outcome is recorded; only 'pending' rows still carry one.
+  payload: string | Record<string, unknown> | null;
+  payloadHash?: string | null;
   sessionId: string | null;
   createdAt: string;
 }
@@ -425,6 +260,28 @@ interface IntegrationDeliveryFailureRow {
   createdAt: string;
 }
 
+// status_updates has no FK to sessions (plain columns), so the import's `DELETE FROM sessions` never
+// clears it — it must be exported + re-inserted explicitly like lid_mappings. postedAt/expiresAt are
+// bigint epoch-ms: raw queries bypass the entity transformer, so Postgres returns them as strings.
+interface StatusUpdateRow {
+  id: string;
+  sessionId: string;
+  contactJid: string;
+  contactName: string | null;
+  contactPushName: string | null;
+  waStatusId: string;
+  type: string;
+  caption: string | null;
+  mediaPath: string | null;
+  mediaMimetype: string | null;
+  mediaOmitted: boolean | number;
+  omitReason: string | null;
+  backgroundColor: string | null;
+  font: number | null;
+  postedAt: number | string;
+  expiresAt: number | string;
+}
+
 interface MigrationTables {
   sessions: SessionRow[];
   webhooks: WebhookRow[];
@@ -438,6 +295,7 @@ interface MigrationTables {
   ingressEvents: IngressEventRow[];
   webhookDeliveryFailures: WebhookDeliveryFailureRow[];
   integrationDeliveryFailures: IntegrationDeliveryFailureRow[];
+  statusUpdates: StatusUpdateRow[];
 }
 
 // Saved infrastructure config returned to the dashboard form for hydration. Secret
@@ -472,7 +330,7 @@ interface SavedConfigResponse {
 
 @ApiTags('infrastructure')
 @Controller('infra')
-export class InfraController {
+export class InfraController implements OnApplicationBootstrap {
   private readonly logger = createLogger('InfraController');
 
   constructor(
@@ -495,6 +353,13 @@ export class InfraController {
     // call site then makes emission a no-op there instead of forcing every test to wire a mock.
     @Optional()
     private readonly auditService?: AuditService,
+    // Post-import runtime reconciliation (see importData). Same trailing-@Optional convention as
+    // auditService: provided by the app (InfraModule imports SessionModule; EngineModule is @Global),
+    // omitted by direct-construction unit tests, and every use is `?.`-guarded.
+    @Optional()
+    private readonly sessionService?: SessionService,
+    @Optional()
+    private readonly lidMappingStore?: LidMappingStoreService,
   ) {}
 
   /** Bound the DB liveness probe so a hung connection can't stall the status read. */
@@ -521,6 +386,62 @@ export class InfraController {
       return false;
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  }
+
+  // Matches exactly the filename exportStorage writes: storage-export-<Date.now()>-<randomUUID()>.tar.gz.
+  // The captured group is the creation epoch-ms, so the sweep reads the age from the name — anything
+  // not in this exact shape (an operator's import candidate, any other file) is never touched.
+  private static readonly EXPORT_ARCHIVE_PATTERN =
+    /^storage-export-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tar\.gz$/;
+
+  /**
+   * Boot sweep for orphaned storage-export archives. exportStorage deletes each archive on a TTL
+   * timer, but that timer dies with the process — an archive whose process restarted or crashed
+   * before the timer fired would accumulate on the data volume forever. At bootstrap, delete the
+   * archives WE created whose embedded creation timestamp is older than
+   * STORAGE_EXPORT_SWEEP_MAX_AGE_MS (default 24h; kept generous so the documented
+   * export→restart→import migration flow still finds its file). Young archives and any
+   * non-export file in data/exports/ are left untouched.
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    await this.sweepStaleExportArchives();
+  }
+
+  /**
+   * Delete export archives older than STORAGE_EXPORT_SWEEP_MAX_AGE_MS from exportDir. Sweep
+   * failures are logged, never thrown: a leftover archive must not block boot.
+   */
+  async sweepStaleExportArchives(exportDir = path.join(process.cwd(), 'data', 'exports')): Promise<void> {
+    const maxAgeRaw = Number.parseInt(process.env.STORAGE_EXPORT_SWEEP_MAX_AGE_MS ?? '', 10);
+    const maxAgeMs = Number.isInteger(maxAgeRaw) && maxAgeRaw > 0 ? maxAgeRaw : 24 * 60 * 60 * 1000; // default 24h
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(exportDir, { withFileTypes: true });
+    } catch (error) {
+      // ENOENT just means no export has ever run on this deployment — nothing to sweep.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.logger.warn('Storage export sweep could not read the exports directory', {
+          exportDir,
+          error: String(error),
+        });
+      }
+      return;
+    }
+
+    const now = Date.now();
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const match = InfraController.EXPORT_ARCHIVE_PATTERN.exec(entry.name);
+      if (!match) continue;
+      if (now - Number(match[1]) < maxAgeMs) continue;
+      try {
+        await fs.promises.unlink(path.join(exportDir, entry.name));
+        this.logger.log('Swept stale storage export archive', { file: entry.name });
+      } catch (error) {
+        this.logger.warn('Failed to sweep stale storage export archive', { file: entry.name, error: String(error) });
+      }
     }
   }
 
@@ -735,15 +656,19 @@ export class InfraController {
 
       // Merge into the existing saved config rather than rebuilding from scratch, so a
       // partial payload (the dashboard only sends the sections it renders) cannot wipe
-      // keys it didn't include (#226).
+      // keys it didn't include (#226). The merge is per-section AND per-key: an absent
+      // section leaves that section's keys alone, and within a present section an absent
+      // field (`undefined`) leaves its stored key alone — only values actually submitted
+      // are written. `existing` below is therefore the base for every key the payload
+      // does not mention.
       const envPath = path.resolve(process.cwd(), 'data', '.env.generated');
       const existing: Record<string, string> = fs.existsSync(envPath)
         ? dotenv.parse(fs.readFileSync(envPath, 'utf8'))
         : {};
       const updates: Record<string, string> = {};
       // Keys to remove from the merged result — used to drop stale settings when the
-      // user switches mode (postgres->sqlite, s3->local) so a reload never sees the new
-      // mode alongside leftover keys from the old one.
+      // user switches mode (postgres->sqlite, s3->local, built-in->external) so a reload
+      // never sees the new mode alongside leftover keys from the old one.
       const staleKeys = new Set<string>();
 
       // Secret values are never echoed back to the form, so an empty submission means
@@ -755,9 +680,15 @@ export class InfraController {
       // Database. NOTE: these keys must match what src/config/configuration.ts reads.
       if (config.database) {
         updates.DATABASE_TYPE = config.database.type || 'sqlite';
-        updates.POSTGRES_BUILTIN = config.database.builtIn ? 'true' : 'false';
+        if (config.database.builtIn !== undefined) {
+          updates.POSTGRES_BUILTIN = config.database.builtIn ? 'true' : 'false';
+        }
+        // The effective mode: an explicit builtIn wins; when it is absent the saved mode
+        // is inherited so a partial payload stays in the current mode instead of silently
+        // flipping to external.
+        const dbBuiltIn = config.database.builtIn ?? existing.POSTGRES_BUILTIN === 'true';
         if (config.database.type === 'postgres') {
-          if (config.database.builtIn) {
+          if (dbBuiltIn) {
             // Built-in PostgreSQL - use container name as host
             updates.DATABASE_HOST = 'postgres';
             updates.DATABASE_PORT = '5432';
@@ -770,24 +701,40 @@ export class InfraController {
             updates.POSTGRES_SCHEMA = 'public';
             profiles.push('postgres');
           } else {
-            // External PostgreSQL
-            updates.DATABASE_HOST = config.database.host || 'localhost';
-            updates.DATABASE_PORT = config.database.port || '5432';
-            updates.DATABASE_USERNAME = config.database.username || 'postgres';
+            // External PostgreSQL. Flipping built-in -> external must not carry the bundled
+            // 'openwa' password into the external config: the production boot guard rejects
+            // it, so the next boot would crash-loop. A password in the same payload wins.
+            if (
+              config.database.builtIn === false &&
+              existing.POSTGRES_BUILTIN === 'true' &&
+              !config.database.password
+            ) {
+              staleKeys.add('DATABASE_PASSWORD');
+            }
+            if (config.database.host !== undefined) updates.DATABASE_HOST = config.database.host || 'localhost';
+            if (config.database.port !== undefined) updates.DATABASE_PORT = config.database.port || '5432';
+            if (config.database.username !== undefined)
+              updates.DATABASE_USERNAME = config.database.username || 'postgres';
             setSecret('DATABASE_PASSWORD', config.database.password);
-            updates.DATABASE_NAME = config.database.database || 'openwa';
-            updates.POSTGRES_SCHEMA = config.database.schema || 'public';
+            if (config.database.database !== undefined) updates.DATABASE_NAME = config.database.database || 'openwa';
+            if (config.database.schema !== undefined) updates.POSTGRES_SCHEMA = config.database.schema || 'public';
           }
-          updates.DATABASE_POOL_SIZE = String(config.database.poolSize || 10);
-          updates.DATABASE_SSL = config.database.sslEnabled ? 'true' : 'false';
-          if (config.database.sslEnabled) {
-            // Default to certificate verification; only relax it when the operator opts out
-            // (managed Postgres with self-signed certs: Supabase, Heroku, Render, Railway).
-            updates.DATABASE_SSL_REJECT_UNAUTHORIZED =
-              config.database.sslRejectUnauthorized === false ? 'false' : 'true';
+          if (config.database.poolSize !== undefined) {
+            updates.DATABASE_POOL_SIZE = String(config.database.poolSize || 10);
+          }
+          if (config.database.sslEnabled !== undefined) {
+            updates.DATABASE_SSL = config.database.sslEnabled ? 'true' : 'false';
+            if (config.database.sslEnabled) {
+              // Default to certificate verification; only relax it when the operator opts out
+              // (managed Postgres with self-signed certs: Supabase, Heroku, Render, Railway).
+              updates.DATABASE_SSL_REJECT_UNAUTHORIZED =
+                config.database.sslRejectUnauthorized === false ? 'false' : 'true';
+            }
           }
         } else {
-          // Switching to sqlite: drop stale postgres connection keys.
+          // Switching to sqlite: drop stale postgres connection keys, and reset the built-in
+          // flag with them — there is no bundled Postgres backing a SQLite database.
+          updates.POSTGRES_BUILTIN = 'false';
           for (const k of [
             'DATABASE_HOST',
             'DATABASE_PORT',
@@ -804,24 +751,32 @@ export class InfraController {
         }
       }
 
-      // Redis / Queue
-      if (config.redis || config.queue) {
-        updates.REDIS_ENABLED = config.redis?.enabled ? 'true' : 'false';
-        updates.REDIS_BUILTIN = config.redis?.builtIn ? 'true' : 'false';
-        updates.QUEUE_ENABLED = config.queue?.enabled ? 'true' : 'false';
-        if (config.redis?.enabled) {
-          if (config.redis.builtIn) {
-            // Built-in Redis - use container name as host
-            updates.REDIS_HOST = 'redis';
-            updates.REDIS_PORT = '6379';
-            profiles.push('redis');
-          } else {
-            // External Redis
-            updates.REDIS_HOST = config.redis.host || 'localhost';
-            updates.REDIS_PORT = config.redis.port || '6379';
-            setSecret('REDIS_PASSWORD', config.redis.password);
-          }
+      // Redis and queue are independent sections: a payload carrying only one of them must
+      // not rewrite (or disable) the other's saved keys.
+      if (config.redis) {
+        if (config.redis.enabled !== undefined) updates.REDIS_ENABLED = config.redis.enabled ? 'true' : 'false';
+        if (config.redis.builtIn !== undefined) updates.REDIS_BUILTIN = config.redis.builtIn ? 'true' : 'false';
+        if (config.redis.builtIn === true) {
+          // Built-in Redis - use container name as host. The bundled container runs without
+          // auth, so a password saved by an earlier external setup is stale: leaving it
+          // would make the client AUTH against a passwordless server on the next boot.
+          updates.REDIS_HOST = 'redis';
+          updates.REDIS_PORT = '6379';
+          if (!config.redis.password) staleKeys.add('REDIS_PASSWORD');
+        } else {
+          // External Redis (explicit, or inherited when builtIn is absent)
+          if (config.redis.host !== undefined) updates.REDIS_HOST = config.redis.host || 'localhost';
+          if (config.redis.port !== undefined) updates.REDIS_PORT = config.redis.port || '6379';
         }
+        setSecret('REDIS_PASSWORD', config.redis.password);
+        const redisEnabled = config.redis.enabled ?? existing.REDIS_ENABLED === 'true';
+        const redisBuiltIn = config.redis.builtIn ?? existing.REDIS_BUILTIN === 'true';
+        if (redisEnabled && redisBuiltIn) {
+          profiles.push('redis');
+        }
+      }
+      if (config.queue) {
+        if (config.queue.enabled !== undefined) updates.QUEUE_ENABLED = config.queue.enabled ? 'true' : 'false';
       }
 
       // Storage. NOTE: STORAGE_LOCAL_PATH / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY are
@@ -829,16 +784,23 @@ export class InfraController {
       // silently ignored — #226).
       if (config.storage) {
         updates.STORAGE_TYPE = config.storage.type || 'local';
-        updates.MINIO_BUILTIN = config.storage.builtIn ? 'true' : 'false';
+        if (config.storage.builtIn !== undefined) {
+          updates.MINIO_BUILTIN = config.storage.builtIn ? 'true' : 'false';
+        }
         if (config.storage.type === 'local') {
-          updates.STORAGE_LOCAL_PATH = config.storage.localPath || './data/media';
+          // Switching to local: drop stale S3 keys, and reset the built-in flag with them —
+          // there is no bundled MinIO backing a local storage path.
+          updates.MINIO_BUILTIN = 'false';
+          if (config.storage.localPath !== undefined) {
+            updates.STORAGE_LOCAL_PATH = config.storage.localPath || './data/media';
+          }
           // Switching to local: drop stale S3 keys.
           for (const k of ['S3_ENDPOINT', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'S3_BUCKET', 'S3_REGION']) {
             staleKeys.add(k);
           }
         } else if (config.storage.type === 's3') {
           staleKeys.add('STORAGE_LOCAL_PATH');
-          if (config.storage.builtIn) {
+          if (config.storage.builtIn === true) {
             // Built-in MinIO - use container name as endpoint
             updates.S3_ENDPOINT = 'http://minio:9000';
             updates.S3_ACCESS_KEY_ID = 'minioadmin';
@@ -847,13 +809,30 @@ export class InfraController {
             updates.S3_REGION = 'us-east-1';
             profiles.push('minio');
           } else {
-            // External S3/MinIO
-            updates.S3_BUCKET = config.storage.s3Bucket || '';
-            updates.S3_REGION = config.storage.s3Region || 'ap-southeast-1';
+            // External S3/MinIO. Flipping built-in -> external must not carry the bundled
+            // 'minioadmin' credentials or the internal endpoint into the external config:
+            // the production boot guard rejects those credentials (crash-loop), and a stale
+            // MinIO endpoint would send AWS-bound traffic to the wrong host. Values in the
+            // same payload win.
+            if (config.storage.builtIn === false && existing.MINIO_BUILTIN === 'true') {
+              if (!config.storage.s3AccessKey) staleKeys.add('S3_ACCESS_KEY_ID');
+              if (!config.storage.s3SecretKey) staleKeys.add('S3_SECRET_ACCESS_KEY');
+              if (!config.storage.s3Endpoint) staleKeys.add('S3_ENDPOINT');
+            }
+            if (config.storage.s3Bucket !== undefined) updates.S3_BUCKET = config.storage.s3Bucket;
+            if (config.storage.s3Region !== undefined) updates.S3_REGION = config.storage.s3Region || 'ap-southeast-1';
             setSecret('S3_ACCESS_KEY_ID', config.storage.s3AccessKey);
             setSecret('S3_SECRET_ACCESS_KEY', config.storage.s3SecretKey);
-            if (config.storage.s3Endpoint) {
-              updates.S3_ENDPOINT = config.storage.s3Endpoint;
+            if (config.storage.s3Endpoint !== undefined) {
+              // Unlike the credentials, the endpoint IS echoed back to the form, so an empty
+              // submission is a real "clear it" (moving to the default AWS endpoint), not
+              // "unchanged" — leaving a stale MinIO endpoint behind would silently keep
+              // pointing S3 traffic at the old host.
+              if (config.storage.s3Endpoint) {
+                updates.S3_ENDPOINT = config.storage.s3Endpoint;
+              } else {
+                staleKeys.add('S3_ENDPOINT');
+              }
             }
           }
         }
@@ -871,13 +850,19 @@ export class InfraController {
           }
           updates.ENGINE_TYPE = config.engine.type;
         }
-        updates.PUPPETEER_HEADLESS = config.engine.headless !== false ? 'true' : 'false';
-        updates.SESSION_DATA_PATH = config.engine.sessionDataPath || './data/sessions';
-        // Must match configuration.ts's PUPPETEER_ARGS default (4 flags). Once compose blank-forwards
-        // PUPPETEER_ARGS, this saved value wins at runtime — a 2-flag default here would silently drop
-        // --disable-dev-shm-usage (the Docker /dev/shm tab-crash guard) after any Infrastructure save.
-        updates.PUPPETEER_ARGS =
-          config.engine.browserArgs || '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu';
+        if (config.engine.headless !== undefined) {
+          updates.PUPPETEER_HEADLESS = config.engine.headless ? 'true' : 'false';
+        }
+        if (config.engine.sessionDataPath !== undefined) {
+          updates.SESSION_DATA_PATH = config.engine.sessionDataPath || './data/sessions';
+        }
+        if (config.engine.browserArgs !== undefined) {
+          // Must match configuration.ts's PUPPETEER_ARGS default (4 flags). Once compose blank-forwards
+          // PUPPETEER_ARGS, this saved value wins at runtime — a 2-flag default here would silently drop
+          // --disable-dev-shm-usage (the Docker /dev/shm tab-crash guard) after any Infrastructure save.
+          updates.PUPPETEER_ARGS =
+            config.engine.browserArgs || '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu';
+        }
       }
 
       // .env.generated is one KEY=value per line, loaded on the next boot. A value carrying a
@@ -891,9 +876,35 @@ export class InfraController {
 
       // Existing values are the base; this payload's values win (secrets handled above).
       const merged: Record<string, string> = { ...existing, ...updates };
-      // Drop keys made obsolete by a mode switch (postgres->sqlite, s3->local).
+      // Drop keys made obsolete by a mode switch (postgres->sqlite, s3->local, built-in->external).
       for (const k of staleKeys) {
         delete merged[k];
+      }
+
+      // Save-time production guard. The file is loaded on the NEXT boot, which may run with
+      // NODE_ENV=production regardless of this process's environment — so evaluate the merged
+      // result with the very same boot guard (as production) and refuse the save when that boot
+      // would refuse to start. This is what stops a built-in->external flip with no fresh
+      // credentials from persisting a config that crash-loops the next production boot.
+      try {
+        assertNoDefaultSecretsInProduction({
+          nodeEnv: 'production',
+          databaseType: merged.DATABASE_TYPE,
+          databasePassword: merged.DATABASE_PASSWORD,
+          postgresBuiltIn: merged.POSTGRES_BUILTIN,
+          databaseHost: merged.DATABASE_HOST,
+          storageType: merged.STORAGE_TYPE,
+          s3AccessKey: merged.S3_ACCESS_KEY_ID,
+          s3SecretKey: merged.S3_SECRET_ACCESS_KEY,
+          s3Endpoint: merged.S3_ENDPOINT,
+          minioBuiltIn: merged.MINIO_BUILTIN,
+          redisPassword: merged.REDIS_PASSWORD,
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new BadRequestException(
+          `Refusing to save a configuration that would be rejected at production boot. ${detail}`,
+        );
       }
       const body = Object.keys(merged)
         .sort()
@@ -963,7 +974,9 @@ export class InfraController {
     const profiles = body?.profiles || [];
     const profilesToRemove = body?.profilesToRemove || [];
     let orchestrationResult: object | undefined;
-    let removalResult: { removed: string[]; errors: string[] } | undefined;
+    // Teardown is stop-only (see DockerService.stopManagedService): containers are stopped and
+    // retained for re-enable, never deleted — the result below reports exactly that.
+    let removalResult: { stopped: string[]; errors: string[] } | undefined;
 
     this.logger.log('Restart requested', { profiles });
     this.logger.log('Profiles to remove', { profilesToRemove });
@@ -977,7 +990,7 @@ export class InfraController {
       // away from a built-in backend and then reloading the page before restarting can leave the old
       // container running until the next explicit change.)
       // Only ever tear down OpenWA-managed services. An arbitrary profile name (or the empty string)
-      // would otherwise reach removeService and, via container-name matching, could stop an unrelated
+      // would otherwise reach stopManagedService and, via container-name matching, could stop an unrelated
       // container — so constrain teardown to the managed allowlist and drop anything else.
       const requested = profilesToRemove.filter(p => !profiles.includes(p));
       const toRemove = requested.filter(p => MANAGED_DOCKER_PROFILES.includes(p));
@@ -986,24 +999,24 @@ export class InfraController {
         this.logger.warn('Ignoring non-managed profiles in profilesToRemove', { ignored });
       }
 
-      // First, remove containers for disabled services
+      // First, stop containers for disabled services (stop-only: retained, never deleted)
       if (toRemove.length > 0) {
-        this.logger.log('Removing disabled profiles...', { toRemove });
-        removalResult = { removed: [], errors: [] };
+        this.logger.log('Stopping disabled profiles (containers retained)...', { toRemove });
+        removalResult = { stopped: [], errors: [] };
 
         for (const profile of toRemove) {
           try {
-            const success = await this.dockerService.removeService(profile);
+            const success = await this.dockerService.stopManagedService(profile);
             if (success) {
-              removalResult.removed.push(profile);
+              removalResult.stopped.push(profile);
             } else {
-              removalResult.errors.push(`Failed to remove ${profile}`);
+              removalResult.errors.push(`Failed to stop ${profile}`);
             }
           } catch (err) {
-            removalResult.errors.push(`Error removing ${profile}: ${err}`);
+            removalResult.errors.push(`Error stopping ${profile}: ${err}`);
           }
         }
-        this.logger.log('Removal result', { removalResult });
+        this.logger.log('Teardown result', { removalResult });
       }
 
       // Then, start containers for enabled services
@@ -1093,89 +1106,55 @@ export class InfraController {
       ingressEvents: number;
       webhookDeliveryFailures: number;
       integrationDeliveryFailures: number;
+      statusUpdates: number;
     };
+    /** Optional tables that were skipped because they genuinely do not exist in this DB (older schema). */
+    skippedTables: string[];
   }> {
     // Get all entities from Data DB
     const sessions = await this.dataDataSource.query<SessionRow[]>('SELECT * FROM sessions');
     const webhooks = await this.dataDataSource.query<WebhookRow[]>('SELECT * FROM webhooks');
 
-    // These tables may not exist yet (older DB) or be empty.
-    let messages: MessageRow[] = [];
-    let messageBatches: MessageBatchRow[] = [];
-    let templates: TemplateRow[] = [];
-    let baileysStoredMessages: BaileysStoredMessageRow[] = [];
-    let lidMappings: LidMappingRow[] = [];
-    let pluginInstances: PluginInstanceRow[] = [];
-    let conversationMappings: ConversationMappingRow[] = [];
-    let ingressEvents: IngressEventRow[] = [];
-    let webhookDeliveryFailures: WebhookDeliveryFailureRow[] = [];
-    let integrationDeliveryFailures: IntegrationDeliveryFailureRow[] = [];
+    // The tables below may legitimately not exist yet (created by migrations an older DB has not run).
+    // Only a GENUINE missing-table error (isMissingTableError) may be tolerated — anything else (lock,
+    // I/O, timeout, aborted connection) must FAIL the export. The old blind `catch { debug-log }`
+    // pattern reported those as "table is empty", producing a 200 "complete" backup that was actually
+    // partial — which the import then treated as authoritative and DELETEd the missing tables' rows.
+    // A skipped table is surfaced in `skippedTables` (and logged as a warning) so an operator can tell
+    // "not migrated yet" apart from "exported empty".
+    const skippedTables: string[] = [];
+    const queryOptionalTable = async <T>(table: string): Promise<T[]> => {
+      try {
+        return await this.dataDataSource.query<T[]>(`SELECT * FROM ${table}`);
+      } catch (error) {
+        if (!isMissingTableError(error)) throw error;
+        skippedTables.push(table);
+        this.logger.warn('Optional table does not exist in this DB; exporting without it', { table });
+        return [];
+      }
+    };
 
-    try {
-      messages = await this.dataDataSource.query<MessageRow[]>('SELECT * FROM messages');
-    } catch (error) {
-      this.logger.debug('Messages table not available for export', { error: String(error) });
+    const messages = await queryOptionalTable<MessageRow>('messages');
+    // Postgres carries a STORED generated tsvector column `body_ts` (FTS) that `SELECT *` picks up.
+    // It is a server-maintained index artifact, not payload: strip it so backups stay dialect-neutral
+    // (and small). The import's explicit column list already ignores it in older archives.
+    for (const row of messages) {
+      delete row.body_ts;
     }
-
-    try {
-      messageBatches = await this.dataDataSource.query<MessageBatchRow[]>('SELECT * FROM message_batches');
-    } catch (error) {
-      this.logger.debug('Message batches table not available for export', { error: String(error) });
-    }
-
-    try {
-      templates = await this.dataDataSource.query<TemplateRow[]>('SELECT * FROM templates');
-    } catch (error) {
-      this.logger.debug('Templates table not available for export', { error: String(error) });
-    }
-
-    try {
-      baileysStoredMessages = await this.dataDataSource.query<BaileysStoredMessageRow[]>(
-        'SELECT * FROM baileys_stored_messages',
-      );
-    } catch (error) {
-      this.logger.debug('Baileys stored messages table not available for export', { error: String(error) });
-    }
-
-    try {
-      lidMappings = await this.dataDataSource.query<LidMappingRow[]>('SELECT * FROM lid_mappings');
-    } catch (error) {
-      this.logger.debug('Lid mappings table not available for export', { error: String(error) });
-    }
-
+    const messageBatches = await queryOptionalTable<MessageBatchRow>('message_batches');
+    const templates = await queryOptionalTable<TemplateRow>('templates');
+    const baileysStoredMessages = await queryOptionalTable<BaileysStoredMessageRow>('baileys_stored_messages');
+    const lidMappings = await queryOptionalTable<LidMappingRow>('lid_mappings');
     // Integration Fabric + both DLQs were added after the original migration set; tolerate a genuinely
     // absent table (older DB) like the tables above rather than 500-ing the whole export.
-    try {
-      pluginInstances = await this.dataDataSource.query<PluginInstanceRow[]>('SELECT * FROM plugin_instances');
-    } catch (error) {
-      this.logger.debug('plugin_instances table not available for export', { error: String(error) });
-    }
-    try {
-      conversationMappings = await this.dataDataSource.query<ConversationMappingRow[]>(
-        'SELECT * FROM conversation_mappings',
-      );
-    } catch (error) {
-      this.logger.debug('conversation_mappings table not available for export', { error: String(error) });
-    }
-    try {
-      ingressEvents = await this.dataDataSource.query<IngressEventRow[]>('SELECT * FROM ingress_events');
-    } catch (error) {
-      this.logger.debug('ingress_events table not available for export', { error: String(error) });
-    }
-    try {
-      webhookDeliveryFailures = await this.dataDataSource.query<WebhookDeliveryFailureRow[]>(
-        'SELECT * FROM webhook_delivery_failures',
-      );
-    } catch (error) {
-      this.logger.debug('webhook_delivery_failures table not available for export', { error: String(error) });
-    }
-    try {
-      integrationDeliveryFailures = await this.dataDataSource.query<IntegrationDeliveryFailureRow[]>(
-        'SELECT * FROM integration_delivery_failures',
-      );
-    } catch (error) {
-      this.logger.debug('integration_delivery_failures table not available for export', { error: String(error) });
-    }
+    const pluginInstances = await queryOptionalTable<PluginInstanceRow>('plugin_instances');
+    const conversationMappings = await queryOptionalTable<ConversationMappingRow>('conversation_mappings');
+    const ingressEvents = await queryOptionalTable<IngressEventRow>('ingress_events');
+    const webhookDeliveryFailures = await queryOptionalTable<WebhookDeliveryFailureRow>('webhook_delivery_failures');
+    const integrationDeliveryFailures = await queryOptionalTable<IntegrationDeliveryFailureRow>(
+      'integration_delivery_failures',
+    );
+    const statusUpdates = await queryOptionalTable<StatusUpdateRow>('status_updates');
 
     const counts = {
       sessions: sessions.length,
@@ -1190,6 +1169,7 @@ export class InfraController {
       ingressEvents: ingressEvents.length,
       webhookDeliveryFailures: webhookDeliveryFailures.length,
       integrationDeliveryFailures: integrationDeliveryFailures.length,
+      statusUpdates: statusUpdates.length,
     };
 
     // Audit the full-DB export: this payload carries webhook + plugin-instance secrets, so WHO pulled
@@ -1213,8 +1193,10 @@ export class InfraController {
         ingressEvents,
         webhookDeliveryFailures,
         integrationDeliveryFailures,
+        statusUpdates,
       },
       counts,
+      skippedTables,
     };
   }
 
@@ -1227,6 +1209,16 @@ export class InfraController {
     schema: {
       type: 'object',
       properties: {
+        force: {
+          type: 'boolean',
+          description:
+            'Allow the replace to proceed even while engines are running for sessions the backup does not contain (they keep running until restart; see restartRequired). Prefer stopOrphans, which closes that window inside this request instead.',
+        },
+        stopOrphans: {
+          type: 'boolean',
+          description:
+            'Stop the running engines for sessions the backup does not contain, inside this request and before the replace runs. Supersedes force for the orphan case: with stopOrphans the engines no longer need a process restart to reconcile, so restartRequired stays false on the success path.',
+        },
         tables: {
           type: 'object',
           properties: {
@@ -1234,16 +1226,31 @@ export class InfraController {
             webhooks: { type: 'array' },
             messages: { type: 'array' },
             messageBatches: { type: 'array' },
+            statusUpdates: { type: 'array' },
           },
         },
       },
     },
   })
   @ApiResponse({ status: 200, description: 'Data imported successfully' })
+  @ApiResponse({
+    status: 409,
+    description:
+      'Refused: live engines exist for sessions the backup would remove (retry with stopOrphans=true to stop them in-request, or force=true to proceed and restart after)',
+  })
   async importData(
     @Body()
     data: {
       tables: Partial<MigrationTables>;
+      force?: boolean;
+      /**
+       * Stop the running engines for sessions the backup does not contain, inside this request and
+       * before the replace runs (best-effort, time-bounded per engine). Supersedes force=true for the
+       * orphan case: with stopOrphans the engines no longer need a process restart to reconcile, so
+       * restartRequired stays false on the success path. Without it the pre-existing behavior holds —
+       * refuse with 409, or proceed with force=true and leave the engines running until restart.
+       */
+      stopOrphans?: boolean;
     },
   ): Promise<{
     imported: boolean;
@@ -1260,10 +1267,89 @@ export class InfraController {
       ingressEvents: number;
       webhookDeliveryFailures: number;
       integrationDeliveryFailures: number;
+      statusUpdates: number;
     };
     warnings: string[];
+    /**
+     * Non-fatal operator-facing messages (e.g. orphan-engine reconciliation details). Distinct from
+     * warnings: notices never cause a rollback, while warnings make the replace-rollback gate fire.
+     */
+    notices: string[];
+    /** True when live engines were left pointing at sessions this restore removed — restart to stop them. */
+    restartRequired: boolean;
+    /** Session ids with a running engine that the restored data no longer contains. */
+    orphanedEngines: string[];
+    /** Orphan engines stopped inside this request (only populated when stopOrphans=true was passed). */
+    stoppedOrphanEngines: string[];
+    /** Orphan engines whose teardown threw or timed out (Map reconciled regardless; investigate). */
+    failedOrphanEngines: string[];
   }> {
     const warnings: string[] = [];
+
+    // Runtime reconciliation, part 1 (pre-flight): the replace below DELETES every session not in the
+    // backup, but an engine started for such a session keeps running as an unstoppable zombie (the
+    // session service keys engines by session id, and every stop path goes through the now-missing DB
+    // row) whose inbound messages land in tables that were just replaced. Three operator-chosen paths:
+    //   - default: refuse with 409 listing the orphan ids;
+    //   - force=true: proceed and leave the engines running until process restart (restartRequired=true);
+    //   - stopOrphans=true: stop each orphan engine inside this request (best-effort, time-bounded,
+    //     isolated per engine) and then proceed — restartRequired stays false on the success path.
+    // stopOrphans is preferred over force for the orphan case: a force restore that silently leaves
+    // engines writing into the freshly replaced tables for an unbounded time is the corruption this
+    // gate exists to prevent, so the explicit-stop path closes that window instead of relying on the
+    // operator to restart promptly.
+    const importedSessionIds = new Set((data.tables.sessions ?? []).map(s => s.id));
+    const orphanedEngines = (this.sessionService?.getActiveSessionIds() ?? []).filter(
+      id => !importedSessionIds.has(id),
+    );
+
+    let stoppedOrphanEngines: string[] = [];
+    let failedOrphanEngines: string[] = [];
+    let restartRequired = false;
+
+    // notices collect non-fatal operator-facing messages (orphan-engine reconciliation details) that
+    // must NOT trip the warnings→rollback gate further down. warnings is reserved for per-row import
+    // failures that make the replace partial and therefore require a rollback.
+    const notices: string[] = [];
+
+    if (orphanedEngines.length > 0 && data.stopOrphans && this.sessionService) {
+      // Stop the orphans inside this request, BEFORE the transaction opens. destroyEngineSafely's
+      // per-engine 10s deadline bounds the worst case (a stuck Chromium cannot wedge the import); the
+      // engines are reconciled from the Map regardless of teardown outcome.
+      const result = await this.sessionService.stopOrphanEngines(orphanedEngines);
+      stoppedOrphanEngines = result.stopped;
+      failedOrphanEngines = result.failed;
+      if (failedOrphanEngines.length > 0) {
+        // Teardown failed for at least one orphan. The Map entry is removed regardless (see
+        // stopOrphanEngines), so the engine no longer holds a concurrency slot — but its underlying
+        // Chromium/socket may still be alive and writing into restored tables. Surface the ids and
+        // flag restartRequired so the operator does not read a clean response as "engines stopped".
+        restartRequired = true;
+        notices.push(
+          `Teardown failed for ${failedOrphanEngines.length} orphan engine(s): ${failedOrphanEngines.join(', ')} ` +
+            `(removed from the engine registry; a process restart guarantees cleanup).`,
+        );
+      }
+      // Engines still mid-initialization (no Map entry yet) are reported in notRunning: their start()
+      // self-aborts via the stop mark, but they are not counted as stopped here.
+      if (result.notRunning.length > 0) {
+        notices.push(
+          `${result.notRunning.length} orphan session(s) had no live engine yet (still initializing): ` +
+            `${result.notRunning.join(', ')} — their start() will self-abort.`,
+        );
+      }
+    } else if (orphanedEngines.length > 0 && !data.force) {
+      throw new ConflictException(
+        `Import would orphan ${orphanedEngines.length} running engine(s) for session(s) ` +
+          `${orphanedEngines.join(', ')} that the backup does not contain. Stop them first, retry with ` +
+          `stopOrphans=true (stops them inside this request), or retry with force=true ` +
+          `(a server restart is then required to stop the orphaned engines).`,
+      );
+    } else if (orphanedEngines.length > 0 && data.force) {
+      // Legacy escape hatch: proceed and leave the engines running until restart.
+      restartRequired = true;
+    }
+
     const queryRunner = this.dataDataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -1311,6 +1397,8 @@ export class InfraController {
       await clearTable('ingress_events');
       await clearTable('webhook_delivery_failures');
       await clearTable('integration_delivery_failures');
+      // status_updates has no FK to sessions; clear it explicitly so the replace is complete.
+      await clearTable('status_updates');
       await queryRunner.query('DELETE FROM sessions');
 
       // Import sessions first
@@ -1390,14 +1478,17 @@ export class InfraController {
         for (const msg of data.tables.messages) {
           try {
             await insert(
-              `INSERT INTO messages (id, "sessionId", "waMessageId", "chatId", "chatName", "from", "to", body, type, direction, "timestamp", metadata, status, "createdAt")
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+              `INSERT INTO messages (id, "sessionId", "waMessageId", "chatId", "chatName", author, "from", "to", body, type, direction, "timestamp", metadata, status, "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
               [
                 msg.id,
                 msg.sessionId,
                 msg.waMessageId ?? null,
                 msg.chatId,
                 msg.chatName ?? null,
+                // Rows exported before the author column existed simply restore to NULL (legacy
+                // behavior) instead of failing the whole import on an unknown key.
+                msg.author ?? null,
                 msg.from,
                 msg.to,
                 msg.body ?? null,
@@ -1667,6 +1758,40 @@ export class InfraController {
         }
       }
 
+      // Import status updates (24h-TTL status/story store; sessionId is non-FK provenance)
+      let statusUpdatesCount = 0;
+      if (data.tables.statusUpdates?.length) {
+        for (const su of data.tables.statusUpdates) {
+          try {
+            await insert(
+              `INSERT INTO status_updates (id, "sessionId", "contactJid", "contactName", "contactPushName", "waStatusId", type, caption, "mediaPath", "mediaMimetype", "mediaOmitted", "omitReason", "backgroundColor", font, "postedAt", "expiresAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+              [
+                su.id,
+                su.sessionId,
+                su.contactJid,
+                su.contactName ?? null,
+                su.contactPushName ?? null,
+                su.waStatusId,
+                su.type,
+                su.caption ?? null,
+                su.mediaPath ?? null,
+                su.mediaMimetype ?? null,
+                su.mediaOmitted ?? false,
+                su.omitReason ?? null,
+                su.backgroundColor ?? null,
+                su.font ?? null,
+                su.postedAt,
+                su.expiresAt,
+              ],
+            );
+            statusUpdatesCount++;
+          } catch (err) {
+            warnings.push(`Failed to import status update ${su.id}: ${err}`);
+          }
+        }
+      }
+
       const counts = {
         sessions: sessionsCount,
         webhooks: webhooksCount,
@@ -1680,6 +1805,7 @@ export class InfraController {
         ingressEvents: ingressEventsCount,
         webhookDeliveryFailures: webhookDeliveryFailuresCount,
         integrationDeliveryFailures: integrationDeliveryFailuresCount,
+        statusUpdates: statusUpdatesCount,
       };
 
       // "Replace all data" must be all-or-nothing: the import already DELETEd every row, so if any
@@ -1688,7 +1814,16 @@ export class InfraController {
       // message history could silently vanish on a SQLite->Postgres migration.
       if (warnings.length > 0) {
         await queryRunner.rollbackTransaction();
-        return { imported: false, counts, warnings };
+        return {
+          imported: false,
+          counts,
+          warnings,
+          notices,
+          restartRequired: false,
+          orphanedEngines: [],
+          stoppedOrphanEngines: [],
+          failedOrphanEngines: [],
+        };
       }
 
       // A wrong/empty/garbage backup file restores zero rows but the DELETE already ran — committing
@@ -1700,10 +1835,22 @@ export class InfraController {
           imported: false,
           counts,
           warnings: ['Backup contained no rows to restore; refused to replace existing data. Check the file.'],
+          notices,
+          restartRequired: false,
+          orphanedEngines: [],
+          stoppedOrphanEngines: [],
+          failedOrphanEngines: [],
         };
       }
 
       await queryRunner.commitTransaction();
+
+      // Runtime reconciliation, part 2 (post-commit): the in-memory lid->phone mirror was warmed from
+      // the OLD lid_mappings rows and is write-through only, so the just-restored table would never
+      // reach it — resolution would keep serving stale entries (and miss restored ones) until the next
+      // process start. Reload from the new DB contents. Best-effort: a miss falls back to engine
+      // re-resolution, so a reload failure degrades instead of failing the (already committed) import.
+      await this.lidMappingStore?.reload();
 
       // Audit the destructive replace-all restore, only on the committed-success path (the rollback /
       // refused-empty branches above return without emitting, since no data actually changed). Any
@@ -1711,7 +1858,18 @@ export class InfraController {
       // only the per-table counts.
       await this.auditService?.logInfo(AuditAction.INFRA_DATA_IMPORTED, { metadata: { counts } });
 
-      return { imported: true, counts, warnings };
+      // restartRequired was computed in the pre-flight: true only when orphans were left running
+      // (force=true legacy path) or when stopOrphans teardown failed for at least one engine.
+      return {
+        imported: true,
+        counts,
+        warnings,
+        notices,
+        restartRequired,
+        orphanedEngines,
+        stoppedOrphanEngines,
+        failedOrphanEngines,
+      };
     } catch (error) {
       await queryRunner.rollbackTransaction();
       throw error;
@@ -1768,6 +1926,13 @@ export class InfraController {
     await new Promise<void>((resolve, reject) => {
       writeStream.on('finish', resolve);
       writeStream.on('error', reject);
+      // pipe() does NOT forward source errors: an archiver/gzip failure surfaces as an 'error' event on
+      // the source stream, which without a listener crashes the process. Fail the request instead and
+      // tear down the sink so its fd isn't held open waiting for a 'finish' that never comes.
+      stream.on('error', (err: Error) => {
+        writeStream.destroy();
+        reject(err);
+      });
     });
 
     // Sweep the throwaway archive so repeated exports don't accumulate on the data volume.
@@ -1817,7 +1982,17 @@ export class InfraController {
     }
 
     const readStream = fs.createReadStream(resolved);
-    const count = await this.storageService.importFromStream(readStream);
+    // importFromStream rejects on archive/gzip/read failures (its streams carry error listeners, so a
+    // bad file fails the request instead of crashing the process on an unhandled 'error' event). The
+    // failures that reach here are almost always a problem with the caller-supplied file (not a gzip,
+    // not a tar, unreadable, over the resource caps), so surface them as a 400 with the real reason
+    // rather than an opaque 500.
+    let count: number;
+    try {
+      count = await this.storageService.importFromStream(readStream);
+    } catch (error) {
+      throw new BadRequestException(`Storage import failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const storageType = this.storageService.getCurrentStorageType();
 
     // Audit the bulk media-import (files written into the active storage backend).

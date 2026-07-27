@@ -28,7 +28,9 @@ class FakeSock extends EventEmitter {
   public groupFetchAllParticipating = jest.fn();
   public groupMetadata = jest.fn();
   public groupCreate = jest.fn();
-  public groupParticipantsUpdate = jest.fn().mockResolvedValue(undefined);
+  public groupParticipantsUpdate = jest
+    .fn()
+    .mockResolvedValue([{ status: '200', jid: '628111@s.whatsapp.net', content: {} }]);
   public groupLeave = jest.fn().mockResolvedValue(undefined);
   public groupUpdateSubject = jest.fn().mockResolvedValue(undefined);
   public groupUpdateDescription = jest.fn().mockResolvedValue(undefined);
@@ -111,6 +113,7 @@ import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
+import { BadRequestException } from '@nestjs/common';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 
 const fakeStore = {
@@ -658,6 +661,97 @@ describe('BaileysAdapter reconnect socket teardown (no leak)', () => {
   });
 });
 
+describe('BaileysAdapter status honesty across the reconnect backoff', () => {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+  const baileys = () => jest.requireMock('@whiskeysockets/baileys') as { default: jest.Mock };
+
+  const fireRecoverableClose = (): void => {
+    fakeSock.fire('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 515 } } },
+    });
+  };
+
+  const initReady = async (over: Partial<EngineEventCallbacks> = {}): Promise<BaileysAdapter> => {
+    fakeSock.user = undefined;
+    fakeSock.resetEmitter();
+    jest.clearAllMocks();
+    const adapter = newAdapter();
+    await adapter.initialize(noopCallbacks(over));
+    fakeSock.fire('connection.update', { connection: 'open' });
+    return adapter;
+  };
+
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it('a transient close drops the session to INITIALIZING immediately — no READY across the backoff', async () => {
+    const states: EngineStatus[] = [];
+    const adapter = await initReady({ onStateChanged: s => states.push(s) });
+    expect(adapter.getStatus()).toBe(EngineStatus.READY);
+    states.length = 0; // count only the transitions from READY onward
+
+    jest.useFakeTimers();
+    fireRecoverableClose();
+
+    // The reconnect timer is still pending (first attempt is ~1 s out, later ones up to 60 s) and
+    // the socket is already dead — the session must NOT read READY in this window.
+    expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+    await expect(adapter.probeLiveness()).resolves.toBe(false);
+    expect(states).toEqual([EngineStatus.INITIALIZING]);
+  });
+
+  it('stays INITIALIZING until the reconnected socket actually opens, then reports READY again', async () => {
+    const adapter = await initReady({});
+    baileys().default.mockClear();
+    jest.useFakeTimers();
+    jest.spyOn(Math, 'random').mockReturnValue(0); // deterministic 1 s first-attempt delay
+
+    fireRecoverableClose();
+    expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+
+    await jest.advanceTimersByTimeAsync(1_000); // attempt 1 runs → new socket created
+    expect(baileys().default).toHaveBeenCalledTimes(1);
+    // The new socket exists but has not opened yet — still not READY.
+    expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+
+    fakeSock.fire('connection.update', { connection: 'open' });
+    expect(adapter.getStatus()).toBe(EngineStatus.READY);
+    await expect(adapter.probeLiveness()).resolves.toBe(true);
+  });
+
+  it('back-to-back transient closes do not flap onStateChanged', async () => {
+    const states: EngineStatus[] = [];
+    await initReady({ onStateChanged: s => states.push(s) });
+    states.length = 0; // count only the transitions from READY onward
+
+    jest.useFakeTimers();
+    fireRecoverableClose();
+    fireRecoverableClose(); // duplicate for the same drop — ignored, no extra transition
+    expect(states).toEqual([EngineStatus.INITIALIZING]);
+
+    await jest.advanceTimersByTimeAsync(2_000); // let the pending attempt run (1 s + jitter)
+    fireRecoverableClose(); // the next drop lands while already INITIALIZING — still no emission
+    expect(states).toEqual([EngineStatus.INITIALIZING]);
+  });
+
+  it('a logged-out close still reports DISCONNECTED (terminal behavior unchanged)', async () => {
+    const onDisconnected = jest.fn();
+    const adapter = await initReady({ onDisconnected });
+
+    fakeSock.fire('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 401 } } },
+    });
+
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    expect(onDisconnected).toHaveBeenCalledWith('logged out');
+    await expect(adapter.probeLiveness()).resolves.toBe(false);
+  });
+});
+
 describe('BaileysAdapter capability gating', () => {
   it('throws EngineNotSupportedError for still-gated methods (e.g. getChatHistory)', async () => {
     const adapter = newAdapter();
@@ -909,6 +1003,53 @@ describe('BaileysAdapter inbound fan-out', () => {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
     const msg = onMessage.mock.calls[0][0] as { id: string; body: string; type: string; fromMe: boolean };
     expect(msg).toMatchObject({ id: 'IN1', body: 'hi there', type: 'text', fromMe: false });
+  });
+
+  it('routes a status broadcast to onMessage with the poster in author (so the status store can ingest it)', async () => {
+    const onMessage = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage });
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          // A contact's status: remoteJid is the shared channel, the poster is in participant.
+          key: { remoteJid: 'status@broadcast', participant: '628111@s.whatsapp.net', fromMe: false, id: 'ST1' },
+          message: { conversation: 'my status' },
+          messageTimestamp: 1700000002,
+          pushName: 'Alice',
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessage.mock.calls[0][0] as { id: string; author?: string; isStatusBroadcast: boolean };
+    // Regression lock: buildIncomingStatus needs author to resolve the poster — without it the
+    // status resolves to the status@broadcast pseudo-JID and is dropped before ingest.
+    expect(msg).toMatchObject({ id: 'ST1', isStatusBroadcast: true, author: '628111@c.us' });
+  });
+
+  it('extracts text-status styling (backgroundArgb/font) from the extended-text content', async () => {
+    baileys.getContentType.mockReturnValue('extendedTextMessage');
+    const onMessage = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage });
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: { remoteJid: 'status@broadcast', participant: '628111@s.whatsapp.net', fromMe: false, id: 'ST2' },
+          message: { extendedTextMessage: { text: 'styled story', backgroundArgb: 0xff123456, font: 3 } },
+          messageTimestamp: 1700000002,
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessage.mock.calls[0][0] as { backgroundColor?: string; font?: number };
+    expect(msg.backgroundColor).toBe('#123456');
+    expect(msg.font).toBe(3);
   });
 
   it('extracts coordinates from an ephemeral (disappearing) location message', async () => {
@@ -2316,12 +2457,27 @@ describe('BaileysAdapter group management', () => {
     ]);
   });
 
-  it('getGroupInfo maps groupMetadata, and returns null when it rejects', async () => {
+  it('getGroupInfo maps groupMetadata, and returns null only for a server refusal (401/403/404)', async () => {
     fakeSock.groupMetadata.mockResolvedValueOnce(META);
     const adapter = await ready();
     expect((await adapter.getGroupInfo('123-456@g.us'))?.id).toBe('123-456@g.us');
-    fakeSock.groupMetadata.mockRejectedValueOnce(new Error('not a group'));
+    // Baileys carries a server refusal as Boom with the numeric WA code on `data`
+    // (assertNodeErrorFree, WABinary/generic-utils.js:57).
+    fakeSock.groupMetadata.mockRejectedValueOnce(Object.assign(new Error('item-not-found'), { data: 404 }));
     expect(await adapter.getGroupInfo('x@g.us')).toBeNull();
+    fakeSock.groupMetadata.mockRejectedValueOnce(Object.assign(new Error('not-authorized'), { data: 401 }));
+    expect(await adapter.getGroupInfo('y@g.us')).toBeNull();
+  });
+
+  it('getGroupInfo does NOT fold a transport death into null — a dead socket is not "group not found"', async () => {
+    const adapter = await ready();
+    // Local Boom, no server error node: DisconnectReason-shaped 428 Connection Closed.
+    const connectionClosed = Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+    fakeSock.groupMetadata.mockRejectedValueOnce(connectionClosed);
+    await expect(adapter.getGroupInfo('123-456@g.us')).rejects.toBe(connectionClosed);
+    // A non-boom failure (programming/protocol error) propagates too.
+    fakeSock.groupMetadata.mockRejectedValueOnce(new Error('unexpected'));
+    await expect(adapter.getGroupInfo('123-456@g.us')).rejects.toThrow('unexpected');
   });
 
   it('getGroupInfo canonicalizes participant + owner ids through the session store (lid -> phone)', async () => {
@@ -2430,9 +2586,61 @@ describe('BaileysAdapter group management', () => {
 
   it('joinGroupViaInviteCode maps an IQ error to InvalidInviteCodeError (400)', async () => {
     // A rejected groupAcceptInvite (not-authorized / gone IQ) is the same client-facing cause.
-    fakeSock.groupAcceptInvite.mockRejectedValue(new Error('not-authorized'));
+    // Baileys carries the refusal as Boom with the numeric WA code on `data`.
+    fakeSock.groupAcceptInvite.mockRejectedValue(Object.assign(new Error('not-authorized'), { data: 401 }));
     const adapter = await ready();
     await expect(adapter.joinGroupViaInviteCode('BAD')).rejects.toBeInstanceOf(InvalidInviteCodeError);
+  });
+
+  it('joinGroupViaInviteCode does NOT fold a transport death into a 400 — a dead socket is not a bad invite', async () => {
+    // Local Boom, no server error node: DisconnectReason-shaped 428 Connection Closed.
+    const connectionClosed = Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+    fakeSock.groupAcceptInvite.mockRejectedValue(connectionClosed);
+    const adapter = await ready();
+    await expect(adapter.joinGroupViaInviteCode('CODE123')).rejects.toBe(connectionClosed);
+  });
+
+  it('addParticipants maps the per-participant [{status, jid}] array — a partial refusal does not throw', async () => {
+    fakeSock.groupParticipantsUpdate.mockResolvedValueOnce([
+      { status: '200', jid: '628111@s.whatsapp.net', content: {} },
+      { status: '403', jid: '628222@s.whatsapp.net', content: {} },
+      { status: '409', jid: '628333@s.whatsapp.net', content: {} },
+    ]);
+    const adapter = await ready();
+    const results = await adapter.addParticipants('123-456@g.us', ['628111@c.us', '628222@c.us', '628333@c.us']);
+    // Jids cross the engine boundary back in the neutral dialect; only the 200 entry is a success.
+    expect(results).toEqual([
+      { id: '628111@c.us', success: true, status: 200 },
+      { id: '628222@c.us', success: false, status: 403 },
+      { id: '628333@c.us', success: false, status: 409 },
+    ]);
+  });
+
+  it.each([
+    ['addParticipants', 'add'],
+    ['removeParticipants', 'remove'],
+    ['promoteParticipants', 'promote'],
+    ['demoteParticipants', 'demote'],
+  ])('%s throws EngineRefusedError (403) when EVERY participant is refused (e.g. not admin)', async method => {
+    fakeSock.groupParticipantsUpdate.mockResolvedValueOnce([
+      { status: '403', jid: '628111@s.whatsapp.net', content: {} },
+      { status: '403', jid: '628222@s.whatsapp.net', content: {} },
+    ]);
+    const adapter = await ready();
+    const err = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)
+      [method]('123-456@g.us', ['628111@c.us', '628222@c.us'])
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EngineRefusedError);
+    expect((err as Error).message).toMatch(/failed for all 2 participant/);
+  });
+
+  it('removeParticipants throws EngineRefusedError when the server returns no per-participant outcome', async () => {
+    // An empty result is no evidence of success — reporting one would be a false success.
+    fakeSock.groupParticipantsUpdate.mockResolvedValueOnce([]);
+    const adapter = await ready();
+    await expect(adapter.removeParticipants('123-456@g.us', ['628111@c.us'])).rejects.toBeInstanceOf(
+      EngineRefusedError,
+    );
   });
 
   it.each([
@@ -3209,6 +3417,13 @@ describe('BaileysAdapter status posting', () => {
       { video: Buffer.from('AAAA', 'base64'), caption: undefined, mimetype: 'video/mp4' },
       { statusJidList: ['628111@s.whatsapp.net'], backgroundColor: undefined, font: undefined },
     );
+  });
+
+  it('postStatus rejects an absent/empty recipients list with a 400 (Baileys posts to exactly the allow-list)', async () => {
+    const adapter = await ready();
+    await expect(adapter.postTextStatus('hello', {})).rejects.toBeInstanceOf(BadRequestException);
+    await expect(adapter.postTextStatus('hello', { recipients: [] })).rejects.toBeInstanceOf(BadRequestException);
+    expect(fakeSock.sendMessage).not.toHaveBeenCalled();
   });
 
   it('deleteStatus revokes by constructing the key from statusId (no store lookup)', async () => {

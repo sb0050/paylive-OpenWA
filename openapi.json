@@ -17,6 +17,8 @@
                 "api_key_revoked",
                 "api_key_deleted",
                 "api_key_auth_failed",
+                "rate_limit_exceeded",
+                "queue_board_mutated",
                 "session_created",
                 "session_started",
                 "session_stopped",
@@ -35,6 +37,7 @@
                 "integration_instance_updated",
                 "integration_instance_secret_regenerated",
                 "integration_instance_deleted",
+                "integration_instance_redriven",
                 "infra_config_saved",
                 "infra_restart_requested",
                 "infra_data_exported",
@@ -1288,7 +1291,7 @@
             "name": "from",
             "required": false,
             "in": "query",
-            "description": "Filter by sender. A phone also matches messages from a lid that resolves to it.",
+            "description": "Filter by sender. A phone also matches group messages via the author field and any lid that resolves to it.",
             "schema": {
               "type": "string"
             }
@@ -2193,7 +2196,7 @@
             "description": "Batch cancelled"
           },
           "400": {
-            "description": "Batch already completed or cancelled"
+            "description": "Batch already completed, cancelled, or failed (terminal statuses are exclusive)"
           },
           "404": {
             "description": "Batch not found"
@@ -2642,6 +2645,14 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "force": {
+                    "type": "boolean",
+                    "description": "Allow the replace to proceed even while engines are running for sessions the backup does not contain (they keep running until restart; see restartRequired). Prefer stopOrphans, which closes that window inside this request instead."
+                  },
+                  "stopOrphans": {
+                    "type": "boolean",
+                    "description": "Stop the running engines for sessions the backup does not contain, inside this request and before the replace runs. Supersedes force for the orphan case: with stopOrphans the engines no longer need a process restart to reconcile, so restartRequired stays false on the success path."
+                  },
                   "tables": {
                     "type": "object",
                     "properties": {
@@ -2656,6 +2667,9 @@
                       },
                       "messageBatches": {
                         "type": "array"
+                      },
+                      "statusUpdates": {
+                        "type": "array"
                       }
                     }
                   }
@@ -2667,6 +2681,9 @@
         "responses": {
           "200": {
             "description": "Data imported successfully"
+          },
+          "409": {
+            "description": "Refused: live engines exist for sessions the backup would remove (retry with stopOrphans=true to stop them in-request, or force=true to proceed and restart after)"
           }
         },
         "summary": "Import data to Data DB (replaces existing data)",
@@ -3257,7 +3274,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants added"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Add participants to a group",
@@ -3299,7 +3316,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants removed"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Remove participants from a group",
@@ -3343,7 +3360,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants promoted"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Promote participants to admin",
@@ -3387,7 +3404,7 @@
         },
         "responses": {
           "200": {
-            "description": "Participants demoted"
+            "description": "Participants processed — `results` carries the per-participant outcome (a partial refusal does not fail the batch; a total refusal is an error)"
           }
         },
         "summary": "Demote participants from admin",
@@ -4074,7 +4091,7 @@
             "name": "limit",
             "required": false,
             "in": "query",
-            "description": "Max messages to return (default 50)",
+            "description": "Max messages to return (default 50, max 100)",
             "schema": {
               "type": "number"
             }
@@ -4190,6 +4207,32 @@
         ]
       }
     },
+    "/api/metrics": {
+      "get": {
+        "operationId": "MetricsController_scrape",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Prometheus exposition text"
+          },
+          "401": {
+            "description": "METRICS_TOKEN is configured but the bearer is missing or wrong"
+          },
+          "404": {
+            "description": "Metrics endpoint is disabled (METRICS_TOKEN unset)"
+          }
+        },
+        "security": [
+          {
+            "metrics-bearer": []
+          }
+        ],
+        "summary": "Prometheus metrics (requires METRICS_TOKEN bearer)",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
     "/api/sessions/{sessionId}/status": {
       "get": {
         "operationId": "StatusController_getStatuses",
@@ -4241,6 +4284,41 @@
           }
         },
         "summary": "Get status updates from a specific contact",
+        "tags": [
+          "status"
+        ]
+      }
+    },
+    "/api/sessions/{sessionId}/status/{statusId}/media": {
+      "get": {
+        "operationId": "StatusController_getStatusMedia",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "statusId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The status image/video bytes."
+          },
+          "404": {
+            "description": "No stored media (text status, omitted, or expired)."
+          }
+        },
+        "summary": "Stream a stored status media file",
         "tags": [
           "status"
         ]
@@ -5741,7 +5819,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API",
-    "version": "0.10.8",
+    "version": "0.10.10",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -5784,6 +5862,18 @@
     {
       "name": "status",
       "description": "Status/Stories"
+    },
+    {
+      "name": "calls",
+      "description": "Call handling"
+    },
+    {
+      "name": "profile",
+      "description": "Own profile management"
+    },
+    {
+      "name": "search",
+      "description": "Global message search"
     },
     {
       "name": "statistics",
@@ -5833,6 +5923,12 @@
         "type": "apiKey",
         "in": "header",
         "name": "X-API-Key"
+      },
+      "metrics-bearer": {
+        "scheme": "bearer",
+        "bearerFormat": "opaque",
+        "type": "http",
+        "description": "METRICS_TOKEN for the GET /api/metrics scrape endpoint"
       }
     },
     "schemas": {
@@ -6342,6 +6438,7 @@
                 "message.revoked",
                 "message.reaction",
                 "message.edited",
+                "status.received",
                 "session.status",
                 "session.qr",
                 "session.authenticated",
@@ -6487,6 +6584,7 @@
                 "message.revoked",
                 "message.reaction",
                 "message.edited",
+                "status.received",
                 "session.status",
                 "session.qr",
                 "session.authenticated",
@@ -7043,7 +7141,7 @@
             "description": "Custom batch ID (auto-generated if not provided)"
           },
           "messages": {
-            "description": "Array of messages (max 100 per request)",
+            "description": "Array of messages (max 100 per request; duplicate chatIds are collapsed — first occurrence wins)",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BulkMessageItemDto"
@@ -7391,6 +7489,7 @@
           },
           "participants": {
             "description": "Participant WhatsApp IDs (e.g. 628123456789@c.us)",
+            "maxItems": 256,
             "type": "array",
             "items": {
               "type": "string"
@@ -7407,6 +7506,7 @@
         "properties": {
           "participants": {
             "description": "Participant WhatsApp IDs (e.g. 628123456789@c.us)",
+            "maxItems": 256,
             "type": "array",
             "items": {
               "type": "string"
@@ -7504,17 +7604,24 @@
           },
           "font": {
             "type": "number",
-            "description": "Font family index (0–5).",
+            "description": "Font family index from the WhatsApp status font enum: 0 (default), 1, 2, 6 (bold), 7, 8, 9, or 10. whatsapp-web.js honors only 0–7 and clamps anything above to the default.",
             "example": 0,
-            "minimum": 0,
-            "maximum": 5
+            "enum": [
+              0,
+              1,
+              2,
+              6,
+              7,
+              8,
+              9,
+              10
+            ]
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256). WhatsApp Status is not posted to a group — use @c.us or @lid individuals. Honored on the Baileys engine only: whatsapp-web.js ignores this allow-list and broadcasts to the account's status-privacy audience.",
+            "description": "Recipient JIDs (0–256). WhatsApp Status is not posted to a group — use @c.us or @lid individuals. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -7523,8 +7630,7 @@
           }
         },
         "required": [
-          "text",
-          "recipients"
+          "text"
         ]
       },
       "StatusMediaInput": {
@@ -7565,11 +7671,10 @@
             "maxLength": 1024
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256), @c.us or @lid. Honored on the Baileys engine only: whatsapp-web.js ignores this allow-list and broadcasts to the account's status-privacy audience.",
+            "description": "Recipient JIDs (0–256), @c.us or @lid. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -7578,8 +7683,7 @@
           }
         },
         "required": [
-          "image",
-          "recipients"
+          "image"
         ]
       },
       "SendVideoStatusDto": {
@@ -7600,11 +7704,10 @@
             "maxLength": 1024
           },
           "recipients": {
-            "description": "Recipient JIDs (1–256), @c.us or @lid. Honored on the Baileys engine only: whatsapp-web.js ignores this allow-list and broadcasts to the account's status-privacy audience.",
+            "description": "Recipient JIDs (0–256), @c.us or @lid. Required on the Baileys engine (it posts to exactly this allow-list); ignored by whatsapp-web.js, which broadcasts to the account's status-privacy audience — omit it there.",
             "example": [
               "628123456789@c.us"
             ],
-            "minItems": 1,
             "maxItems": 256,
             "type": "array",
             "items": {
@@ -7613,8 +7716,7 @@
           }
         },
         "required": [
-          "video",
-          "recipients"
+          "video"
         ]
       },
       "SendProductDto": {
@@ -7664,7 +7766,7 @@
         "properties": {
           "url": {
             "type": "string",
-            "description": "HTTP(S) URL of the plugin .zip to download and install"
+            "description": "HTTPS URL of the plugin .zip to download and install. Plain http:// is rejected: the package is executable code, so it must be integrity-protected in transit (hosts on private networks remain subject to the SSRF guard). Optional content pinning: append `#sha256=<64 hex>` (fragment — never sent to the server) or `?sha256=<64 hex>` to require the downloaded archive to match that digest; a mismatch fails the install."
           }
         },
         "required": [
@@ -7903,7 +8005,7 @@
           },
           "config": {
             "type": "object",
-            "description": "Per-instance config slice passed to the adapter, or null.",
+            "description": "Per-instance config slice passed to the adapter, or null. Fields flagged `secret` in the plugin's config schema are masked ('***') on EVERY response — including create/regenerate-secret; only the ingress secret and verifyToken are ever revealed once.",
             "nullable": true
           },
           "enabled": {

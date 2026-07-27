@@ -106,6 +106,10 @@ export interface IncomingMessage {
   senderPhone?: string | null;
   /** Sender contact info, best-effort from the WhatsApp Web cache. Sync fields only (no network). */
   contact?: MessageContact;
+  /** Styling of a text status/story: background as `#RRGGBB`. Only set by engines that expose it. */
+  backgroundColor?: string;
+  /** Styling of a text status/story: the WhatsApp font index. Only set by engines that expose it. */
+  font?: number;
   media?: {
     mimetype: string;
     filename?: string;
@@ -186,6 +190,26 @@ export interface GroupParticipant {
   isSuperAdmin: boolean;
 }
 
+/**
+ * Outcome of a group membership write (add/remove/promote/demote) for ONE participant. Engines
+ * that report per-participant results map them verbatim (whatsapp-web.js `addParticipants` resolves
+ * a `{[participantId]: {code, message}}` object; Baileys `groupParticipantsUpdate` resolves a
+ * `[{status, jid}]` array); engines that only confirm the batch as a whole (whatsapp-web.js
+ * remove/promote/demote resolve `{status: 200}`) report one success entry per requested participant.
+ * `status` is the engine's own code when it reported one (e.g. 200 ok, 403 invite-only/not-admin,
+ * 404 not registered, 409 already a member).
+ */
+export interface ParticipantOperationResult {
+  /** Neutral participant id the outcome belongs to. */
+  id: string;
+  /** True only when the engine confirmed the change for THIS participant. */
+  success: boolean;
+  /** Engine-reported status code, when it gave one. */
+  status?: number;
+  /** Engine-reported human-readable reason, when it gave one. */
+  message?: string;
+}
+
 export interface GroupInfo {
   id: string;
   name: string;
@@ -255,6 +279,8 @@ export interface Status {
   type: 'text' | 'image' | 'video';
   caption?: string;
   mediaUrl?: string;
+  /** Downloaded media bytes for an image/video status, when the engine fetched them (see `capInboundMediaFor`). */
+  media?: IncomingMessage['media'];
   backgroundColor?: string;
   font?: number;
   timestamp: Date;
@@ -262,8 +288,12 @@ export interface Status {
 }
 
 export interface StatusPostOptions {
-  /** REQUIRED. Neutral JIDs (@c.us / @lid) permitted to see the status. Maps to Baileys statusJidList. */
-  recipients: string[];
+  /**
+   * Neutral JIDs (@c.us / @lid) permitted to see the status. Maps to Baileys statusJidList.
+   * REQUIRED on the Baileys engine (it rejects an absent/empty list with a 400); ignored by
+   * whatsapp-web.js, which broadcasts to the account's status-privacy audience.
+   */
+  recipients?: string[];
   /** Hex background colour (#RRGGBB). Text status only. */
   backgroundColor?: string;
   /** Font index. Text status only. */
@@ -580,10 +610,16 @@ export interface IWhatsAppEngine {
   // Groups - Extended (Phase 3)
   getGroupInfo(groupId: string): Promise<GroupInfo | null>;
   createGroup(name: string, participants: string[]): Promise<Group>;
-  addParticipants(groupId: string, participants: string[]): Promise<void>;
-  removeParticipants(groupId: string, participants: string[]): Promise<void>;
-  promoteParticipants(groupId: string, participants: string[]): Promise<void>;
-  demoteParticipants(groupId: string, participants: string[]): Promise<void>;
+  /**
+   * Membership writes resolve one {@link ParticipantOperationResult} per participant, so a partial
+   * refusal (one invite-only number among several added) is visible instead of being flattened into
+   * a blanket success. They THROW only when the operation failed for every requested participant —
+   * e.g. the account lacks admin rights — or the batch itself was refused.
+   */
+  addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
+  removeParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
+  promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
+  demoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]>;
   leaveGroup(groupId: string): Promise<void>;
   setGroupSubject(groupId: string, subject: string): Promise<void>;
   setGroupDescription(groupId: string, description: string): Promise<void>;
@@ -611,7 +647,22 @@ export interface IWhatsAppEngine {
    * non-text or foreign messages at their own layer — the engine's error is surfaced as-is.
    */
   editMessage(chatId: string, messageId: string, body: string): Promise<MessageResult>;
-  getChatHistory(chatId: string, limit?: number, includeMedia?: boolean): Promise<IncomingMessage[]>;
+  /**
+   * Read a chat's recent messages, newest first. When `includeMedia` downloads blobs, an optional
+   * `mediaMaxBytes` tightens the declared-size pre-gate below the global MEDIA_DOWNLOAD_MAX_BYTES —
+   * the status seed uses it to skip downloads the store would discard as over-cap anyway.
+   * Inlined media is additionally bounded in aggregate (CHAT_HISTORY_MEDIA_BUDGET_BYTES): once the
+   * running base64 total crosses the budget, later media messages carry the `omitted` marker instead
+   * of a download. An optional `signal` (e.g. client disconnect) stops the read loop early; the
+   * messages collected so far are returned.
+   */
+  getChatHistory(
+    chatId: string,
+    limit?: number,
+    includeMedia?: boolean,
+    mediaMaxBytes?: number,
+    signal?: AbortSignal,
+  ): Promise<IncomingMessage[]>;
 
   // Calls
   /**

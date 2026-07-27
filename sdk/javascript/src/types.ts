@@ -92,6 +92,8 @@ export interface SendTextRequest {
   chatId: Jid;
   /** Max 4096 chars. */
   text: string;
+  /** WIDs to @mention (e.g. `["62811@c.us"]`). The text must also contain the `@<number>` token. */
+  mentions?: string[];
 }
 
 export interface SendMediaRequest {
@@ -177,6 +179,16 @@ export interface SendTemplateRequest {
   templateName?: string;
   /** Template variables (server DTO field is `vars`). */
   vars?: Record<string, string>;
+}
+
+export interface SendPollRequest {
+  chatId: Jid;
+  /** Poll question / title (max 255 chars). */
+  name: string;
+  /** Options to vote on (WhatsApp allows between 2 and 12). */
+  options: string[];
+  /** Allow voters to pick several options (default single choice). */
+  allowMultipleAnswers?: boolean;
 }
 
 export interface ListMessagesQuery {
@@ -364,6 +376,11 @@ export interface ProfilePictureResponse {
   url: string | null;
 }
 
+/** Batch profile-picture lookup: a map of contact id → picture URL (null when the lookup failed). */
+export interface ProfilePicturesResponse {
+  pictures: Record<string, string | null>;
+}
+
 export interface ContactPhoneResponse {
   contactId: Jid;
   phone: string | null;
@@ -496,12 +513,19 @@ export type WebhookEvent =
   | 'group.leave'
   | 'group.update'
   | 'call.received'
+  | 'status.received'
   | '*';
 
 export interface WebhookFilterCondition {
   field: string;
   operator: string;
-  value: string[];
+  /**
+   * Polymorphic per field kind: a single string (text fields), a string array
+   * (id/idArray/enum fields), or a boolean (boolean fields).
+   */
+  value: string | string[] | boolean;
+  /** Only meaningful for text fields (`contains`/`equals`). Defaults to false. */
+  caseSensitive?: boolean;
 }
 
 export interface WebhookFilters {
@@ -588,9 +612,6 @@ export interface StatusRecord {
   type: 'text' | 'image' | 'video';
   /** Text body for a text status, caption for an image/video one. */
   caption?: string;
-  // Declared by the backend `Status`, but no engine populates them on a read yet: whatsapp-web.js
-  // maps neither, and Baileys does not support reading statuses at all. Present for forward
-  // compatibility — do not expect them on a response today.
   mediaUrl?: string;
   backgroundColor?: string;
   font?: number;
@@ -614,8 +635,8 @@ export interface StatusResult {
 
 export interface SendTextStatusRequest {
   text: string;
-  /** Recipient JIDs the status is addressed to (required by the server; empty → 400). */
-  recipients: string[];
+  /** Recipient JIDs. Required on the Baileys engine (absent/empty → 400); omit on whatsapp-web.js, which broadcasts instead. */
+  recipients?: string[];
   /** Hex background color, e.g. `#25D366`. */
   backgroundColor?: string;
   /** Font index supported by WhatsApp status. */
@@ -633,16 +654,16 @@ export interface StatusMediaInput {
 /** Server expects a nested `{ image: { url|base64 } }` body, not flat media fields. */
 export interface SendImageStatusRequest {
   image: StatusMediaInput;
-  /** Recipient JIDs the status is addressed to (required by the server; empty → 400). */
-  recipients: string[];
+  /** Recipient JIDs. Required on the Baileys engine (absent/empty → 400); omit on whatsapp-web.js, which broadcasts instead. */
+  recipients?: string[];
   caption?: string;
 }
 
 /** Server expects a nested `{ video: { url|base64 } }` body, not flat media fields. */
 export interface SendVideoStatusRequest {
   video: StatusMediaInput;
-  /** Recipient JIDs the status is addressed to (required by the server; empty → 400). */
-  recipients: string[];
+  /** Recipient JIDs. Required on the Baileys engine (absent/empty → 400); omit on whatsapp-web.js, which broadcasts instead. */
+  recipients?: string[];
   caption?: string;
 }
 

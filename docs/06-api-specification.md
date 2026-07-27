@@ -184,7 +184,7 @@ Every path below is prefixed with `/api`. Unless marked **public**, send `X-API-
 
 ### 6.4.1 Sessions
 
-Base path `/api/sessions`. Read routes return data shaped by `SessionResponseDto.fromEntity` (via `transformSession`), which **strips** `config`, `proxyUrl`, and `proxyType` and renames the entity field `lastActiveAt` to `lastActive`. The one exception is `POST /api/sessions`, which returns the **raw `Session` entity** and therefore *does* expose `config`/`proxyUrl`/`proxyType`/`lastActiveAt`. Session `status` wire values are lowercase: `created | initializing | qr_ready | authenticating | ready | disconnected | failed`.
+Base path `/api/sessions`. All routes that return a session return data shaped by `SessionResponseDto.fromEntity` (via `transformSession`), which **strips** `config`, `proxyUrl`, and `proxyType` and renames the entity field `lastActiveAt` to `lastActive`. Session `status` wire values are lowercase: `created | initializing | qr_ready | authenticating | ready | disconnected | failed`.
 
 #### GET /api/sessions
 
@@ -382,7 +382,7 @@ Create a new WhatsApp session.
 | Field | Type | Required | Constraints | Description |
 | --- | --- | --- | --- | --- |
 | `name` | string | Yes | `@IsString`; length 3–50; `@Matches(/^[a-zA-Z0-9-]+$/)` (letters, numbers, hyphens only) | Unique session name; duplicate → `409` |
-| `config` | object | No | `@IsOptional` (arbitrary object, no shape validation) | Opaque engine config; defaults to `{}`; never returned by read routes |
+| `config` | object | No | `@IsOptional` (arbitrary object, no shape validation) | Opaque engine config; defaults to `{}`; never returned in responses |
 | `proxyUrl` | string | No | `@IsOptional`; `@IsString`; max 255; `@IsUrl` (protocols `http`/`https`/`socks4`/`socks5`, `require_protocol`, `require_tld:false`, `allow_underscores`) | Per-session proxy egress; credentialed `http://user:pass@host` and single-label hosts allowed; not SSRF-blocked. ⚠ **Must be a real, reachable proxy** — an unreachable value silently blocks the WhatsApp WebSocket (no QR, start → `504`); leave unset unless you need it. See "Per-session egress proxy" below. |
 | `proxyType` | `http` \| `https` \| `socks4` \| `socks5` | No | `@IsOptional`; `@IsIn([...])` | Proxy protocol |
 
@@ -420,17 +420,15 @@ network cannot reach WhatsApp directly. Set `proxyUrl`/`proxyType` on the same r
   "status": "created",
   "phone": null,
   "pushName": null,
-  "config": { "autoReconnect": true },
-  "proxyUrl": null,
-  "proxyType": null,
   "connectedAt": null,
-  "lastActiveAt": null,
+  "lastActive": null,
   "createdAt": "2026-06-25T09:00:00.000Z",
-  "updatedAt": "2026-06-25T09:00:00.000Z"
+  "updatedAt": "2026-06-25T09:00:00.000Z",
+  "lastError": null
 }
 ```
 
-This route returns the **raw `Session` entity** (not via `fromEntity`), so `config`/`proxyUrl`/`proxyType`/`lastActiveAt` are present here only. Newly created `status` is `created`.
+Like every other session route, this returns the `SessionResponseDto` shape (via `fromEntity`), so `config`/`proxyUrl`/`proxyType` are stripped and `lastActiveAt` appears as `lastActive`. Newly created `status` is `created`.
 
 **Errors:** `400` validation (bad `name`/`proxyUrl`/`proxyType`, or an extra non-whitelisted field) · `401` · `403` key lacks OPERATOR role · `409` session name already exists
 
@@ -1389,12 +1387,14 @@ Send messages to multiple recipients as an async batch — returns immediately a
 | Field | Type | Required | Constraints | Description |
 | --- | --- | --- | --- | --- |
 | batchId | string | No | string | Auto-generated `batch_<hex>` if omitted; a duplicate id returns `400` |
-| messages | BulkMessageItemDto[] | Yes | array, max 100, nested-validated | The batch items (see below) |
+| messages | BulkMessageItemDto[] | Yes | array, max 100, nested-validated | The batch items (see below); duplicate `chatId`s are collapsed before processing — first occurrence wins, order preserved |
 | options | BulkMessageOptionsDto | No | nested-validated | Pacing/error options (see below) |
 
 Each `BulkMessageItemDto`: `{ chatId: string, type: 'text'|'image'|'video'|'audio'|'document', content: BulkMessageContentDto, variables?: Record<string,string> }`. `content` (all fields optional, nested-validated): `text?: string`, `image?`/`video?`/`audio?`/`document?`: `{ url?, base64?, mimetype?, filename? }`, `caption?: string`.
 
 `BulkMessageOptionsDto`: `{ delayBetweenMessages?: number (1000–60000, default 3000), randomizeDelay?: boolean (default true), stopOnError?: boolean (default false) }`.
+
+Each item's base64 media is checked against the media byte cap (`MEDIA_DOWNLOAD_MAX_BYTES`) twice: at batch creation, and again per item after `variables` and the `message:sending` plugin gate are applied. An item that outgrows the cap only after rendering fails individually (`failed` in `results`, with `message:failed` fired) instead of being sent. `totalMessages` in the response reflects the de-duplicated item count.
 
 ```json
 {
@@ -2690,6 +2690,8 @@ Note: this is the one route in the module that returns a literal `{ success: tru
 
 Labels are a WhatsApp Business feature: every label route lives under a session and reads/writes the chat-label assignments exposed by the engine. Status routes manage the session's status feed (stories) — reading visible statuses and posting/deleting your own. Read routes require a base API key; all writes require `OPERATOR`.
 
+**Reads are store-backed, not engine-direct.** `GET /status` and `GET /status/:contactId` no longer call the engine — they read from an OpenWA-side store that ingests inbound status/story broadcasts as they arrive (plus a best-effort backfill of currently-active stories on session connect), with a 24h TTL matching WhatsApp's own story expiry. This makes reads **identical on both engines**: `whatsapp-web.js` (which had a native `getBroadcasts()`/`getBroadcastById()` path) and Baileys (which never had one — `fetchStatus` only returns the *about* text, not stories, so the raw engine methods still throw `501` if called directly, they're just no longer on the read path) now return the same shape from the same source. A status older than 24h, or received before the store existed, will not appear.
+
 #### GET /api/sessions/:sessionId/labels
 
 List all labels defined for the session (WhatsApp Business accounts only).
@@ -2822,7 +2824,7 @@ The handler always returns `{ "success": true }`. DELETE default status is `200`
 
 #### GET /api/sessions/:sessionId/status
 
-Get all contact status updates (stories) visible to the session.
+Get all contact status updates (stories) visible to the session, read from the store (24h TTL, both engines — see the note above).
 
 **Auth:** API key
 
@@ -2842,7 +2844,7 @@ Get all contact status updates (stories) visible to the session.
       "contact": { "id": "6281234567890@c.us", "name": "Alice", "pushName": "Alice" },
       "type": "image",
       "caption": "On the road",
-      "mediaUrl": "https://…",
+      "mediaUrl": "/api/sessions/my-session/status/false_6281234567890@c.us_3A1F.../media",
       "backgroundColor": "#25D366",
       "font": 2,
       "timestamp": "2026-06-25T08:30:00.000Z",
@@ -2852,13 +2854,13 @@ Get all contact status updates (stories) visible to the session.
 }
 ```
 
-The controller wraps the engine array in `{ statuses }`. `type` is one of `text | image | video`; `caption`, `mediaUrl`, `backgroundColor`, `font` are optional. `timestamp` and `expiresAt` serialize to ISO strings (these are `Date` values, not the epoch-number convention used by message timestamps).
+The controller wraps the store array in `{ statuses }`, ordered newest-first. `type` is one of `text | image | video`; `caption`, `backgroundColor`, `font` are optional. `mediaUrl` is present only when the status carried media that the store kept (see the media endpoint below) — it is a same-origin path into this API, not an external WhatsApp CDN link. `timestamp` and `expiresAt` serialize to ISO strings (these are `Date` values, not the epoch-number convention used by message timestamps).
 
-**Errors:** `401` missing/invalid API key, or key not scoped to this session · `404` `Session {id} not found or not connected`
+**Errors:** `401` missing/invalid API key, or key not scoped to this session
 
 #### GET /api/sessions/:sessionId/status/:contactId
 
-Get status updates posted by a specific contact.
+Get status updates posted by a specific contact, read from the store (24h TTL, both engines).
 
 **Auth:** API key
 
@@ -2888,9 +2890,28 @@ Get status updates posted by a specific contact.
 }
 ```
 
-Same `{ statuses }` wrapper and `Status` shape as the list-all route.
+Same `{ statuses }` wrapper and `Status` shape as the list-all route. An unknown `contactId` returns `{ "statuses": [] }`, not a `404`.
 
-**Errors:** `401` missing/invalid API key, or key not scoped to this session · `404` session not found / not connected
+**Errors:** `401` missing/invalid API key, or key not scoped to this session
+
+#### GET /api/sessions/:sessionId/status/:statusId/media
+
+Stream a stored status's media bytes (the file behind a `mediaUrl` returned above).
+
+**Auth:** API key
+
+**Path parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| sessionId | string | WhatsApp session identifier |
+| statusId | string | The status `id` (e.g. from a `GET /status` response) |
+
+**Response** `200` — the raw media bytes as the response body, with `Content-Type` set to the stored mimetype (e.g. `image/jpeg`, `video/mp4`). Streamed via `StreamableFile` from whatever backs `StorageService` (local disk or S3 — the route does not care which).
+
+**Errors:** `401` missing/invalid API key, or key not scoped to this session · `404` `Status media not found or expired` — the status is text-only, its media was omitted (e.g. over the configured size cap), or the 24h TTL has since purged the row
+
+Note: `:statusId/media` is a two-path-segment route, so it never collides with the single-segment `GET /status/:contactId` above regardless of declaration order.
 
 #### POST /api/sessions/:sessionId/status/send-text
 
@@ -3054,7 +3075,7 @@ Webhooks are configured per session and managed under `/api/sessions/:sessionId/
 
 Two fields — `secret` and `headers` — are **write-only**: they are accepted on create/update but are **never** returned in any response (the response DTO has no `@Expose` for them, so `fromEntity` drops them). The `secret` is used to compute the `X-OpenWA-Signature: sha256=<hex>` HMAC-SHA256 header on deliveries.
 
-The `events` array accepts these members plus the `*` wildcard: `message.received`, `message.sent`, `message.ack`, `message.failed`, `message.revoked`, `message.reaction`, `message.edited`, `session.status`, `session.qr`, `session.authenticated`, `session.disconnected`, `session.reconnect_loop`, `group.join`, `group.leave`, `group.update`, `call.received`. All of them are actively dispatched by the engines.
+The `events` array accepts these members plus the `*` wildcard: `message.received`, `message.sent`, `message.ack`, `message.failed`, `message.revoked`, `message.reaction`, `message.edited`, `session.status`, `session.qr`, `session.authenticated`, `session.disconnected`, `session.reconnect_loop`, `group.join`, `group.leave`, `group.update`, `call.received`, `status.received`. All of them are actively dispatched by the engines.
 
 #### GET /api/sessions/:sessionId/webhooks
 
@@ -3222,7 +3243,7 @@ Create a webhook for the session.
 
 `secret` and `headers` are deliberately excluded from the response. `active` defaults to `true`, `lastTriggeredAt` is `null` on create.
 
-**Errors:** `400` validation failure, unknown body field (whitelist), or SSRF URL rejection · `401` missing/invalid API key · `403` insufficient role
+**Errors:** `400` validation failure, unknown body field (whitelist), SSRF URL rejection, or the per-session webhook limit (`WEBHOOK_MAX_PER_SESSION`, default 16 — delete an existing webhook before registering another; webhooks already above the cap are grandfathered and keep working) · `401` missing/invalid API key · `403` insufficient role
 
 #### PUT /api/sessions/:sessionId/webhooks/:id
 
@@ -4303,7 +4324,9 @@ Install a plugin from an uploaded `.zip` package.
 
 #### POST /api/plugins/install-url
 
-Install a plugin by downloading its `.zip` from an HTTP(S) URL (SSRF-guarded fetch: host validated, redirects refused, size-capped at `plugins.downloadMaxBytes`, default 5 MB).
+Install a plugin by downloading its `.zip` from an HTTPS URL (SSRF-guarded fetch: host validated, redirects refused, size-capped at `plugins.downloadMaxBytes`, default 5 MB). Plain `http://` is rejected — the package is executable code and must be integrity-protected in transit; private-network targets remain subject to the SSRF guard.
+
+Optional content pinning: append `#sha256=<64 hex>` (URL fragment — never sent to the server) or `?sha256=<64 hex>` (`checksum=` also accepted) to require the downloaded bytes to match that digest. A mismatch, a malformed marker, or conflicting markers fail the install closed; no marker means no verification (HTTPS + the SSRF guard are the baseline).
 
 **Auth:** API key (ADMIN)
 
@@ -4311,7 +4334,7 @@ Install a plugin by downloading its `.zip` from an HTTP(S) URL (SSRF-guarded fet
 
 | Field | Type | Required | Constraints | Description |
 | --- | --- | --- | --- | --- |
-| `url` | string | Yes | `@IsUrl({ protocols:['http','https'], require_protocol:true })` | Absolute http(s) URL of the package |
+| `url` | string | Yes | `@IsUrl({ protocols:['https'], require_protocol:true })` | Absolute https URL of the package; optional `#sha256=` / `?sha256=` digest pin |
 
 ```json
 { "url": "https://github.com/openwa-plugins/chat-flow/releases/download/v1.0.0/chat-flow.zip" }
@@ -4319,7 +4342,7 @@ Install a plugin by downloading its `.zip` from an HTTP(S) URL (SSRF-guarded fet
 
 **Response** `201` — the newly installed `PluginDto`.
 
-**Errors:** `400` invalid URL / download or package invalid · `401` · `403` · `409` already installed
+**Errors:** `400` invalid URL / download, integrity check, or package invalid · `401` · `403` · `409` already installed
 
 ---
 
@@ -4468,7 +4491,7 @@ A session-restricted key requesting `"*"` or out-of-scope sessions gets `403 API
 
 #### POST /api/plugins/:id/update
 
-Update an installed plugin in place from a URL, preserving config + enabled state (old directory backed up and restored on failure).
+Update an installed plugin in place from a URL, preserving config + enabled state. The new package is written to a staging sibling and validated BEFORE the running plugin is stopped, then swapped in with two renames (live → backup, staging → live); a failure before or during the swap restores the previous version, and a process crash mid-swap is reconciled at boot (the backup is restored when the live directory is missing), so an interrupted update can never make the plugin silently vanish. Accepts the same optional `#sha256=` / `?sha256=` digest pin as `install-url` (fail-closed on mismatch).
 
 **Auth:** API key (ADMIN)
 
@@ -4482,7 +4505,7 @@ Update an installed plugin in place from a URL, preserving config + enabled stat
 
 | Field | Type | Required | Constraints | Description |
 | --- | --- | --- | --- | --- |
-| `url` | string | Yes | `@IsUrl({ protocols:['http','https'], require_protocol:true })` | Absolute http(s) URL of the new `.zip` (SSRF-guarded download) |
+| `url` | string | Yes | `@IsUrl({ protocols:['https'], require_protocol:true })` | Absolute https URL of the new `.zip` (SSRF-guarded download); optional `#sha256=` / `?sha256=` digest pin |
 
 ```json
 { "url": "https://example.com/plugins/chat-flow-1.1.0.zip" }
@@ -4496,7 +4519,7 @@ Update an installed plugin in place from a URL, preserving config + enabled stat
 
 #### DELETE /api/plugins/:id
 
-Uninstall a plugin and delete its files. Built-in plugins are protected.
+Uninstall a plugin: dispatch its `onUnload` lifecycle hook, delete its files, drop its registry entry, and remove its `ctx.storage` data directory (`<dataDir>/plugins/<id>` — a separate tree when `PLUGINS_DIR` points outside the data dir). Built-in plugins are protected.
 
 **Auth:** API key (ADMIN)
 
@@ -4806,6 +4829,7 @@ group.join
 group.leave
 group.update
 call.received
+status.received
 ```
 
 A subscribe request whose `events` array contains no recognized name (after filtering) is rejected with `INVALID_EVENTS`. Unknown names mixed with valid ones are silently dropped; the `subscribed` reply echoes only the accepted events.
@@ -4884,8 +4908,13 @@ These are the events OpenWA actually emits. A webhook is registered with an `eve
 | `group.leave` | Participant(s) leave or are removed from a group | `{ groupId, actorId?, participantIds, timestamp }` |
 | `group.update` | Group metadata changes (subject, description, announce/locked settings) | `{ groupId, actorId?, participantIds, changes?, timestamp }` — `changes` carries only the fields that changed: `subject?`, `description?`, `announce?`, `locked?` |
 | `call.received` | An incoming voice/video call starts ringing | `{ callId, from, isVideo, isGroup, timestamp }` — `callId` is the id to pass to `POST /sessions/:sessionId/calls/:callId/reject` |
+| `status.received` | A contact posts a status/story (opt-in — see below) | `{ sessionId, statusId, contact: { id, name?, pushName? }, type, caption?, hasMedia, mediaOmitted, omitReason?, postedAt, expiresAt }` — `statusId` is the store's `id` (usable with the status endpoints below); `postedAt`/`expiresAt` are epoch **milliseconds** (unlike the epoch-seconds convention for message timestamps), matching the `GET /status` store's own `Date`-backed fields |
+
+> **`status.received` is opt-in and carries no media blob.** Unlike every other event above, `status.received` is only delivered to a webhook whose `events` list explicitly includes `"status.received"` (or `"*"`) — registering for other events does not implicitly subscribe you to it. The payload never embeds media bytes: when `hasMedia` is `true`, fetch the file separately via `GET /api/sessions/:sessionId/status/:statusId/media`. Your own posted statuses never trigger this event — only inbound stories from contacts (an own-send echo is dropped before ingest).
 
 > **`STORE_EPHEMERAL_MESSAGES=false` affects `message.received`.** When `STORE_EPHEMERAL_MESSAGES` is set to `false`, incoming disappearing messages (those with `ephemeralDuration > 0`) are **not** persisted nor dispatched — no DB insert, no webhook delivery, and no websocket event. Downstream consumers and the dashboard both stop seeing them. Default is `true` (backward compatible — store and dispatch everything).
+
+> **Large media is not inlined into webhook payloads.** A `media` blob whose decoded size exceeds `WEBHOOK_MEDIA_INLINE_MAX_BYTES` (default **1 MiB**; `0` = never inline) is replaced — before the payload is fanned out to your webhook — with the marker form `media: { mimetype, filename?, omitted: true, sizeBytes }`, the same shape the engine emits for capped inbound media. Media at or under the cap stays inline unchanged. Additionally, if the serialized body still exceeds `WEBHOOK_MAX_PAYLOAD_BYTES` (default **1 MiB**) after `webhook:before` hooks ran, any remaining inline media is shed the same way so the event is still delivered; only a payload that is over budget *without* inline media is dropped (recorded in `GET /api/webhooks/delivery-failures`). Because shedding happens before enqueue, queued and failed BullMQ jobs in Redis never carry the blob either — failed-job retention is bounded by the queue's `removeOnComplete`/`removeOnFail` windows (1h/1000 completed, 24h/5000 failed). Fetch the media itself afterwards via `GET /api/sessions/:sessionId/messages/:chatId/history?includeMedia=true` when you need it.
 
 > There is **no** `contact.update` or `presence.update` event, and no `call.accepted` / `call.terminated` lifecycle event yet — only `call.received` is emitted.
 

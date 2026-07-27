@@ -20,6 +20,7 @@ import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
+import { StatusStoreService } from '../status-store/status-store.service';
 import {
   IncomingMessage,
   EngineEventCallbacks,
@@ -62,6 +63,7 @@ describe('SessionService', () => {
   let hookManager: jest.Mocked<Partial<HookManager>>;
   let configService: jest.Mocked<Partial<ConfigService>>;
   let lidMappingStore: jest.Mocked<Partial<LidMappingStoreService>>;
+  let statusStore: jest.Mocked<Partial<StatusStoreService>>;
   let mockEngine: Record<string, jest.Mock>;
 
   beforeEach(async () => {
@@ -119,6 +121,9 @@ describe('SessionService', () => {
       sendChatState: jest.fn().mockResolvedValue(undefined),
       resolveContactPhone: jest.fn().mockResolvedValue('628111222333'),
       rejectCall: jest.fn().mockResolvedValue(undefined),
+      getContactStatuses: jest.fn().mockResolvedValue([]),
+      getChatHistory: jest.fn().mockResolvedValue([]),
+      getContactById: jest.fn().mockResolvedValue(null),
     };
 
     engineFactory = {
@@ -140,6 +145,7 @@ describe('SessionService', () => {
       emitGroupLeave: jest.fn(),
       emitGroupUpdate: jest.fn(),
       emitCallReceived: jest.fn(),
+      emitStatusReceived: jest.fn(),
       emitQRCode: jest.fn(),
     };
 
@@ -159,6 +165,11 @@ describe('SessionService', () => {
       remember: jest.fn().mockResolvedValue(undefined),
       getCached: jest.fn().mockReturnValue(undefined),
       lidsForPhone: jest.fn().mockReturnValue([]),
+    };
+
+    statusStore = {
+      // Default: nothing freshly inserted (callers only dispatch status.received on created=true).
+      ingest: jest.fn().mockResolvedValue({ row: {}, created: false }),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -182,6 +193,7 @@ describe('SessionService', () => {
         { provide: HookManager, useValue: hookManager },
         { provide: ConfigService, useValue: configService },
         { provide: LidMappingStoreService, useValue: lidMappingStore },
+        { provide: StatusStoreService, useValue: statusStore },
       ],
     }).compile();
 
@@ -225,7 +237,7 @@ describe('SessionService', () => {
       expect(dataSource.transaction).toHaveBeenCalled(); // DB removal still ran
     });
 
-    it('delete() purges the engine on-disk auth dir (keyed by session NAME) so a same-name recreate starts clean', async () => {
+    it('delete() purges the on-disk auth dirs (keyed by session NAME) so a same-name recreate starts clean', async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(
         createMockSession({ id: 'sess-uuid-1', name: 'test-session' }),
       );
@@ -234,6 +246,23 @@ describe('SessionService', () => {
       await service.delete('sess-uuid-1');
 
       expect(engineFactory.purgeSessionData).toHaveBeenCalledWith('test-session');
+    });
+
+    it('delete() delegates the both-engines purge exactly once, after the DB rows are removed', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(
+        createMockSession({ id: 'sess-uuid-1', name: 'test-session' }),
+      );
+
+      await expect(service.delete('sess-uuid-1')).resolves.toBeUndefined();
+
+      // The factory owns the per-engine best-effort isolation (covered in engine.factory.spec);
+      // the service hands it the session NAME once, only after the DB removal has committed.
+      expect(dataSource.transaction).toHaveBeenCalled();
+      expect(engineFactory.purgeSessionData).toHaveBeenCalledTimes(1);
+      expect(engineFactory.purgeSessionData).toHaveBeenCalledWith('test-session');
+      const txOrder = (dataSource.transaction as jest.Mock).mock.invocationCallOrder[0];
+      const purgeOrder = (engineFactory.purgeSessionData as jest.Mock).mock.invocationCallOrder[0];
+      expect(txOrder).toBeLessThan(purgeOrder);
     });
 
     it('delete() purges even when no engine is loaded (a stopped session has none)', async () => {
@@ -297,6 +326,85 @@ describe('SessionService', () => {
     it('forceKill() throws NotFoundException for an unknown session', async () => {
       (repository.findOne as jest.Mock).mockResolvedValue(null);
       await expect(service.forceKill('nope')).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ── stopOrphanEngines (infra import path) ─────────────────────────
+  describe('stopOrphanEngines', () => {
+    const enginesOf = () => (service as unknown as { engines: Map<string, unknown> }).engines;
+    const stoppingOf = () => (service as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+
+    it('stops each running orphan engine, reconciles the map, and reports stopped', async () => {
+      const g1 = { destroy: jest.fn().mockResolvedValue(undefined) };
+      const g2 = { destroy: jest.fn().mockResolvedValue(undefined) };
+      enginesOf().set('g1', g1);
+      enginesOf().set('g2', g2);
+
+      const result = await service.stopOrphanEngines(['g1', 'g2']);
+
+      expect(g1.destroy).toHaveBeenCalledTimes(1);
+      expect(g2.destroy).toHaveBeenCalledTimes(1);
+      expect(enginesOf().has('g1')).toBe(false);
+      expect(enginesOf().has('g2')).toBe(false);
+      expect(result.stopped.sort()).toEqual(['g1', 'g2']);
+      expect(result.notRunning).toEqual([]);
+      expect(result.failed).toEqual([]);
+      // The stop mark blocks a late reconnect from resurrecting either id mid-teardown.
+      expect(stoppingOf().has('g1')).toBe(true);
+      expect(stoppingOf().has('g2')).toBe(true);
+    });
+
+    it('reports an id without a live engine as notRunning (still initializing — start() self-aborts via the mark)', async () => {
+      const g1 = { destroy: jest.fn().mockResolvedValue(undefined) };
+      enginesOf().set('g1', g1);
+      // 'g-init' is in the requested list but has no Map entry.
+
+      const result = await service.stopOrphanEngines(['g1', 'g-init']);
+
+      expect(result.stopped).toEqual(['g1']);
+      expect(result.notRunning).toEqual(['g-init']);
+      expect(result.failed).toEqual([]);
+      expect(stoppingOf().has('g-init')).toBe(true); // still marked so start() aborts
+    });
+
+    it('isolates a failing destroy(): teardown is best-effort so both engines are reconciled from the map', async () => {
+      // destroyEngineSafely delegates to teardownEngineSafely, which isolates + time-bounds failures and
+      // never throws — a stuck destroy() therefore cannot stall the batch or poison other orphans. The
+      // engine is removed from the Map regardless of teardown outcome (it stops holding a slot).
+      const good = { destroy: jest.fn().mockResolvedValue(undefined) };
+      const bad = { destroy: jest.fn().mockRejectedValue(new Error('stuck chromium')) };
+      enginesOf().set('good', good);
+      enginesOf().set('bad', bad);
+
+      const result = await service.stopOrphanEngines(['good', 'bad']);
+
+      expect(good.destroy).toHaveBeenCalledTimes(1);
+      expect(bad.destroy).toHaveBeenCalledTimes(1);
+      // Map reconciled for both regardless of teardown outcome — neither holds a concurrency slot.
+      expect(enginesOf().has('good')).toBe(false);
+      expect(enginesOf().has('bad')).toBe(false);
+      expect(result.failed).toEqual([]); // teardown failures are isolated, not surfaced as failed
+      expect(result.stopped.sort()).toEqual(['bad', 'good']);
+    });
+
+    it('is a bounded no-op for an empty id list', async () => {
+      const result = await service.stopOrphanEngines([]);
+      expect(result).toEqual({ stopped: [], notRunning: [], failed: [] });
+    });
+
+    it('cancels an in-flight reconnect for each orphan before teardown', async () => {
+      const engine = { destroy: jest.fn().mockResolvedValue(undefined) };
+      enginesOf().set('g1', engine);
+      const reconnectStates = (
+        service as unknown as {
+          reconnectStates: Map<string, unknown>;
+        }
+      ).reconnectStates;
+      reconnectStates.set('g1', { timer: null }); // exercise the cancelReconnect path
+
+      await service.stopOrphanEngines(['g1']);
+
+      expect(reconnectStates.has('g1')).toBe(false);
     });
   });
 
@@ -814,6 +922,48 @@ describe('SessionService', () => {
       // maxAttempts:0 means auto-reconnect is OFF, not that 0 attempts were tried and failed.
       expect(i.sessionErrors.get('sess-uuid-1')).toMatch(/auto-reconnect is disabled/i);
     });
+
+    it('evicts the dead engine when the max-attempts budget is exhausted (no leaked slot, restart works)', async () => {
+      // A terminal FAILED session must not hold an engine entry — otherwise isActive() stays true,
+      // the concurrency cap leaks a slot, and a later start() rejects the session as "already started".
+      // This mirrors onError's terminal path, which evicts for exactly that reason.
+      const i = service as unknown as {
+        reconnectStates: Map<string, { attempts: number; timer: null; maxAttempts: number; baseDelay: number }>;
+        sessionErrors: Map<string, string>;
+        engines: Map<string, { forceDestroy: jest.Mock }>;
+        scheduleReconnect: (id: string, session: Session) => void;
+      };
+      const deadEngine = { forceDestroy: jest.fn().mockResolvedValue(undefined) };
+      i.engines.set('sess-uuid-1', deadEngine);
+      i.reconnectStates.set('sess-uuid-1', { attempts: 2, timer: null, maxAttempts: 2, baseDelay: 5000 });
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      expect(service.isActive('sess-uuid-1')).toBe(true);
+
+      i.scheduleReconnect('sess-uuid-1', createMockSession());
+      await new Promise(resolve => setImmediate(resolve));
+
+      // The dead engine is evicted and force-destroyed; the session no longer counts as active.
+      expect(service.isActive('sess-uuid-1')).toBe(false);
+      expect(deadEngine.forceDestroy).toHaveBeenCalledTimes(1);
+      expect(i.sessionErrors.get('sess-uuid-1')).toMatch(/reconnection failed after 2 attempts/i);
+    });
+
+    it('does not throw when the engine was already evicted (executeReconnect-catch path)', () => {
+      // executeReconnect evicts the half-built engine before scheduling a reconnect, so by the time
+      // the maxAttempts branch runs there the engine is gone. The eviction guard must handle that.
+      const i = service as unknown as {
+        reconnectStates: Map<string, { attempts: number; timer: null; maxAttempts: number; baseDelay: number }>;
+        sessionErrors: Map<string, string>;
+        engines: Map<string, unknown>;
+        scheduleReconnect: (id: string, session: Session) => void;
+      };
+      i.reconnectStates.set('sess-uuid-1', { attempts: 0, timer: null, maxAttempts: 0, baseDelay: 5000 });
+      expect(i.engines.has('sess-uuid-1')).toBe(false);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      expect(() => i.scheduleReconnect('sess-uuid-1', createMockSession())).not.toThrow();
+    });
   });
 
   describe('scheduleReconnect (reconnect policy)', () => {
@@ -1097,6 +1247,8 @@ describe('SessionService', () => {
     it('tears down an engine created when a stop lands during init (post-init guard)', async () => {
       const i = internals();
       // Simulate a concurrent stop() during engine init: initialize() flips the teardown flag.
+      // The row itself survives a stop(), so the retirement must NOT purge the auth dirs.
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
       mockEngine.initialize.mockImplementation(() => {
         i.stoppingSessions.add('sess-uuid-1');
         return Promise.resolve();
@@ -1106,6 +1258,7 @@ describe('SessionService', () => {
 
       expect(mockEngine.destroy).toHaveBeenCalled();
       expect(i.engines.has('sess-uuid-1')).toBe(false);
+      expect(engineFactory.purgeSessionData).not.toHaveBeenCalled();
     });
 
     it('tears down an engine created when a delete lands during init (session row gone, mark cleared)', async () => {
@@ -1124,6 +1277,8 @@ describe('SessionService', () => {
 
       expect(mockEngine.destroy).toHaveBeenCalled();
       expect(i.engines.has('sess-uuid-1')).toBe(false);
+      // delete() purged BEFORE this re-init re-created the auth dir — the guard purges a second time.
+      expect(engineFactory.purgeSessionData).toHaveBeenCalledWith('test-session');
     });
 
     it('still re-initializes when the old engine destroy() hangs (time-bounded teardown)', async () => {
@@ -1822,6 +1977,35 @@ describe('SessionService', () => {
       expect(row.metadata).toEqual({ media: marker });
     });
 
+    it('persists the group participant as author (the stable sender id attribution keys on)', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      // Pass the message through the hook chain untouched (the default mock replaces data with {}).
+      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'wa-grp-1',
+          from: '120363@g.us',
+          to: 'me@c.us',
+          chatId: '120363@g.us',
+          fromMe: false,
+          isGroup: true,
+          kind: 'group',
+          author: '628111@c.us',
+          contact: { id: '628111@c.us', pushName: 'Alice' },
+        }),
+      );
+      await flush();
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const row = (messageRepository.create as jest.Mock).mock.calls[0][0] as Partial<Message>;
+      expect(row.author).toBe('628111@c.us');
+      expect(row.from).toBe('120363@g.us');
+      expect(row.chatName).toBe('Alice');
+    });
+
     it('scopes the ack status UPDATE by sessionId, not just waMessageId', async () => {
       const callbacks = await startAndCaptureCallbacks();
       expect(typeof callbacks.onMessageAck).toBe('function');
@@ -2173,6 +2357,138 @@ describe('SessionService', () => {
       expect(dispatchedEvents('message.received')).toHaveLength(0);
     });
 
+    it('ingests an inbound status broadcast into the status store instead of dropping it', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (messageRepository.insert as jest.Mock).mockClear();
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(statusStore.ingest).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ waStatusId: 'st1', contactJid: '628111@c.us' }),
+      );
+      // Statuses never fall through to the messages table or the message.received webhook.
+      expect(messageRepository.insert).not.toHaveBeenCalled();
+      expect(dispatchedEvents('message.received')).toHaveLength(0);
+    });
+
+    it('dispatches status.received with the ingested row once ingest resolves with created=true', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (statusStore.ingest as jest.Mock).mockResolvedValueOnce({
+        created: true,
+        row: {
+          waStatusId: 'st1',
+          contactJid: '628111@c.us',
+          contactName: 'Alice',
+          type: 'text',
+          caption: 'hi',
+          mediaOmitted: false,
+          postedAt: 1000,
+          expiresAt: 1000 + 86400000,
+        },
+      });
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        'status.received',
+        expect.objectContaining({
+          statusId: 'st1',
+          contact: { id: '628111@c.us', name: 'Alice' },
+          type: 'text',
+          caption: 'hi',
+          hasMedia: false,
+          mediaOmitted: false,
+          postedAt: 1000,
+          expiresAt: 1000 + 86400000,
+        }),
+      );
+      // …and the same payload goes over the websocket so the dashboard refreshes live.
+      expect(eventsGateway.emitStatusReceived).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ statusId: 'st1', contact: { id: '628111@c.us', name: 'Alice' } }),
+      );
+    });
+
+    it('does not dispatch when the session is deleted mid-ingest', async () => {
+      // ingest() awaits (findOne + media write + save); a delete() completing in that window must
+      // stop the continuation before it webhooks/emits for a retired session — mirroring the
+      // message.received re-check above.
+      const callbacks = await startAndCaptureCallbacks();
+      const engines = (service as unknown as { engines: Map<string, unknown> }).engines;
+      (statusStore.ingest as jest.Mock).mockImplementationOnce(() => {
+        engines.delete('sess-uuid-1');
+        return Promise.resolve({ created: true, row: { waStatusId: 'st1', contactJid: '628111@c.us' } });
+      });
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(dispatchedEvents('status.received')).toHaveLength(0);
+      expect(eventsGateway.emitStatusReceived).not.toHaveBeenCalled();
+    });
+
+    it('does not dispatch status.received for a duplicate delivery (ingest resolves created=false)', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (statusStore.ingest as jest.Mock).mockResolvedValueOnce({
+        created: false,
+        row: { waStatusId: 'st1', contactJid: '628111@c.us' },
+      });
+
+      callbacks.onMessage!(
+        makeMessage({
+          id: 'st1',
+          from: 'status@broadcast',
+          to: 'me@c.us',
+          chatId: 'status@broadcast',
+          fromMe: false,
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+        }),
+      );
+      await flush();
+
+      expect(dispatchedEvents('status.received')).toHaveLength(0);
+      expect(eventsGateway.emitStatusReceived).not.toHaveBeenCalled();
+    });
+
     it('skips persist and dispatch for ephemeral messages when STORE_EPHEMERAL_MESSAGES=false', async () => {
       process.env.STORE_EPHEMERAL_MESSAGES = 'false';
       const callbacks = await startAndCaptureCallbacks();
@@ -2522,6 +2838,205 @@ describe('SessionService', () => {
       expect(auth[0][2]).toMatchObject({ sessionId: 'sess-uuid-1', phone: '628123', pushName: 'Alice' });
     });
 
+    it('seeds the status store from the status-broadcast chat history when the engine reports ready', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const nowSec = Math.floor(Date.now() / 1000);
+      mockEngine.getChatHistory.mockResolvedValue([
+        makeMessage({
+          id: 'st-a',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+          type: 'text',
+          body: 'hi',
+          timestamp: nowSec,
+          contact: { id: '628111@c.us', name: 'Alice', pushName: 'Ali' },
+        }),
+        makeMessage({
+          id: 'st-b',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628222@c.us',
+          kind: 'status',
+          type: 'image',
+          body: '',
+          timestamp: nowSec + 1,
+        }),
+        // Poster resolves to the shared pseudo-JID → buildIncomingStatus returns null → never ingested.
+        makeMessage({
+          id: 'st-self',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: 'status@broadcast',
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec + 2,
+        }),
+      ]);
+      // st-b's message carries no cached contact name; the seed resolves it via getContactById.
+      mockEngine.getContactById.mockImplementation((jid: string) =>
+        Promise.resolve(
+          jid === '628222@c.us'
+            ? {
+                id: '628222@c.us',
+                name: 'Bob',
+                pushName: 'Bobby',
+                number: '628222',
+                isMyContact: true,
+                isBlocked: false,
+              }
+            : null,
+        ),
+      );
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      // Reads the status-broadcast chat's own messages (with media), not the near-empty-at-ready
+      // getBroadcasts collection. Downloads are pre-gated at the store's 10 MB cap, not the looser
+      // global MEDIA_DOWNLOAD_MAX_BYTES — anything bigger would be discarded as over_cap on ingest.
+      expect(mockEngine.getChatHistory).toHaveBeenCalledWith('status@broadcast', 50, true, 10 * 1024 * 1024);
+      expect(mockEngine.getContactStatuses).not.toHaveBeenCalled();
+      // Two usable statuses ingested; the pseudo-JID poster is filtered out.
+      expect(statusStore.ingest).toHaveBeenCalledTimes(2);
+      expect(statusStore.ingest).toHaveBeenNthCalledWith(
+        1,
+        'sess-uuid-1',
+        expect.objectContaining({
+          waStatusId: 'st-a',
+          contactJid: '628111@c.us',
+          contactName: 'Alice',
+          contactPushName: 'Ali',
+          type: 'text',
+          caption: 'hi',
+          postedAt: nowSec * 1000,
+        }),
+      );
+      // st-b had no cached name, so the seed backfilled it from getContactById.
+      expect(statusStore.ingest).toHaveBeenNthCalledWith(
+        2,
+        'sess-uuid-1',
+        expect.objectContaining({
+          waStatusId: 'st-b',
+          contactJid: '628222@c.us',
+          type: 'image',
+          contactName: 'Bob',
+          contactPushName: 'Bobby',
+        }),
+      );
+      // The lookup runs only for the poster that lacked a name; st-a already had one.
+      expect(mockEngine.getContactById).toHaveBeenCalledWith('628222@c.us');
+      expect(mockEngine.getContactById).not.toHaveBeenCalledWith('628111@c.us');
+    });
+
+    it('seeds status media downloaded with the history so it renders like a live post', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const media = { mimetype: 'image/png', data: 'QUJD' };
+      mockEngine.getChatHistory.mockResolvedValue([
+        makeMessage({
+          id: 'st-c',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628333@c.us',
+          kind: 'status',
+          type: 'image',
+          body: '',
+          timestamp: Math.floor(Date.now() / 1000),
+          media,
+        }),
+      ]);
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(statusStore.ingest).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ waStatusId: 'st-c', media }),
+      );
+    });
+
+    it('skips the account’s own (fromMe) statuses and statuses older than 24h when seeding', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const nowSec = Math.floor(Date.now() / 1000);
+      mockEngine.getChatHistory.mockResolvedValue([
+        // Own active status echoed in the broadcast chat — mirrors the live path's fromMe drop.
+        makeMessage({
+          id: 'st-own',
+          from: 'me@c.us',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          fromMe: true,
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec,
+        }),
+        // 25 hours old — past the 24h TTL, gone from WhatsApp clients already.
+        makeMessage({
+          id: 'st-old',
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author: '628111@c.us',
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec - 25 * 60 * 60,
+        }),
+      ]);
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(statusStore.ingest).not.toHaveBeenCalled();
+    });
+
+    it('keeps seeding the remaining statuses when one item’s ingest fails', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      const nowSec = Math.floor(Date.now() / 1000);
+      const seedItem = (id: string, author: string) =>
+        makeMessage({
+          id,
+          from: 'status@broadcast',
+          chatId: 'status@broadcast',
+          isStatusBroadcast: true,
+          author,
+          kind: 'status',
+          type: 'text',
+          timestamp: nowSec,
+        });
+      mockEngine.getChatHistory.mockResolvedValue([
+        seedItem('st-fail', '628111@c.us'),
+        seedItem('st-ok', '628222@c.us'),
+      ]);
+      (statusStore.ingest as jest.Mock)
+        .mockRejectedValueOnce(new Error('database is locked'))
+        .mockResolvedValueOnce({ row: {}, created: true });
+
+      callbacks.onReady!('628123', 'Alice');
+      await flush();
+
+      expect(statusStore.ingest).toHaveBeenCalledTimes(2);
+      expect(statusStore.ingest).toHaveBeenNthCalledWith(
+        2,
+        'sess-uuid-1',
+        expect.objectContaining({ waStatusId: 'st-ok' }),
+      );
+    });
+
+    it('swallows a status-history failure on ready (e.g. Baileys has no status chat) without throwing', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      mockEngine.getChatHistory.mockRejectedValue(new Error('not supported'));
+
+      expect(() => callbacks.onReady!('628123', 'Alice')).not.toThrow();
+      await flush();
+
+      expect(statusStore.ingest).not.toHaveBeenCalled();
+    });
+
     it('dispatches session.disconnected with the reason when the engine disconnects', async () => {
       const callbacks = await startAndCaptureCallbacks();
       expect(typeof callbacks.onDisconnected).toBe('function');
@@ -2669,6 +3184,41 @@ describe('SessionService', () => {
         expect(qb.orIgnore).toHaveBeenCalled();
         expect(execute).toHaveBeenCalled();
         expect(messageRepository.save).not.toHaveBeenCalled(); // no longer the throwing path
+      });
+
+      it('persists author only for inbound history rows, never for the account’s own (fromMe) posts', async () => {
+        // The Baileys history sync includes the account's own group messages (with author = self);
+        // those must land with author NULL to keep the column's "null on outgoing" contract.
+        const callbacks = await startAndCaptureCallbacks();
+        const created: Array<Record<string, unknown>> = [];
+        (messageRepository.create as jest.Mock).mockImplementation((data: Record<string, unknown>) => {
+          created.push(data);
+          return { ...data };
+        });
+        (messageRepository.find as jest.Mock).mockResolvedValue([]); // nothing pre-seen
+
+        const histMsg = (over: Partial<IncomingMessage>): IncomingMessage => ({
+          id: 'h-x',
+          from: '120363@g.us',
+          to: 'me@c.us',
+          chatId: '120363@g.us',
+          body: 'g',
+          type: 'text',
+          timestamp: 1,
+          fromMe: false,
+          isGroup: true,
+          kind: 'group',
+          ...over,
+        });
+        callbacks.onHistoryMessages?.([
+          histMsg({ id: 'h-in', fromMe: false, author: '628111@c.us' }),
+          histMsg({ id: 'h-out', fromMe: true, author: '628999@c.us' }),
+        ]);
+        await flush();
+
+        const byId = new Map(created.map(r => [r.waMessageId as string, r]));
+        expect(byId.get('h-in')?.author).toBe('628111@c.us');
+        expect(byId.get('h-out')?.author).toBeUndefined();
       });
 
       it('synthesizes the omitted media marker for media-free history rows (no empty bubbles)', async () => {
@@ -3029,6 +3579,8 @@ describe('SessionService', () => {
       // The engine registered during init must be torn down + removed, not left READY.
       expect(mockEngine.destroy).toHaveBeenCalled();
       expect(service.getEngine('sess-uuid-1')).toBeUndefined();
+      // A stop() retirement must NOT purge: the row (and its credentials) is meant to survive.
+      expect(engineFactory.purgeSessionData).not.toHaveBeenCalled();
     });
 
     it('tears down the just-initialized engine if the session is deleted during start() (row gone, mark cleared)', async () => {
@@ -3049,6 +3601,75 @@ describe('SessionService', () => {
 
       expect(mockEngine.destroy).toHaveBeenCalled();
       expect(service.getEngine('sess-uuid-1')).toBeUndefined();
+    });
+
+    it('re-purges the auth dirs when a start completes after its row was deleted (init re-created them)', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      // delete() runs its purge BEFORE this start's init resolves; the init re-creates the auth dir
+      // (both engines mkdir at init), so the retirement guard must purge a second time — keyed by
+      // session NAME, same as delete()'s purge — or the race leaves credentials behind.
+      mockEngine.initialize.mockImplementationOnce(() => {
+        (repository.findOne as jest.Mock).mockResolvedValue(null);
+        return Promise.resolve();
+      });
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow(NotFoundException);
+
+      expect(mockEngine.destroy).toHaveBeenCalled();
+      expect(engineFactory.purgeSessionData).toHaveBeenCalledWith('test-session');
+    });
+
+    it('emits no QR/status event for the retired engine once the post-init guard has run', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      mockEngine.initialize.mockImplementationOnce(() => {
+        (repository.findOne as jest.Mock).mockResolvedValue(null);
+        return Promise.resolve();
+      });
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow(NotFoundException);
+
+      // The guard evicted the engine from the live map, so a late engine callback must no-op.
+      const callbacks = (mockEngine.initialize.mock.calls as [EngineEventCallbacks][])[0][0];
+      callbacks.onQRCode?.('qr-after-retire');
+      expect(eventsGateway.emitQRCode).not.toHaveBeenCalled();
+      expect(webhookService.dispatch).not.toHaveBeenCalledWith('sess-uuid-1', 'session.qr', expect.anything());
+    });
+
+    it('does not re-purge when the same name was re-created under a new id mid-race (the new row owns the dirs)', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      // delete(old id) + create(same name) land during init: the old row is gone but a NEW row now
+      // owns the name — purging would wipe the fresh session's auth dir, so the guard must skip it.
+      mockEngine.initialize.mockImplementationOnce(() => {
+        (repository.findOne as jest.Mock).mockImplementation(({ where }: { where: { id?: string; name?: string } }) => {
+          if (where.name === 'test-session') return Promise.resolve(createMockSession({ id: 'sess-uuid-2' }));
+          return Promise.resolve(null);
+        });
+        return Promise.resolve();
+      });
+
+      await expect(service.start('sess-uuid-1')).rejects.toThrow(NotFoundException);
+
+      expect(mockEngine.destroy).toHaveBeenCalled();
+      expect(engineFactory.purgeSessionData).not.toHaveBeenCalled();
+    });
+
+    it('does not purge anything on a normal start (session row present throughout)', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+
+      await service.start('sess-uuid-1');
+
+      expect(service.getEngine('sess-uuid-1')).toBeDefined();
+      expect(engineFactory.purgeSessionData).not.toHaveBeenCalled();
     });
   });
 

@@ -117,6 +117,91 @@ describe('configuration — plugin download cap is fail-safe', () => {
   });
 });
 
+describe('configuration — status media cap is fail-safe', () => {
+  const orig = process.env.STATUS_MEDIA_MAX_BYTES;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.STATUS_MEDIA_MAX_BYTES;
+    else process.env.STATUS_MEDIA_MAX_BYTES = orig;
+  });
+
+  it('uses the env value when it is a valid positive integer', () => {
+    process.env.STATUS_MEDIA_MAX_BYTES = '2097152';
+    expect(configuration().status.mediaMaxBytes).toBe(2097152);
+  });
+
+  it('falls back to the 10 MiB default when unset, empty, non-numeric, or non-positive', () => {
+    delete process.env.STATUS_MEDIA_MAX_BYTES;
+    expect(configuration().status.mediaMaxBytes).toBe(10 * 1024 * 1024);
+    // A non-positive value must NOT disable the per-file cap — it falls back to the default.
+    for (const bad of ['', 'abc', '0', '-5']) {
+      process.env.STATUS_MEDIA_MAX_BYTES = bad;
+      expect(configuration().status.mediaMaxBytes).toBe(10 * 1024 * 1024);
+    }
+  });
+});
+
+describe('configuration — in-flight body budget', () => {
+  const keys = ['INFLIGHT_BODY_BUDGET_BYTES', 'BODY_SIZE_LIMIT'];
+  const orig: Record<string, string | undefined> = {};
+  beforeEach(() => keys.forEach(k => (orig[k] = process.env[k])));
+  afterEach(() =>
+    keys.forEach(k => {
+      if (orig[k] === undefined) delete process.env[k];
+      else process.env[k] = orig[k];
+    }),
+  );
+
+  it('defaults to 4 × the per-request body cap and scales with BODY_SIZE_LIMIT', () => {
+    keys.forEach(k => delete process.env[k]);
+    expect(configuration().http.inflightBodyBudgetBytes).toBe(100 * 1024 * 1024);
+    process.env.BODY_SIZE_LIMIT = '5mb';
+    expect(configuration().http.inflightBodyBudgetBytes).toBe(20 * 1024 * 1024);
+  });
+
+  it('honors an explicit INFLIGHT_BODY_BUDGET_BYTES override', () => {
+    process.env.INFLIGHT_BODY_BUDGET_BYTES = '52428800';
+    expect(configuration().http.inflightBodyBudgetBytes).toBe(52428800);
+  });
+});
+
+describe('configuration — webhook fan-out knobs are fail-safe', () => {
+  const keys = ['WEBHOOK_MAX_PER_SESSION', 'WEBHOOK_MEDIA_INLINE_MAX_BYTES'];
+  const orig: Record<string, string | undefined> = {};
+  beforeEach(() => keys.forEach(k => (orig[k] = process.env[k])));
+  afterEach(() =>
+    keys.forEach(k => {
+      if (orig[k] === undefined) delete process.env[k];
+      else process.env[k] = orig[k];
+    }),
+  );
+
+  it('defaults: 16 webhooks per session, 1 MiB inline media', () => {
+    keys.forEach(k => delete process.env[k]);
+    expect(configuration().webhook.maxPerSession).toBe(16);
+    expect(configuration().webhook.mediaInlineMaxBytes).toBe(1024 * 1024);
+  });
+
+  it('honors valid non-negative overrides (0 = cap disabled / never inline)', () => {
+    process.env.WEBHOOK_MAX_PER_SESSION = '0';
+    process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES = '0';
+    expect(configuration().webhook.maxPerSession).toBe(0);
+    expect(configuration().webhook.mediaInlineMaxBytes).toBe(0);
+    process.env.WEBHOOK_MAX_PER_SESSION = '32';
+    process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES = '262144';
+    expect(configuration().webhook.maxPerSession).toBe(32);
+    expect(configuration().webhook.mediaInlineMaxBytes).toBe(262144);
+  });
+
+  it('falls back to the defaults on garbage or negative values (never silently unlimited)', () => {
+    for (const bad of ['', 'abc', '-1']) {
+      process.env.WEBHOOK_MAX_PER_SESSION = bad;
+      process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES = bad;
+      expect(configuration().webhook.maxPerSession).toBe(16);
+      expect(configuration().webhook.mediaInlineMaxBytes).toBe(1024 * 1024);
+    }
+  });
+});
+
 describe('configuration search namespace', () => {
   // Save/restore the SEARCH_* env vars so a CI .env that sets them cannot flake the default-value
   // assertions below (mirrors the mutate-and-restore pattern used for PLUGIN_DOWNLOAD_MAX_BYTES etc.).
@@ -134,5 +219,22 @@ describe('configuration search namespace', () => {
     keys.forEach(k => delete process.env[k]);
     const cfg = configuration();
     expect(cfg.search).toEqual({ enabled: true, provider: 'auto', limitMax: 100 });
+  });
+});
+
+describe('configuration stats namespace', () => {
+  const orig = process.env.STATS_CACHE_TTL_MS;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.STATS_CACHE_TTL_MS;
+    else process.env.STATS_CACHE_TTL_MS = orig;
+  });
+
+  it('exposes stats memo defaults and parses STATS_CACHE_TTL_MS (0 disables the memo)', () => {
+    delete process.env.STATS_CACHE_TTL_MS;
+    expect(configuration().stats.cacheTtlMs).toBe(30000);
+    process.env.STATS_CACHE_TTL_MS = '0';
+    expect(configuration().stats.cacheTtlMs).toBe(0);
+    process.env.STATS_CACHE_TTL_MS = '60000';
+    expect(configuration().stats.cacheTtlMs).toBe(60000);
   });
 });

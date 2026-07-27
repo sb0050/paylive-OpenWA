@@ -125,7 +125,7 @@ For any deployment where ethical, legal, or regulatory compliance matters (healt
 | Proxy Support       | ✅     | Per-session proxy configuration    |
 | Rate Limiting       | ✅     | Configurable request limits        |
 | CIDR Whitelisting   | ✅     | IP-based access control            |
-| Audit Logging       | ✅     | Track all API operations           |
+| Audit Logging       | ✅     | Audit trail for API-key, session, integration-instance, and infra admin operations (message sends and webhook deliveries are tracked in their own tables, not the audit log) |
 
 ### Infrastructure
 
@@ -199,7 +199,7 @@ The production stack never exposes `/var/run/docker.sock` directly to the applic
 openwa-api  ──TCP 2375──▶  docker-proxy  ──unix──▶  /var/run/docker.sock
 ```
 
-Only the operations needed for container orchestration are enabled (`CONTAINERS`, `IMAGES`, `VOLUMES`, `INFO`, `PING`, `POST`, `DELETE`). The application connects via the `DOCKER_HOST=tcp://docker-proxy:2375` environment variable, which `DockerService` detects automatically.
+Only the operations needed for container orchestration are enabled (`CONTAINERS`, `IMAGES`, `VOLUMES`, `INFO`, `PING`, plus the `POST` method switch). The application connects via the `DOCKER_HOST=tcp://docker-proxy:2375` environment variable, which `DockerService` detects automatically. Note this is an operational gateway, not a fine-grained privilege boundary: with `POST` enabled the proxy admits every method to the enabled paths and cannot scope container-create payloads, so a compromised API container would be host-root-equivalent — see `SECURITY.md` for the full threat model, mitigations, and how to disable the proxy if you don't use the built-in datastore orchestration.
 
 ### Non-root Container Execution
 

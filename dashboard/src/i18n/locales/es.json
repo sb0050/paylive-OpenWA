@@ -84,7 +84,8 @@
     "loadingChats": "Cargando chats...",
     "empty": "Sin chats",
     "noMessageYet": "Aún sin mensajes",
-    "unreadBadge": "{{count}} mensajes sin leer",
+    "unreadBadge": "{{count}} mensaje sin leer",
+    "unreadBadge_other": "{{count}} mensajes sin leer",
     "loadingMessages": "Cargando mensajes...",
     "noMessagesInChat": "Aún no hay mensajes. ¡Envía el primero para empezar!",
     "downloadDocument": "Descargar documento",
@@ -123,14 +124,32 @@
       "status": "Estado"
     },
     "status": {
-      "placeholderTitle": "Estado",
-      "placeholderDesc": "Las actualizaciones de estado por contacto llegarán en una futura actualización."
+      "itemCount": "{{count}} actualización",
+      "itemCount_other": "{{count}} actualizaciones",
+      "empty": "Ningún contacto tiene un estado activo.",
+      "loadError": "No se pudieron cargar los estados.",
+      "mediaUnavailable": "Contenido multimedia no disponible",
+      "compose": "Publicar un estado",
+      "composeText": "Texto",
+      "composeImage": "Imagen",
+      "recipients": "Quién puede ver esto",
+      "recipientsHint": "Baileys requiere una lista de destinatarios; whatsapp-web.js usa tu audiencia de privacidad de estado.",
+      "noContacts": "No se encontraron contactos",
+      "caption": "Leyenda",
+      "backgroundColor": "Color de fondo",
+      "font": "Fuente",
+      "fontDefault": "Predeterminada",
+      "orLabel": "o",
+      "post": "Publicar",
+      "posted": "Estado publicado",
+      "postFailed": "No se pudo publicar el estado"
     },
     "channels": {
       "notSupported": "Los canales no son compatibles con el motor Baileys.",
       "empty": "Aún no estás suscrito a ningún canal.",
       "notReady": "La sesión aún no está lista.",
-      "subscribers": "{{count}} suscriptores"
+      "subscribers": "{{count}} suscriptor",
+      "subscribers_other": "{{count}} suscriptores"
     },
     "errors": {
       "loadSessions": "Error al cargar las sesiones",
@@ -208,7 +227,9 @@
     "connecting": "Conectando...",
     "qr_ready": "Escanear QR",
     "ready": "Conectada",
-    "disconnected": "Desconectada"
+    "disconnected": "Desconectada",
+    "failed": "Fallida",
+    "authenticating": "Autenticando..."
   },
   "sessions": {
     "title": "Sesiones",
@@ -338,6 +359,7 @@
       "title": "Filtros (opcional)",
       "hint": "Activar solo cuando se cumplan todas las condiciones. Se aplica a eventos de mensajes.",
       "badge": "{{count}} filtro",
+      "badge_other": "{{count}} filtros",
       "addCondition": "Añadir condición",
       "removeCondition": "Eliminar condición",
       "caseSensitive": "Distinguir mayúsculas",
@@ -773,7 +795,12 @@
       "title": "Instalar un plugin",
       "hint": "Sube un plugin empaquetado como un .zip (con un manifest.json). Se ejecuta en modo aislado una vez habilitado.",
       "choose": "Elige un archivo .zip…",
-      "tooLarge": "El archivo supera el límite de 5 MB."
+      "tooLarge": "El archivo supera el límite de 5 MB.",
+      "catalogHint": "Instala directamente desde el catálogo de plugins de OpenWA. El .zip se obtiene en el servidor a través de la protección SSRF, luego se valida y se ejecuta en sandbox.",
+      "catalogTeaser": "¿Buscas plugins?",
+      "catalogTeaserSuffix": "explora el marketplace oficial.",
+      "tabCatalog": "Catálogo",
+      "tabUpload": "Subir .zip"
     },
     "toasts": {
       "errorTitle": "Error de plugin",
@@ -791,7 +818,8 @@
       "enableFailedTitle": "Error al activar",
       "disableFailedTitle": "Error al desactivar",
       "configRequiredTitle": "Configuración requerida",
-      "configRequiredDesc": "Completa los campos obligatorios antes de activar: {{fields}}"
+      "configRequiredDesc": "Completa los campos obligatorios antes de activar: {{fields}}",
+      "updateFailed": "Error al actualizar"
     },
     "sessions": {
       "activationTitle": "Ejecutar para",
@@ -870,6 +898,17 @@
         "secretRegenerated": "Secreto regenerado",
         "actionFailed": "La acción falló"
       }
+    },
+    "catalog": {
+      "empty": "No hay plugins en el catálogo.",
+      "install": "Instalar",
+      "installed": "Instalado",
+      "noDownload": "Esta entrada del catálogo no tiene URL de descarga.",
+      "noMatch": "Ningún plugin coincide con tu búsqueda.",
+      "searchPlaceholder": "Buscar plugins…",
+      "update": "Actualizar",
+      "updateAvailable": "Actualización disponible",
+      "updated": "Plugin actualizado"
     }
   },
   "search": {

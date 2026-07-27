@@ -25,6 +25,7 @@ import {
   Group,
   GroupInfo,
   GroupParticipant,
+  ParticipantOperationResult,
   LocationInput,
   PollInput,
   ContactCard,
@@ -62,6 +63,7 @@ import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.
 import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import {
   GroupChat,
@@ -76,6 +78,7 @@ import { buildEditedMessage, buildIncomingMessageBase, mapContactFields } from '
 import { buildVCard } from './vcard';
 import {
   capInboundMedia,
+  chatHistoryMediaBudgetBytes,
   coerceDeclaredSize,
   inboundMediaConcurrency,
   inboundMediaMaxBytes,
@@ -168,6 +171,22 @@ export function extractWwebjsCall(msg: Message): { video: boolean; missed: boole
   if ((msg.type as string) !== 'call_log') return undefined;
   const d = (msg as unknown as { _data?: { isVideoCall?: boolean; callDuration?: number } })._data ?? {};
   return { video: Boolean(d.isVideoCall), missed: !msg.fromMe && !d.callDuration };
+}
+
+/**
+ * The `media` envelope for a message whose blob is not downloaded: keeps the sender-declared metadata
+ * so the `media` field stays present (n8n/dashboard contract) while carrying the `omitted` marker
+ * instead of base64. Used when downloads are disabled, the size pre-gate trips, the aggregate history
+ * budget is spent, or the download fails/times out.
+ */
+function declaredOnlyMedia(msg: Message): IncomingMessage['media'] {
+  const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
+  return {
+    mimetype: data?.mimetype ?? '',
+    filename: data?.filename || undefined,
+    omitted: true,
+    sizeBytes: coerceDeclaredSize(data?.size),
+  };
 }
 
 /**
@@ -365,30 +384,23 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * on the sender-declared size and skip the download entirely when it exceeds the cap, and (2) run the
    * download through the concurrency limiter for backpressure. Returns undefined when there's no media.
    */
-  private async capInboundMediaFor(msg: Message): Promise<IncomingMessage['media'] | undefined> {
+  private async capInboundMediaFor(
+    msg: Message,
+    maxBytesOverride?: number,
+  ): Promise<IncomingMessage['media'] | undefined> {
     if (!isMediaDownloadEnabled()) {
-      const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
-      return {
-        mimetype: data?.mimetype ?? '',
-        filename: data?.filename || undefined,
-        omitted: true,
-        sizeBytes: coerceDeclaredSize(data?.size),
-      };
+      return declaredOnlyMedia(msg);
     }
-    const maxBytes = inboundMediaMaxBytes();
+    const maxBytes = maxBytesOverride ?? inboundMediaMaxBytes();
     const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
     const declared = coerceDeclaredSize(data?.size);
     if (declared > maxBytes) {
-      this.logger.warn('Inbound media declared size exceeds MEDIA_DOWNLOAD_MAX_BYTES; skipped download', {
+      this.logger.warn('Inbound media declared size exceeds the cap; skipped download', {
         msgId: msg.id._serialized,
         sizeBytes: declared,
+        maxBytes,
       });
-      return {
-        mimetype: data?.mimetype ?? '',
-        filename: data?.filename || undefined,
-        omitted: true,
-        sizeBytes: declared,
-      };
+      return declaredOnlyMedia(msg);
     }
     // msg.downloadMedia() can't be aborted, so freeing the slot the moment the wall-clock deadline fires
     // would admit a fresh download while the abandoned one is still materialising in heap — letting the
@@ -431,12 +443,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     });
     const media = await boundedReady;
     if (!media) {
-      return {
-        mimetype: data?.mimetype ?? '',
-        filename: data?.filename || undefined,
-        omitted: true,
-        sizeBytes: declared,
-      };
+      return declaredOnlyMedia(msg);
     }
     const capped = capInboundMedia({
       mimetype: media.mimetype,
@@ -498,8 +505,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // output later (after a hard kill of the OpenWA process orphaned them).
       puppeteerArgs.push(`--openwa-session=${this.config.sessionId}`);
 
-      // Pin the WA-Web version when configured (fixes the 1.34.x "stuck at authenticating"
-      // hang on some setups, #251). Opt-in: unset leaves whatsapp-web.js to auto-select.
+      // Pin the WA-Web version (fixes the 1.34.x "stuck at authenticating" hang on some setups,
+      // #251/#488). DEFAULT: auto-resolve a settled build from the wa-version registry and pin its
+      // remote HTML (no integrity check — resolveWebVersionPin logs a loud warning); only
+      // WWEBJS_WEB_VERSION=off leaves whatsapp-web.js to use the first-party build from WhatsApp.
       const versionPin = await resolveWebVersionPin();
       if (this.tearingDown) {
         this.setStatus(EngineStatus.DISCONNECTED);
@@ -1008,6 +1017,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private static readonly PAGE_TRANSPORT_ERROR_PATTERN =
     /protocol error|target closed|targetclosederror|detached frame|session closed|connection closed/i;
 
+  /** Whether the error carries a dead page/transport signature (see PAGE_TRANSPORT_ERROR_PATTERN). */
+  private isPageTransportError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return WhatsAppWebJsAdapter.PAGE_TRANSPORT_ERROR_PATTERN.test(message);
+  }
+
   /**
    * Report a failed client/page operation as a session death when the error matches
    * PAGE_TRANSPORT_ERROR_PATTERN. A wedged page can fire NO events while still reporting CONNECTED
@@ -1017,12 +1032,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * handlePuppeteerDeath's guard makes this safe during teardown and against double-reporting.
    */
   private reportIfPageTransportError(error: unknown, context: string): void {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!WhatsAppWebJsAdapter.PAGE_TRANSPORT_ERROR_PATTERN.test(message)) {
+    if (!this.isPageTransportError(error)) {
       return;
     }
     this.logger.warn(`Page transport error during ${context} — treating the session as dead`, {
-      error: message,
+      error: error instanceof Error ? error.message : String(error),
     });
     this.handlePuppeteerDeath(`Page transport error during ${context}`);
   }
@@ -1164,14 +1178,18 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           else resolve(stdout);
         });
       });
+      // Token-exact marker match: the marker is a single argv token, so it must appear delimited by
+      // whitespace or string boundaries. A plain substring test would let restarting session
+      // `sales` SIGKILL the LIVE browser of sibling `sales2` (their markers share a prefix).
       const marker = `--openwa-session=${this.config.sessionId}`;
+      const markerRe = new RegExp('(?:^|\\s)' + marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?=\\s|$)');
       const killedPids: number[] = [];
       for (const line of psOutput.split('\n')) {
         const match = /^\s*(\d+)\s+(.*)$/.exec(line);
         if (!match) continue;
         const pid = Number(match[1]);
         const args = match[2];
-        if (pid === process.pid || !args.includes(marker)) continue;
+        if (pid === process.pid || !markerRe.test(args)) continue;
         // Never kill a non-browser process that happens to carry the marker string
         // (e.g. a `grep --openwa-session=…` probing the process table).
         if (!/chrome|chromium|headless/i.test(args)) continue;
@@ -1799,6 +1817,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
       };
     } catch (error) {
+      // A dead page and a genuinely-missing group both land in this catch; only the second may
+      // become null (→ service 404). A transport death surfaced as "group not found" sends
+      // operators debugging the wrong layer — report it and answer 503 instead.
+      if (this.isPageTransportError(error)) {
+        this.reportIfPageTransportError(error, 'getGroupInfo');
+        throw new EngineTransportError(`Transport died while reading group ${groupId}`);
+      }
       this.logger.warn(`Failed to get group: ${groupId}`, { error: String(error) });
       return null;
     }
@@ -1831,44 +1856,88 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     };
   }
 
-  async addParticipants(groupId: string, participants: string[]): Promise<void> {
+  async addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
     this.ensureReady();
     const chat = await this.client!.getChatById(groupId);
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
     const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).addParticipants(participantIds);
+    const raw = await (chat as unknown as GroupChat).addParticipants(participantIds);
+    // whatsapp-web.js reports a batch-level refusal (no admin rights, empty group) by RESOLVING a
+    // plain reason string (GroupChat.js:106-107,128-130) instead of throwing — surface it as a
+    // refusal, not a success.
+    if (typeof raw === 'string') {
+      throw new EngineRefusedError(raw);
+    }
+    // Per-participant outcome: code 200 = added; 403 invite-only / 404 not registered / 408
+    // recently left / 409 already a member / 419 group full (GroupChat.js:102-116).
+    const results: ParticipantOperationResult[] = Object.entries(raw ?? {}).map(([id, r]) => ({
+      id,
+      success: r.code === 200,
+      status: r.code,
+      message: r.message || undefined,
+    }));
+    return this.assertParticipantResults('addParticipants', groupId, results);
   }
 
-  async removeParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).removeParticipants(participantIds);
+  async removeParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runStatusOnlyParticipantOp('removeParticipants', groupId, participants);
   }
 
-  async promoteParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).promoteParticipants(participantIds);
+  async promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runStatusOnlyParticipantOp('promoteParticipants', groupId, participants);
   }
 
-  async demoteParticipants(groupId: string, participants: string[]): Promise<void> {
+  async demoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runStatusOnlyParticipantOp('demoteParticipants', groupId, participants);
+  }
+
+  /**
+   * whatsapp-web.js remove/promote/demote resolve `{status: 200}` for the whole batch and reject on
+   * a page-side failure (GroupChat.js:267-298,305-340,343-374) — there is no per-participant
+   * breakdown to map. A non-200 status is a batch refusal; a 200 confirms the batch, so report one
+   * success entry per requested participant rather than discarding the outcome.
+   */
+  private async runStatusOnlyParticipantOp(
+    op: 'removeParticipants' | 'promoteParticipants' | 'demoteParticipants',
+    groupId: string,
+    participants: string[],
+  ): Promise<ParticipantOperationResult[]> {
     this.ensureReady();
     const chat = await this.client!.getChatById(groupId);
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
     const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).demoteParticipants(participantIds);
+    const res = await (chat as unknown as GroupChat)[op](participantIds);
+    if (res?.status !== 200) {
+      throw new EngineRefusedError(`${op} refused for group ${groupId} (status ${res?.status ?? 'unknown'})`);
+    }
+    return participantIds.map(id => ({ id, success: true, status: 200 }));
+  }
+
+  /**
+   * Shared gate for the membership writes: a result list with at least one success resolves as-is
+   * (partial refusals stay visible per participant); a batch that failed for EVERY requested
+   * participant is a refusal of the operation itself (HTTP 403), not a per-participant detail; and
+   * an empty result is no evidence of success at all.
+   */
+  private assertParticipantResults(
+    op: string,
+    groupId: string,
+    results: ParticipantOperationResult[],
+  ): ParticipantOperationResult[] {
+    if (results.length === 0) {
+      throw new EngineRefusedError(`${op} returned no per-participant outcome for group ${groupId}`);
+    }
+    if (results.every(r => !r.success)) {
+      const detail = results.map(r => `${r.id} (${r.status ?? '?'})`).join(', ');
+      throw new EngineRefusedError(
+        `${op} failed for all ${results.length} participant(s) in group ${groupId}: ${detail}`,
+      );
+    }
+    return results;
   }
 
   async leaveGroup(groupId: string): Promise<void> {
@@ -1886,7 +1955,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
-    await (chat as unknown as GroupChat).setSubject(subject);
+    // GroupChat.setSubject resolves false when WA Web rejects the change (e.g. the account lacks
+    // admin rights; index.d.ts:1982) instead of throwing — surface the refusal, not a false success.
+    const ok = await (chat as unknown as GroupChat).setSubject(subject);
+    if (!ok) {
+      throw new EngineRefusedError(`Failed to set the subject for group ${groupId} — admin rights required`);
+    }
   }
 
   async setGroupDescription(groupId: string, description: string): Promise<void> {
@@ -1895,7 +1969,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
-    await (chat as unknown as GroupChat).setDescription(description);
+    // Same discarded-boolean contract as setSubject (index.d.ts:1984).
+    const ok = await (chat as unknown as GroupChat).setDescription(description);
+    if (!ok) {
+      throw new EngineRefusedError(`Failed to set the description for group ${groupId} — admin rights required`);
+    }
   }
 
   // Reactions (Phase 3)
@@ -2066,20 +2144,27 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return channels.find(c => c.id === channelId) ?? null;
   }
 
-  async subscribeToChannel(inviteCode: string): Promise<Channel> {
+  // whatsapp-web.js `Client.subscribeToChannel(channelId)` takes a channel ID and resolves a
+  // boolean (index.d.ts:71; Client.js:2533) — the interface contract here is subscribe-by-INVITE-CODE
+  // returning the subscribed Channel. The old wiring passed the invite code straight in and mapped
+  // the returned boolean as if it were a Channel, fabricating `{ id: "undefined" }`: a reported
+  // success that never subscribed anything. A real wiring is the two-step
+  // `getChannelByInviteCode(inviteCode)` (Client.js:1707) → `subscribeToChannel(channel.id)` flow;
+  // until that is verified against a live session, an honest 501 beats a phantom success.
+  // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
+  async subscribeToChannel(_inviteCode: string): Promise<Channel> {
     this.ensureReady();
-    const ch = await (this.client as unknown as BusinessClient).subscribeToChannel(inviteCode);
-    this.logger.log(`Subscribed to channel with invite code: ${inviteCode}`);
-    return {
-      id: String(typeof ch.id === 'object' ? ch.id._serialized : ch.id),
-      name: String(ch.name || ''),
-      description: ch.description ? String(ch.description) : undefined,
-    };
+    throw new EngineNotSupportedError('subscribeToChannel');
   }
 
   async unsubscribeFromChannel(channelId: string): Promise<void> {
     this.ensureReady();
-    await (this.client as unknown as BusinessClient).unsubscribeFromChannel(channelId);
+    // Resolves false instead of throwing when the unsubscription did not complete (Client.js:2556)
+    // — surface the refusal rather than reporting a false success.
+    const ok = await (this.client as unknown as BusinessClient).unsubscribeFromChannel(channelId);
+    if (!ok) {
+      throw new EngineRefusedError(`Failed to unsubscribe from channel ${channelId}`);
+    }
     this.logger.log(`Unsubscribed from channel: ${channelId}`);
   }
 
@@ -2095,7 +2180,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!channel) {
       throw new ChannelNotFoundError(channelId);
     }
-    const messages = await channel.fetchMessages({ limit });
+    // wwebjs Channel.fetchMessages only honors a limit > 0: its load-earlier loop AND the final
+    // splice are both gated on `searchOptions.limit > 0` (Channel.js:352), so a 0/negative/NaN
+    // limit fails OPEN and returns every loaded message. Substitute the default instead.
+    const safeLimit = Number.isFinite(limit) && limit >= 1 ? Math.trunc(limit) : 50;
+    const messages = await channel.fetchMessages({ limit: safeLimit });
     return (messages ?? []).map(msg => ({
       // Read `$1` before the sentinel (#747), and don't `String()` the object branch: that turned an
       // unreadable id into the literal "undefined" rather than the empty sentinel every other path
@@ -2111,12 +2200,27 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   // ========== Gap Quick Wins Implementation ==========
 
-  async getChatHistory(chatId: string, limit: number = 50, includeMedia: boolean = false): Promise<IncomingMessage[]> {
+  async getChatHistory(
+    chatId: string,
+    limit: number = 50,
+    includeMedia: boolean = false,
+    mediaMaxBytes?: number,
+    signal?: AbortSignal,
+  ): Promise<IncomingMessage[]> {
     this.ensureReady();
     const chat = await this.client!.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit });
     const results: IncomingMessage[] = [];
+    // Aggregate base64 budget across the whole pass: the per-message cap bounds ONE blob, but without
+    // an aggregate bound a 100-message history could stack ~100 × 50 MiB into one response. Once the
+    // running total crosses the budget, later media messages get the declared-only `omitted` marker —
+    // no download — while everything already inlined stays inline (a small history is byte-identical
+    // to before). `signal` (client disconnect) stops the loop between messages; partials are returned.
+    let mediaBudget = includeMedia ? chatHistoryMediaBudgetBytes() : 0;
     for (const msg of messages) {
+      if (signal?.aborted) {
+        break;
+      }
       // Reuse the shared mapper so history messages carry the same author/contact
       // enrichment as live incoming messages (#223). The mapper defaults chatId to
       // msg.from, which is wrong here (history includes fromMe messages whose `from`
@@ -2149,12 +2253,23 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         }
       }
       if (includeMedia && msg.hasMedia) {
-        try {
-          // Same pre-gate + limiter as live media: a large historical blob shouldn't bloat the response/heap.
-          const capped = await this.capInboundMediaFor(msg);
-          if (capped) out.media = capped;
-        } catch (error) {
-          this.logger.warn(`Failed to download media for ${msg.id._serialized}: ${String(error)}`);
+        if (mediaBudget <= 0) {
+          out.media = declaredOnlyMedia(msg);
+        } else {
+          try {
+            // Same pre-gate + limiter as live media: a large historical blob shouldn't bloat the
+            // response/heap. Callers (the status seed) can tighten the cap below the global default.
+            const capped = await this.capInboundMediaFor(msg, mediaMaxBytes);
+            if (capped) {
+              out.media = capped;
+              // Only an inlined payload spends budget; an omitted marker carries no base64.
+              if (capped.data) {
+                mediaBudget -= capped.data.length;
+              }
+            }
+          } catch (error) {
+            this.logger.warn(`Failed to download media for ${msg.id._serialized}: ${String(error)}`);
+          }
         }
       }
       results.push(out);
@@ -2215,7 +2330,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       const url = await this.client!.getProfilePicUrl(contactId);
       return url || null;
     } catch (error) {
-      this.reportIfPageTransportError(error, 'getProfilePicture');
+      // Mirrors getGroupInfo: a dead page and a contact with no picture both land here, and only the
+      // second may become null (→ service: the contact simply has no avatar). A transport death
+      // surfaced as "no picture" sends operators debugging the wrong layer — report it and answer 503.
+      if (this.isPageTransportError(error)) {
+        this.reportIfPageTransportError(error, 'getProfilePicture');
+        throw new EngineTransportError(`Transport died while reading profile picture for ${contactId}`);
+      }
       this.logger.warn(`Failed to get profile picture for ${contactId}: ${String(error)}`);
       return null;
     }
@@ -2302,9 +2423,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       groupId = await this.client!.acceptInvite(inviteCode);
     } catch (error) {
       // A refused invite and a broken page both land here, and only the first is the caller's
-      // fault. Surface the transport case to the liveness path and keep the original error in the
-      // log: without it an upstream rename turns every join into an unexplained 400.
-      this.reportIfPageTransportError(error, 'joinGroupViaInviteCode');
+      // fault. A transport death must not be reported as "invalid invite" (400): report the death
+      // to the liveness path and answer 503 so the caller can tell the layers apart.
+      if (this.isPageTransportError(error)) {
+        this.reportIfPageTransportError(error, 'joinGroupViaInviteCode');
+        throw new EngineTransportError('Transport died while accepting the group invite');
+      }
       this.logger.warn(`Failed to accept group invite: ${String(error)}`);
       groupId = undefined;
     }
@@ -2403,6 +2527,16 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       };
       for (const msg of broadcast.msgs) {
         const ts = new Date(msg.timestamp * 1000);
+        // Reuse the same capped/limited/timeout-bounded inbound media download the live message path
+        // uses (capInboundMediaFor), so a seeded status renders identically to one that arrived live.
+        let media: IncomingMessage['media'];
+        if (msg.hasMedia) {
+          try {
+            media = await this.capInboundMediaFor(msg);
+          } catch (error) {
+            this.logger.warn(`Failed to download media for status ${msg.id._serialized}: ${String(error)}`);
+          }
+        }
         statuses.push({
           // `deleteStatus` takes this id as its revoke handle, so losing it to the rename makes a
           // listed status unactionable (#747). The contact id above is a Wid and is unaffected.
@@ -2410,6 +2544,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           contact: contactSummary,
           type: msg.type === MessageTypes.IMAGE ? 'image' : msg.type === MessageTypes.VIDEO ? 'video' : 'text',
           ...(msg.body ? { caption: msg.body } : {}),
+          ...(media ? { media } : {}),
           timestamp: ts,
           expiresAt: new Date(ts.getTime() + 24 * 3_600_000),
         });
@@ -2540,27 +2675,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   // ========== Catalog (Phase 3) ==========
+  // whatsapp-web.js has no Catalog API at all (no Client.getCatalog/getProducts/getProduct symbol in
+  // index.d.ts). These used to be phantom stubs — a warn log plus null/empty results — so the API
+  // reported "no catalog" / "no products" for a capability that never ran. Honest 501s instead,
+  // matching sendProduct/sendCatalog below.
 
   async getCatalog(): Promise<Catalog | null> {
     this.ensureReady();
-    // whatsapp-web.js doesn't have native Catalog API support
-    this.logger.warn('getCatalog not implemented in whatsapp-web.js adapter');
-    return null;
+    throw new EngineNotSupportedError('getCatalog');
   }
 
   async getProducts(_options?: ProductQueryOptions): Promise<PaginatedProducts> {
     this.ensureReady();
-    this.logger.warn('getProducts not implemented in whatsapp-web.js adapter');
-    return {
-      products: [],
-      pagination: { page: 1, limit: 20, total: 0, totalPages: 0 },
-    };
+    throw new EngineNotSupportedError('getProducts');
   }
 
   async getProduct(_productId: string): Promise<Product | null> {
     this.ensureReady();
-    this.logger.warn('getProduct not implemented in whatsapp-web.js adapter');
-    return null;
+    throw new EngineNotSupportedError('getProduct');
   }
 
   async sendProduct(_chatId: string, _productId: string, _body?: string): Promise<MessageResult> {

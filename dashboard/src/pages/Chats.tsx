@@ -19,6 +19,7 @@ import {
   CornerUpLeft,
   Trash2,
   ChevronDown,
+  Plus,
 } from 'lucide-react';
 import { useProfilePicture } from '../hooks/useProfilePicture';
 import { useProfilePictures } from '../hooks/useProfilePictures';
@@ -27,6 +28,7 @@ import { formatPhoneForDisplay } from '../utils/formatPhone';
 import {
   sessionApi,
   messageApi,
+  contactApi,
   asMessageType,
   type Session,
   type Chat,
@@ -34,27 +36,35 @@ import {
   type Channel,
   type MessageType,
   type SearchHit,
+  type ContactStatusGroup,
 } from '../services/api';
 import {
   applyMessageEdit,
   mergeDeliveryStatus,
   mergeOrAppend,
   findRevokedIndex,
+  senderKey,
   type ChatMessageView,
 } from '../utils/chatMessages';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useRole } from '../hooks/useRole';
 import { useToast } from '../components/Toast';
+import { Modal } from '../components/Modal';
 import { PageHeader } from '../components/PageHeader';
 import { GlobalSearch } from '../components/GlobalSearch';
 import { useChatMessages, useChatMessagesActions, messagesQueryKey } from '../hooks/useChatMessages';
 import { useChannelMessages } from '../hooks/useChannelMessages';
+import { useContactStatuses } from '../hooks/useContactStatuses';
 import { useChatScrollPosition } from '../hooks/useChatScrollPosition';
 import { useCurrentEngineQuery } from '../hooks/queries';
+import { createTrailingCoalescer } from '../utils/trailingCoalescer';
 import MessageBody from '../components/chats/MessageBody';
 import MediaLightbox, { type LightboxItem } from '../components/chats/MediaLightbox';
 import './Chats.css';
+
+// Quiet window for coalescing mark-as-read RPCs (see markReadCoalescer below).
+const MARK_READ_DEBOUNCE_MS = 750;
 
 type MessageMedia = { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
 
@@ -77,7 +87,20 @@ interface IncomingWsMessage {
   call?: { video: boolean; missed: boolean };
   metadata?: ChatMessageView['metadata'];
   kind?: ChatKind;
+  /** Group poster: `from` is the group JID, so `contact`/`author` identify who actually sent it. */
+  contact?: { id?: string; name?: string; pushName?: string };
+  author?: string;
 }
+
+// Stable per-sender colour for group message labels, like WhatsApp gives each participant a colour.
+// Hashed from the sender's name so the same person keeps the same colour across a session. The palette
+// is tuned to stay legible on both the light and dark incoming-bubble backgrounds.
+const SENDER_COLORS = ['#d1416f', '#7c5cff', '#0a86c4', '#1a8f5c', '#c26a00', '#c0392b', '#0e7c86', '#8e44ad'];
+const senderColor = (name: string): string => {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  return SENDER_COLORS[Math.abs(hash) % SENDER_COLORS.length];
+};
 
 // Map an attachment MIME type to the neutral MessageType for the optimistic outgoing bubble, so the
 // placeholder matches what the backend will persist (e.g. a PDF is `document`, not `application`).
@@ -121,11 +144,87 @@ function ChatAvatar({ pictureUrl, kind }: { pictureUrl?: string | null; kind: Ch
   );
 }
 
+// Status image item. <img src="/api/..."> can't carry the X-API-Key header, so the bytes are
+// fetched via sessionApi (which does) and re-exposed as a local object URL. The URL is revoked on
+// unmount/statusId change to avoid leaking blob memory as the viewer browses items.
+function StatusMedia({
+  sessionId,
+  statusId,
+  type,
+}: {
+  sessionId: string | null;
+  statusId: string;
+  type: 'image' | 'video';
+}) {
+  const { t } = useTranslation();
+  const [src, setSrc] = useState<string | null>(null);
+  const [error, setError] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!sessionId) return undefined;
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    setSrc(null);
+    setError(false);
+    sessionApi
+      .getStatusMediaBlob(sessionId, statusId)
+      .then(blob => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setSrc(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setError(true);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [sessionId, statusId]);
+
+  if (error) return <span className="status-media-placeholder">{t('chats.status.mediaUnavailable')}</span>;
+  if (!src) return null;
+  if (type === 'video') return <video className="channel-media" src={src} controls />;
+  return <img className="channel-media" src={src} alt="" />;
+}
+
+// Mirrors @ArrayMaxSize(256) on the send-status DTOs — the picker caps selection client-side so the
+// user can't build a list the backend is guaranteed to reject.
+const STATUS_RECIPIENTS_MAX = 256;
+
+// WhatsApp's text-status font slots — the current wire enum is {0,1,2,6,7,8,9,10} (6 is the bold
+// system face); 3–5 are legacy slots older clients still emit. Approximated with generic
+// families/weights since the actual faces are proprietary; slot 0 and unknown slots keep the UI
+// default.
+const STATUS_FONT: Record<number, { family?: string; weight?: number }> = {
+  1: { family: 'serif' },
+  2: { family: 'cursive' },
+  3: { family: 'fantasy' }, // legacy
+  4: { family: 'serif' }, // legacy
+  5: { family: 'ui-rounded, system-ui, sans-serif' }, // legacy
+  6: { weight: 700 },
+  7: { family: 'cursive' },
+  8: { family: 'serif' },
+  9: { family: 'sans-serif', weight: 800 },
+  10: { family: 'monospace', weight: 700 },
+};
+
+/** Inline style for a status item's font slot; {} when unstyled/unknown. */
+const statusFontStyle = (font?: number): { fontFamily?: string; fontWeight?: number } => {
+  if (font === undefined) return {};
+  const slot = STATUS_FONT[font];
+  if (!slot) return {};
+  return {
+    ...(slot.family ? { fontFamily: slot.family } : {}),
+    ...(slot.weight ? { fontWeight: slot.weight } : {}),
+  };
+};
+
 export function Chats() {
   const { t } = useTranslation();
   useDocumentTitle(t('nav.chats'));
   const { canWrite } = useRole();
-  const { error: showErrorToast, warning: showWarningToast } = useToast();
+  const { success: showSuccessToast, error: showErrorToast, warning: showWarningToast } = useToast();
 
   // Sessions list & active session
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -140,6 +239,11 @@ export function Chats() {
   // Selected chat & message history
   const [activeChat, setActiveChat] = useState<Chat | null>(null);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
+  // Only the contact id is state — the open group is derived from groupedStatuses at render, so a
+  // refetch (window focus, post-compose) flows straight into the open viewer instead of leaving it
+  // pinned to the snapshot captured at click time. A group that disappears (all items expired)
+  // simply closes the viewer.
+  const [activeStatusContactId, setActiveStatusContactId] = useState<string | null>(null);
 
   // Chats/Channels/Status tab selection. Switching tabs closes whatever conversation is open so a
   // press on another tab doesn't leave a Chats-tab room rendered underneath a Channels/Status list.
@@ -148,6 +252,7 @@ export function Chats() {
     setActiveTab(tab);
     setActiveChat(null);
     setActiveChannel(null);
+    setActiveStatusContactId(null);
   }, []);
 
   // Channels tab: only whatsapp-web.js implements channel listing/reading — Baileys throws 501 for
@@ -161,6 +266,11 @@ export function Chats() {
   });
   const channelMessages = useChannelMessages(selectedSessionId, activeChannel?.id ?? null);
 
+  // Status tab: both engines expose stored status content, so this query isn't engine-gated (unlike
+  // channelsQuery above) — but it is tab-gated the same way, so selecting a session on another tab
+  // doesn't fire a background /status fetch nobody is looking at.
+  const statusesQuery = useContactStatuses(selectedSessionId, activeTab === 'status');
+
   // A channel feed opens at its newest post, mirroring the chat room's initial scroll. The pane is
   // also keyed by channel id, so switching channels remounts the feed instead of reusing the DOM
   // (and its stale scroll offset) of the previous channel.
@@ -169,6 +279,132 @@ export function Chats() {
     const el = channelFeedRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [activeChannel?.id, channelMessages.data]);
+
+  // --- Status compose modal ---
+  // Baileys targets a status post to an explicit allow-list (statusJidList); whatsapp-web.js has no
+  // per-recipient concept and broadcasts to the account's status-privacy audience instead, so the
+  // recipient picker is Baileys-only.
+  const isBaileysEngine = currentEngine.data?.engineType === 'baileys';
+
+  const [composeOpen, setComposeOpen] = useState<boolean>(false);
+  const [composeType, setComposeType] = useState<'text' | 'image'>('text');
+  const [composeText, setComposeText] = useState<string>('');
+  const [composeBgColor, setComposeBgColor] = useState<string>('');
+  const [composeFont, setComposeFont] = useState<string>('');
+  const [composeImageUrl, setComposeImageUrl] = useState<string>('');
+  const [composeImageBase64, setComposeImageBase64] = useState<string | null>(null);
+  const [composeCaption, setComposeCaption] = useState<string>('');
+  const [composeRecipients, setComposeRecipients] = useState<string[]>([]);
+  const [composeRecipientSearch, setComposeRecipientSearch] = useState<string>('');
+  const [composePosting, setComposePosting] = useState<boolean>(false);
+  const composeFileInputRef = useRef<HTMLInputElement | null>(null);
+  // Monotonic token invalidating an in-flight FileReader: picking a file reads asynchronously, and
+  // a URL edit (or form reset) before `onload` fires must win over the late-arriving file bytes.
+  const composeImageReadSeq = useRef(0);
+
+  // Sourced only while the modal is actually open on Baileys — no reason to fetch the full contact
+  // list on wwjs (no picker) or before the user has opened compose.
+  const composeContactsQuery = useQuery({
+    queryKey: ['status-compose-contacts', selectedSessionId],
+    queryFn: () => contactApi.list(selectedSessionId!),
+    enabled: composeOpen && isBaileysEngine && Boolean(selectedSessionId),
+  });
+  const composeContacts = composeContactsQuery.data ?? [];
+  const composeRecipientSearchLower = composeRecipientSearch.toLowerCase();
+  const filteredComposeContacts = composeContacts.filter(c =>
+    // Match against every identity field — a named contact must still be findable by number/JID.
+    [c.name, c.pushName, c.number, c.id].some(v => v?.toLowerCase().includes(composeRecipientSearchLower)),
+  );
+
+  const resetComposeForm = useCallback(() => {
+    composeImageReadSeq.current += 1;
+    setComposeType('text');
+    setComposeText('');
+    setComposeBgColor('');
+    setComposeFont('');
+    setComposeImageUrl('');
+    setComposeImageBase64(null);
+    setComposeCaption('');
+    setComposeRecipients([]);
+    setComposeRecipientSearch('');
+    if (composeFileInputRef.current) composeFileInputRef.current.value = '';
+  }, []);
+
+  const closeComposeModal = useCallback(() => {
+    setComposeOpen(false);
+    resetComposeForm();
+  }, [resetComposeForm]);
+
+  const toggleComposeRecipient = (id: string) => {
+    setComposeRecipients(prev =>
+      prev.includes(id)
+        ? prev.filter(r => r !== id)
+        : prev.length >= STATUS_RECIPIENTS_MAX
+          ? prev
+          : [...prev, id],
+    );
+  };
+
+  const handleComposeImageUrlChange = (value: string) => {
+    composeImageReadSeq.current += 1;
+    setComposeImageUrl(value);
+    if (value) {
+      setComposeImageBase64(null);
+      if (composeFileInputRef.current) composeFileInputRef.current.value = '';
+    }
+  };
+
+  const handleComposeImageFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setComposeImageUrl('');
+    const myRead = ++composeImageReadSeq.current;
+    const reader = new FileReader();
+    reader.onload = event => {
+      // A URL edit or form reset since the read started supersedes these bytes — drop them.
+      if (composeImageReadSeq.current !== myRead) return;
+      // The backend's stripBase64DataUri unwraps a `data:...;base64,` prefix, so passing the raw
+      // data URL through as `base64` is safe — no need to slice it ourselves.
+      setComposeImageBase64(event.target?.result as string);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const composeCanSubmit =
+    Boolean(selectedSessionId) &&
+    !composePosting &&
+    // The engine type decides whether recipients are required (Baileys) or omitted (wwjs) — while
+    // it's still unknown, a Baileys submit would go out with no recipients and 400.
+    Boolean(currentEngine.data) &&
+    (composeType === 'text' ? composeText.trim().length > 0 : Boolean(composeImageBase64 || composeImageUrl.trim())) &&
+    (!isBaileysEngine || composeRecipients.length > 0);
+
+  const handleComposeSubmit = async () => {
+    if (!selectedSessionId || !composeCanSubmit) return;
+    setComposePosting(true);
+    try {
+      // whatsapp-web.js ignores `recipients` entirely (it broadcasts to status@broadcast), so none
+      // are sent — the backend DTO treats the list as optional and only the Baileys engine requires
+      // (and honors) it. The picker is hidden on wwjs since it has no effect there.
+      const recipients = isBaileysEngine ? composeRecipients : undefined;
+      if (composeType === 'text') {
+        await sessionApi.postTextStatus(selectedSessionId, composeText.trim(), recipients, {
+          backgroundColor: composeBgColor || undefined,
+          font: composeFont === '' ? undefined : Number(composeFont),
+        });
+      } else {
+        const image = composeImageBase64 ? { base64: composeImageBase64 } : { url: composeImageUrl.trim() };
+        await sessionApi.postImageStatus(selectedSessionId, image, recipients, composeCaption.trim() || undefined);
+      }
+      showSuccessToast(t('chats.status.posted'));
+      closeComposeModal();
+      statusesQuery.refetch();
+    } catch (err) {
+      showErrorToast(t('chats.status.postFailed'), err instanceof Error ? err.message : undefined);
+    } finally {
+      setComposePosting(false);
+    }
+  };
 
   const {
     data: messages = [],
@@ -192,6 +428,19 @@ export function Chats() {
   } | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState<boolean>(false);
+  // Monotonic token invalidating an in-flight attachment FileReader: picking a second file (or
+  // removing the attachment) before `onload` fires must win over the late-arriving bytes —
+  // otherwise the slower read overwrites the newer pick. Same pattern as composeImageReadSeq.
+  const attachmentReadSeq = useRef(0);
+
+  // Unmounting the page with a read still in flight: invalidate both readers so their late
+  // onload handlers drop the bytes instead of setting state on a dead component.
+  useEffect(() => {
+    return () => {
+      attachmentReadSeq.current += 1;
+      composeImageReadSeq.current += 1;
+    };
+  }, []);
 
   // References
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -325,6 +574,7 @@ export function Chats() {
       void loadChats(selectedSessionId);
       setActiveChat(null);
       setActiveChannel(null);
+      setActiveStatusContactId(null);
       setAttachment(null);
       setPreviewUrl(null);
     }
@@ -339,13 +589,28 @@ export function Chats() {
     return () => URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
 
+  // Coalesce mark-as-read RPCs per chat: every incoming message in the visible chat raises a
+  // read event, and a per-event POST sprays the gateway into 429s. One trailing call per chat
+  // after a quiet window carries the same effect.
+  const markReadCoalescer = useMemo(
+    () =>
+      createTrailingCoalescer<string>(chatId => {
+        void sessionApi.markChatRead(selectedSessionId, chatId).catch(err => {
+          showWarningToast(t('chats.errors.markRead'), err instanceof Error ? err.message : undefined);
+        });
+      }, MARK_READ_DEBOUNCE_MS),
+    [selectedSessionId, t, showWarningToast],
+  );
+
+  // Drop pending trailing calls on unmount / session switch so a late fire never targets an
+  // unmounted component or the previous session.
+  useEffect(() => () => markReadCoalescer.cancel(), [markReadCoalescer]);
+
   const markChatRead = useCallback(
     (chatId: string) => {
-      void sessionApi.markChatRead(selectedSessionId, chatId).catch(err => {
-        showWarningToast(t('chats.errors.markRead'), err instanceof Error ? err.message : undefined);
-      });
+      markReadCoalescer.call(chatId);
     },
-    [selectedSessionId, t, showWarningToast],
+    [markReadCoalescer],
   );
 
   // 3. WebSocket integration for real-time messages
@@ -359,6 +624,10 @@ export function Chats() {
         id: newMsg.id,
         waMessageId: newMsg.id,
         chatId: newMsg.chatId,
+        // For a group post `from` is the group JID, so the sender's name is carried on `contact`.
+        // Persisted rows keep the same value in `chatName`; normalize both to one field for the thread.
+        chatName: newMsg.contact?.pushName ?? newMsg.contact?.name,
+        author: newMsg.author,
         from: newMsg.from,
         to: newMsg.to,
         body: newMsg.body,
@@ -529,12 +798,23 @@ export function Chats() {
     [selectedSessionId, queryClient, loadChats],
   );
 
+  // A contact's new story lands here instead of in the message pipeline; invalidate the statuses
+  // query so the Status tab refetches live. A disabled query (another tab active) just goes stale
+  // and refetches on open — no background fetch either way.
+  const handleStatusReceived = useCallback(
+    (event: { sessionId: string }) => {
+      queryClient.invalidateQueries({ queryKey: ['contact-statuses', event.sessionId] });
+    },
+    [queryClient],
+  );
+
   const { isConnected, connectionFailed, reconnect, subscribe, unsubscribe } = useWebSocket({
     onMessage: handleIncomingMessage,
     onMessageAck: handleIncomingMessageAck,
     onMessageReaction: handleIncomingMessageReaction,
     onMessageRevoked: handleIncomingMessageRevoked,
     onMessageEdited: handleIncomingMessageEdited,
+    onStatusReceived: handleStatusReceived,
   });
 
   // A transient WebSocket gap means message.received/ack/revoke events were missed, and the chat
@@ -553,6 +833,9 @@ export function Chats() {
     reconnectWasDisconnected.current = decision.wasDisconnected;
     if (decision.invalidate) {
       queryClient.invalidateQueries({ queryKey: ['messages', selectedSessionId] });
+      // Statuses are live now (status.received): a story posted during the socket gap would
+      // otherwise stay invisible until a focus refetch.
+      queryClient.invalidateQueries({ queryKey: ['contact-statuses', selectedSessionId] });
     }
   }, [isConnected, selectedSessionId, queryClient]);
 
@@ -565,6 +848,7 @@ export function Chats() {
         'message.reaction',
         'message.revoked',
         'message.edited',
+        'status.received',
       ]);
       return () => {
         unsubscribe(selectedSessionId);
@@ -677,10 +961,12 @@ export function Chats() {
             setActiveTab('status');
             setActiveChat(chat);
             setActiveChannel(null);
+            setActiveStatusContactId(null);
           } else {
             setActiveTab('chats');
             setActiveChat(chat);
             setActiveChannel(null);
+            setActiveStatusContactId(null);
           }
         } else {
           pendingHitRef.current = null;
@@ -703,10 +989,12 @@ export function Chats() {
         setActiveTab('status');
         setActiveChat(chat);
         setActiveChannel(null);
+        setActiveStatusContactId(null);
       } else {
         setActiveTab('chats');
         setActiveChat(chat);
         setActiveChannel(null);
+        setActiveStatusContactId(null);
       }
     }
   }, [chats, activeChat, switchTab]);
@@ -742,8 +1030,11 @@ export function Chats() {
       setPreviewUrl(null);
     }
 
+    const myRead = ++attachmentReadSeq.current;
     const reader = new FileReader();
     reader.onload = event => {
+      // A newer pick, a removal, or an unmount since the read started supersedes these bytes.
+      if (attachmentReadSeq.current !== myRead) return;
       const dataUrl = event.target?.result as string;
       const base64Data = dataUrl.split(',')[1];
       setAttachment({ file, base64: base64Data, mimetype: file.type, filename: file.name });
@@ -752,6 +1043,7 @@ export function Chats() {
   };
 
   const handleRemoveAttachment = () => {
+    attachmentReadSeq.current += 1; // an in-flight read must not resurrect the removed attachment
     setAttachment(null);
     setPreviewUrl(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -922,8 +1214,6 @@ export function Chats() {
   // Chats tab: real conversations. Channel/status-kind rows are hidden here and surfaced on their
   // own tabs instead.
   const filteredChats = chats.filter(c => c.kind !== 'channel' && c.kind !== 'status' && searchMatch(c));
-  // Status tab: the wwjs aggregate status@broadcast row, if getChats returned one.
-  const statusChats = chats.filter(c => c.kind === 'status' && searchMatch(c));
 
   // Channels tab: same search box, filtered client-side like the other two tabs. The zero-state
   // ("not subscribed to any channels") stays keyed on the unfiltered list below, so a non-matching
@@ -932,6 +1222,46 @@ export function Chats() {
   const filteredChannels = (channelsQuery.data ?? []).filter(
     ch => ch.name.toLowerCase().includes(searchQueryLower) || ch.id.toLowerCase().includes(searchQueryLower),
   );
+
+  // Status tab: group the flat status list by contact (one row per contact), newest-contact-first
+  // across groups, filtered by the same search box. The store returns statuses newest-first
+  // (postedAt DESC); each group's items are flipped to oldest-first so the viewer reads like a
+  // WhatsApp story — newest at the bottom, where the viewer's open-at-newest scroll lands.
+  // A plain const (not useMemo) mirrors filteredChats/filteredChannels above — statusesQuery.data
+  // is already a stable, query-cached reference, so re-grouping on every render is cheap.
+  const byStatusContact = new Map<string, ContactStatusGroup>();
+  for (const item of statusesQuery.data ?? []) {
+    const existing = byStatusContact.get(item.contact.id);
+    if (existing) {
+      existing.items.push(item);
+      if (item.timestamp > existing.latest) existing.latest = item.timestamp;
+    } else {
+      byStatusContact.set(item.contact.id, { contact: item.contact, items: [item], latest: item.timestamp });
+    }
+  }
+  for (const group of byStatusContact.values()) group.items.reverse();
+  const groupedStatuses = Array.from(byStatusContact.values())
+    .filter(
+      g =>
+        (g.contact.name ?? '').toLowerCase().includes(searchQueryLower) ||
+        (g.contact.pushName ?? '').toLowerCase().includes(searchQueryLower) ||
+        g.contact.id.toLowerCase().includes(searchQueryLower),
+    )
+    .sort((a, b) => (a.latest < b.latest ? 1 : a.latest > b.latest ? -1 : 0));
+
+  // The open status group, derived — see the activeStatusContactId declaration.
+  const activeStatusGroup = activeStatusContactId
+    ? (groupedStatuses.find(g => g.contact.id === activeStatusContactId) ?? null)
+    : null;
+
+  // Same open-at-newest behavior for the status viewer pane, keyed off the active contact and its
+  // item list. Declared after activeStatusGroup: the viewer follows refetches because the deps are
+  // the derived group's items, not a click-time snapshot.
+  const statusFeedRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = statusFeedRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeStatusGroup?.contact.id, activeStatusGroup?.items]);
 
   // Shared row markup for the Chats and Status lists — a plain function (not memoized) since it
   // closes over render-scoped state (activeChat, listPics) that already changes every render.
@@ -1025,7 +1355,7 @@ export function Chats() {
           </p>
         </div>
       ) : (
-        <div className={`chats-layout ${activeChat || activeChannel ? 'has-active-chat' : ''}`}>
+        <div className={`chats-layout ${activeChat || activeChannel || activeStatusGroup ? 'has-active-chat' : ''}`}>
           {/* LEFT SIDEBAR: session & chat rooms */}
           <aside className="chats-sidebar">
             <div className="sidebar-header-box">
@@ -1071,6 +1401,14 @@ export function Chats() {
                   onChange={e => setSearchQuery(e.target.value)}
                 />
               </div>
+
+              {/* Compose a new status — only meaningful on the Status tab. */}
+              {activeTab === 'status' && (
+                <button type="button" className="btn-primary status-compose-trigger" onClick={() => setComposeOpen(true)}>
+                  <Plus size={16} />
+                  {t('chats.status.compose')}
+                </button>
+              )}
             </div>
 
             {/* Chat list */}
@@ -1145,16 +1483,51 @@ export function Chats() {
               </div>
             )}
 
-            {/* Status list — the wwjs status@broadcast aggregate row, if present. Real per-status
-                (per-contact story) rows are a future capability; this tab starts as a placeholder. */}
+            {/* Status list — per-contact status groups read from the 24h store. Not engine-gated:
+                both engines now have status content. */}
             {activeTab === 'status' && (
               <div className="chats-list">
-                {statusChats.map(renderChatRow)}
-                <div className="chats-room-placeholder">
-                  <CircleDashed size={40} />
-                  <h2>{t('chats.status.placeholderTitle')}</h2>
-                  <p>{t('chats.status.placeholderDesc')}</p>
-                </div>
+                {statusesQuery.isLoading ? (
+                  <div className="chats-list-loading">
+                    <Loader2 className="animate-spin" size={24} />
+                  </div>
+                ) : statusesQuery.isError ? (
+                  <div className="chats-list-empty">
+                    <AlertCircle size={24} className="text-warn" />
+                    <span>{t('chats.status.loadError')}</span>
+                  </div>
+                ) : groupedStatuses.length === 0 ? (
+                  <div className="chats-list-empty">
+                    <span>{t('chats.status.empty')}</span>
+                  </div>
+                ) : (
+                  groupedStatuses.map(group => (
+                    <div
+                      key={group.contact.id}
+                      className={`chat-item-card ${activeStatusContactId === group.contact.id ? 'active' : ''}`}
+                      onClick={() => setActiveStatusContactId(group.contact.id)}
+                    >
+                      <div className="chat-avatar">
+                        <CircleDashed size={20} />
+                      </div>
+                      <div className="chat-item-info">
+                        <div className="chat-item-top">
+                          <span className="chat-item-name">
+                            {group.contact.name ?? group.contact.pushName ?? group.contact.id}
+                          </span>
+                          <span className="chat-item-time">
+                            {formatChatTime(Math.floor(new Date(group.latest).getTime() / 1000))}
+                          </span>
+                        </div>
+                        <div className="chat-item-bottom">
+                          <span className="chat-item-snippet">
+                            {t('chats.status.itemCount', { count: group.items.length })}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             )}
           </aside>
@@ -1230,10 +1603,23 @@ export function Chats() {
                       <span>{t('chats.noMessagesInChat')}</span>
                     </div>
                   ) : (
-                    messages.map(msg => {
+                    messages.map((msg, index) => {
                       const isMe = msg.direction === 'outgoing';
                       const formattedTime = formatTime(
                         msg.timestamp || Math.floor(new Date(msg.createdAt).getTime() / 1000),
+                      );
+
+                      // Label who posted, WhatsApp-style: only in groups, only on incoming messages,
+                      // and only on the first of a consecutive run from the same sender (so a burst
+                      // from one person isn't repeated on every bubble).
+                      const prev = messages[index - 1];
+                      const showSender = Boolean(
+                        activeChat?.isGroup &&
+                          !isMe &&
+                          msg.chatName &&
+                          // Key the run on the stable sender id (participant JID), not the display
+                          // name — two participants who share a pushName must still start a new run.
+                          (!prev || prev.direction === 'outgoing' || senderKey(prev) !== senderKey(msg)),
                       );
 
                       const isMediaMessage = msg.type !== 'text';
@@ -1350,6 +1736,16 @@ export function Chats() {
                                 isMediaMessage ? 'media-type' : ''
                               } ${isRevoked ? 'revoked-type' : ''}`}
                             >
+                              {/* Group sender label (WhatsApp-style: coloured name atop the bubble) */}
+                              {/* Group sender label (WhatsApp-style: coloured name atop the bubble).
+                                  Colour keys on the stable sender id, so same-named participants
+                                  still get distinct colours; the label shows the human name. */}
+                              {showSender && (
+                                <div className="message-sender" style={{ color: senderColor(senderKey(msg)!) }}>
+                                  {msg.chatName}
+                                </div>
+                              )}
+
                               {/* Quoted message display */}
                               {msg.metadata?.quotedMessage && (
                                 <div className="message-quote-box">
@@ -1593,6 +1989,55 @@ export function Chats() {
                   )}
                 </div>
               </div>
+            ) : activeStatusGroup ? (
+              // Read-only status viewer: no send footer, reactions, delete, reply, or markChatRead —
+              // statuses are ephemeral broadcast posts, not a two-way conversation.
+              <div key={activeStatusGroup.contact.id} className="channel-room">
+                <header className="chats-room-header">
+                  <button
+                    className="room-back"
+                    onClick={() => setActiveStatusContactId(null)}
+                    aria-label={t('common.back')}
+                  >
+                    <ArrowLeft size={20} />
+                  </button>
+                  <CircleDashed size={20} />
+                  <h2>{activeStatusGroup.contact.name ?? activeStatusGroup.contact.pushName ?? activeStatusGroup.contact.id}</h2>
+                </header>
+                <div className="messages-list" ref={statusFeedRef}>
+                  {activeStatusGroup.items.map(item => (
+                    <div
+                      key={item.id}
+                      className="message-bubble incoming"
+                      // A text status keeps the look it was posted with: background colour (white
+                      // text like WhatsApp) and the closest generic font family we have for the
+                      // proprietary WhatsApp font slots.
+                      style={
+                        item.type === 'text' && (item.backgroundColor || item.font)
+                          ? {
+                              ...(item.backgroundColor
+                                ? { backgroundColor: item.backgroundColor, color: '#fff' }
+                                : {}),
+                              ...statusFontStyle(item.font),
+                            }
+                          : undefined
+                      }
+                    >
+                      {item.mediaUrl && (
+                        <StatusMedia
+                          sessionId={selectedSessionId || null}
+                          statusId={item.id}
+                          type={item.type === 'video' ? 'video' : 'image'}
+                        />
+                      )}
+                      {item.caption && <MessageBody text={item.caption} className="message-text" />}
+                      <span className="message-time">
+                        {formatChatTime(Math.floor(new Date(item.timestamp).getTime() / 1000))}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             ) : (
               <div className="chats-room-placeholder">
                 <MessageSquare size={80} className="placeholder-icon" />
@@ -1610,6 +2055,141 @@ export function Chats() {
         onClose={() => setLightboxIndex(null)}
         onNavigate={setLightboxIndex}
       />
+
+      {composeOpen && (
+        <Modal
+          open
+          onClose={closeComposeModal}
+          title={t('chats.status.compose')}
+          closeLabel={t('common.close')}
+          className="status-compose-modal"
+          footer={
+            <>
+              <button className="btn-secondary" onClick={closeComposeModal} disabled={composePosting}>
+                {t('common.cancel')}
+              </button>
+              <button className="btn-primary" onClick={handleComposeSubmit} disabled={!composeCanSubmit}>
+                {composePosting ? <Loader2 className="animate-spin" size={16} /> : t('chats.status.post')}
+              </button>
+            </>
+          }
+        >
+          <div className="compose-type-toggle">
+            <button type="button" className={composeType === 'text' ? 'active' : ''} onClick={() => setComposeType('text')}>
+              {t('chats.status.composeText')}
+            </button>
+            <button
+              type="button"
+              className={composeType === 'image' ? 'active' : ''}
+              onClick={() => setComposeType('image')}
+            >
+              {t('chats.status.composeImage')}
+            </button>
+          </div>
+
+          {composeType === 'text' ? (
+            <>
+              <div className="compose-field">
+                <label>{t('chats.status.composeText')}</label>
+                <textarea
+                  value={composeText}
+                  onChange={e => setComposeText(e.target.value)}
+                  maxLength={4096}
+                  placeholder={t('chats.status.composeText')}
+                />
+              </div>
+              <div className="compose-row">
+                <div className="compose-field">
+                  <label>{t('chats.status.backgroundColor')}</label>
+                  <input
+                    type="color"
+                    value={composeBgColor || '#000000'}
+                    onChange={e => setComposeBgColor(e.target.value)}
+                  />
+                </div>
+                <div className="compose-field">
+                  <label>{t('chats.status.font')}</label>
+                  <select value={composeFont} onChange={e => setComposeFont(e.target.value)}>
+                    <option value="">{t('chats.status.fontDefault')}</option>
+                    {/* The WhatsApp status font enum: 6 is the bold system face; 3–5 don't exist on
+                        the wire and the backend rejects them. */}
+                    {[0, 1, 2, 6, 7, 8, 9, 10].map(f => (
+                      <option key={f} value={f}>
+                        {f}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="compose-field">
+                <label>{t('chats.status.composeImage')}</label>
+                <input
+                  type="url"
+                  placeholder="https://example.com/image.jpg"
+                  value={composeImageUrl}
+                  onChange={e => handleComposeImageUrlChange(e.target.value)}
+                />
+              </div>
+              <p className="compose-image-or">{t('chats.status.orLabel')}</p>
+              <div className="compose-field">
+                <input
+                  type="file"
+                  accept="image/*"
+                  ref={composeFileInputRef}
+                  onChange={handleComposeImageFile}
+                />
+              </div>
+              <div className="compose-field">
+                <label>{t('chats.status.caption')}</label>
+                <input
+                  type="text"
+                  placeholder={t('chats.captionPlaceholder')}
+                  value={composeCaption}
+                  onChange={e => setComposeCaption(e.target.value)}
+                  maxLength={1024}
+                />
+              </div>
+            </>
+          )}
+
+          {isBaileysEngine && (
+            <div className="compose-field">
+              <label>{t('chats.status.recipients')}</label>
+              <input
+                type="text"
+                placeholder={t('common.search')}
+                value={composeRecipientSearch}
+                onChange={e => setComposeRecipientSearch(e.target.value)}
+              />
+              <div className="compose-recipients">
+                {composeContactsQuery.isLoading ? (
+                  <div className="compose-recipients-empty">
+                    <Loader2 className="animate-spin" size={16} />
+                  </div>
+                ) : filteredComposeContacts.length === 0 ? (
+                  <div className="compose-recipients-empty">{t('chats.status.noContacts')}</div>
+                ) : (
+                  filteredComposeContacts.map(c => (
+                    <label key={c.id} className="compose-recipient-row">
+                      <input
+                        type="checkbox"
+                        checked={composeRecipients.includes(c.id)}
+                        disabled={!composeRecipients.includes(c.id) && composeRecipients.length >= STATUS_RECIPIENTS_MAX}
+                        onChange={() => toggleComposeRecipient(c.id)}
+                      />
+                      <span>{c.name || c.pushName || c.number || c.id}</span>
+                    </label>
+                  ))
+                )}
+              </div>
+              <p className="input-hint">{t('chats.status.recipientsHint')}</p>
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

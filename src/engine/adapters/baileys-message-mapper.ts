@@ -156,13 +156,17 @@ export interface BaileysIncomingFields {
   ephemeralDuration?: number;
   /** @mentioned engine JIDs from `contextInfo.mentionedJid`; normalized and surfaced as `mentionedIds`. */
   mentionedJids?: string[];
+  /** Styling of an extended-text (status) message: proto `backgroundArgb` (fixed32 ARGB). */
+  backgroundArgb?: number;
+  /** Styling of an extended-text (status) message: proto `font` (WhatsApp font index). */
+  font?: number;
 }
 
 /**
  * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is always
  * `remoteJid` (Baileys reports the conversation directly); `fromMe` only flips from/to. The group
- * sender lives in `participant` (exposed as `author`), matching the wwjs convention where `from`
- * is the group JID.
+ * sender — and likewise the poster of a status broadcast — lives in `participant` (exposed as
+ * `author`), matching the wwjs convention where `from` is the group JID / broadcast channel.
  */
 export function buildIncomingMessageFromBaileys(
   fields: BaileysIncomingFields,
@@ -191,7 +195,11 @@ export function buildIncomingMessageFromBaileys(
     isStatusBroadcast,
   };
 
-  if (isGroup && fields.participant) {
+  // The sender behind a group message — or the poster behind a status broadcast — lives in
+  // `participant` (exposed as `author`), matching the wwjs convention where `from` is the group JID
+  // (or the shared status@broadcast channel). Without the status arm, buildIncomingStatus can only
+  // resolve the poster to the pseudo-JID itself and drops every Baileys status.
+  if ((isGroup || isStatusBroadcast) && fields.participant) {
     incoming.author = normalizeJid(fields.participant);
   }
 
@@ -203,6 +211,14 @@ export function buildIncomingMessageFromBaileys(
 
   if (fields.pushName) {
     incoming.contact = { pushName: fields.pushName };
+  }
+
+  // Extended-text (status) styling: proto ARGB → the #RRGGBB the API/outbound DTOs speak.
+  if (fields.backgroundArgb !== undefined && Number.isFinite(fields.backgroundArgb)) {
+    incoming.backgroundColor = `#${(fields.backgroundArgb & 0xffffff).toString(16).padStart(6, '0')}`;
+  }
+  if (fields.font !== undefined) {
+    incoming.font = fields.font;
   }
 
   if (fields.media) {
