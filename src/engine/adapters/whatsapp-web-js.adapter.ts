@@ -692,6 +692,26 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
               id: quoted.id._serialized,
               body: quoted.body,
             };
+            // Carry the quoted media too. A reply to a status/story arrives as
+            // an ordinary chat message, and the status is reachable ONLY from
+            // here: it lives in `status@broadcast`, so it is in no chat history
+            // a consumer could go and fetch it from afterwards. Emitting the
+            // quote without its image left the reply unattributable.
+            //
+            // Goes through the same capped path as the message's own media, so
+            // an oversized or slow status degrades to an `omitted` marker
+            // instead of stalling the message — never blocks the reply itself.
+            if (quoted.hasMedia) {
+              try {
+                const quotedMedia = await this.capInboundMediaFor(quoted);
+                if (quotedMedia) incomingMessage.quotedMessage.media = quotedMedia;
+              } catch (mediaError) {
+                this.logger.warn('Quoted media download failed; emitting quote without it', {
+                  msgId: quoted.id._serialized,
+                  error: String(mediaError),
+                });
+              }
+            }
           } catch (error) {
             this.logger.error('Error getting quoted message', String(error));
           }
