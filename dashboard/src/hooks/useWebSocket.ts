@@ -137,9 +137,10 @@ interface ServerErrorFrame {
   message?: string;
 }
 
-// Use current origin for WebSocket (goes through nginx proxy in Docker)
-// Falls back to env var or localhost for development
-const SOCKET_URL = import.meta.env.VITE_WS_URL || window.location.origin;
+// Use the configured backend in hosted deployments (VITE_WS_URL, then VITE_API_URL for a
+// split-origin deployment where only the API URL is set), while keeping the origin fallback
+// for Docker/nginx setups that proxy websocket traffic.
+const SOCKET_URL = import.meta.env.VITE_WS_URL || import.meta.env.VITE_API_URL || window.location.origin;
 // Warn when the WebSocket origin is an insecure http:// URL on a non-localhost host.
 warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
 
