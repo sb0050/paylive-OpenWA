@@ -68,11 +68,16 @@ FROM docker.io/node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc
 # changes nothing about which dependencies land in the image.
 ENV NODE_ENV=production
 
-# Chrome for Testing has no linux-arm64 build, and Puppeteer's chromium snapshot
-# is x86_64-only on Linux too. So: amd64 uses Chrome for Testing (downloaded below)
-# to avoid the Debian chromium package's K8s SIGTRAP under strict non-root/seccomp;
-# arm64 installs Debian's chromium instead (it ships a native arm64 build). Both
-# resolve to the same /usr/local/bin/puppeteer-chrome symlink below.
+# Navigateur pour Puppeteer, expose via le symlink /usr/local/bin/puppeteer-chrome
+# (ce que le reste du Dockerfile et le code attendent).
+#  - amd64 (Railway, x86_64) : Google Chrome STABLE, PAS le « Chrome for Testing »
+#    d'upstream. Le paquet Debian `chromium` hard-crash en SIGTRAP (exit 133) au
+#    lancement sur le kernel Railway (6.18), meme avec --no-sandbox / --no-zygote /
+#    --single-process ; c'est le build Google Chrome stable, et lui seul, qui est
+#    verifie en production chez nous (fix eprouve, cf. l'historique du fork).
+#    La .deb Chrome declare ses propres deps -> apt les resout depuis les listes de
+#    paquets, encore presentes ici (installee AVANT `rm -rf /var/lib/apt/lists/*`).
+#  - arm64 : chromium Debian (build natif ; Chrome/CfT n'ont pas de build linux-arm64).
 #
 # chromium-sandbox is listed EXPLICITLY (not left to Recommends) so --no-install-recommends still
 # trims every other Recommends but keeps the setuid sandbox binary available. Our default forces
@@ -113,10 +118,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     patch \
     curl \
+    ca-certificates \
     unzip \
     procps \
     sqlite3 \
     ffmpeg \
+    && if [ "$TARGETARCH" != arm64 ]; then \
+         curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+         && apt-get install -y /tmp/chrome.deb \
+         && rm -f /tmp/chrome.deb; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 # The PostgreSQL client for the DATABASE_TYPE=postgres half of backup.sh/restore.sh, which the
@@ -216,19 +227,18 @@ RUN npm ci --omit=dev --ignore-scripts \
 # a floating npm@12 would make the image's bundled npm tree depend on when the build happened.
 RUN npm install -g npm@12.0.2 && npm cache clean --force
 
-# amd64: download Chrome for Testing via Puppeteer and symlink it.
-# arm64: use Debian's chromium installed above (CfT has no linux-arm64 build).
-# test -n guards against a future path mismatch failing loudly instead of shipping a broken image.
+# Expose le navigateur installe plus haut via un symlink stable.
+#  - amd64 : google-chrome-stable (fix SIGTRAP Railway ; on ne telecharge PAS le
+#    « Chrome for Testing » d'upstream a cette etape).
+#  - arm64 : chromium Debian (CfT/Chrome n'ont pas de build linux-arm64).
+# test -x fait echouer le build franchement plutot que de livrer une image cassee.
 RUN if [ "$TARGETARCH" = arm64 ]; then \
-        ln -s /usr/bin/chromium /usr/local/bin/puppeteer-chrome; \
+        chrome_path=/usr/bin/chromium; \
     else \
-        mkdir -p /opt/puppeteer && \
-        PUPPETEER_CACHE_DIR=/opt/puppeteer ./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31' && \
-        chown -R openwa:openwa /opt/puppeteer && \
-        chrome_path=$(find /opt/puppeteer/chrome/linux*/chrome-linux64/chrome | head -n 1) && \
-        test -n "$chrome_path" && \
-        ln -s "$chrome_path" /usr/local/bin/puppeteer-chrome; \
-    fi
+        chrome_path=/usr/bin/google-chrome-stable; \
+    fi && \
+    test -n "$chrome_path" && test -x "$chrome_path" && \
+    ln -s "$chrome_path" /usr/local/bin/puppeteer-chrome
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/puppeteer-chrome
 
 # Copy built application from builder stage
