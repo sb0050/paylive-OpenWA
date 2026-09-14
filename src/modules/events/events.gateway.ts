@@ -90,6 +90,9 @@ const EVICTION_MESSAGES: Record<ApiKeyEvictionReason, string> = {
     origin: resolveWsCorsOrigin(),
   },
   namespace: '/events',
+  // 2 Mo : les messages image (media base64) peuvent depasser le defaut 1 Mo de
+  // Socket.IO, qui ferme alors la connexion au lieu de livrer le message.
+  maxHttpBufferSize: 2 * 1024 * 1024,
 })
 export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy {
   @WebSocketServer()
@@ -222,6 +225,24 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     }
   }
 
+  /**
+   * Read the API key from the socket handshake (auth field -> header -> query fallback).
+   * Lives on the handshake, so it is available synchronously in every event handler --
+   * unlike `client.data`, which is only populated once the async `handleConnection`
+   * resolves. handleSubscribe uses this as a fallback to avoid a connect/subscribe race
+   * (a client that emits `subscribe` inside its `connect` handler can be processed before
+   * handleConnection's `await validateApiKey` has stored `client.data.rawApiKey`).
+   */
+  private extractApiKey(client: Socket): string | undefined {
+    const handshakeAuth = client.handshake.auth as { apiKey?: string } | undefined;
+    return (
+      handshakeAuth?.apiKey ||
+      (client.handshake.headers['x-api-key'] as string) ||
+      (client.handshake.query.apiKey as string) ||
+      undefined
+    );
+  }
+
   async handleConnection(client: Socket) {
     // Resolve the client IP once here so the handshake throttle, the validation, and the
     // audit trail all use the same trusted-proxy-aware value (parity with the REST guard / MCP mount).
@@ -238,10 +259,12 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       return;
     }
 
-    // Accept the key only via Socket.IO's `auth` field or the header — never the query string, which
-    // leaks the credential into proxy/access logs. (The deprecated `?apiKey=` fallback was removed.)
-    const handshakeAuth = client.handshake.auth as { apiKey?: string } | undefined;
-    const apiKey = handshakeAuth?.apiKey || (client.handshake.headers['x-api-key'] as string);
+    // Read the key via auth -> header -> query. We deliberately KEEP the query fallback that
+    // upstream dropped for log hygiene: the PayLive worker connects to OpenWA with
+    // `query: { apiKey }` (workers/src/openwaClient.ts), so removing it here would reject the
+    // worker's Socket.IO connection and break the entire WhatsApp realtime pipeline.
+    // TODO(paylive): migrate the worker to `auth: { apiKey }`, then switch to auth||header only.
+    const apiKey = this.extractApiKey(client);
 
     if (!apiKey) {
       this.logger.warn(`Client ${client.id} rejected: No API key provided`);
@@ -365,7 +388,11 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     // revoked/expired after connect must not be able to keep opening new subscriptions.
     // The clientIp is re-resolved (trusted-proxy-aware) so an IP-restricted key is enforced
     // here too, not just at connect.
-    const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey;
+    // Fall back to the handshake key when `client.data` is not populated yet -- a client that
+    // subscribes inside its `connect` handler can race the async handleConnection (which sets
+    // rawApiKey only after `await validateApiKey`). The handshake travels with the socket, so
+    // it is always readable here.
+    const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey ?? this.extractApiKey(client);
     const clientIp = this.resolveClientIp(client);
     let subscriberKey: { allowedSessions?: string[] | null } | null;
     try {

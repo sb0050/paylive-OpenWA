@@ -86,12 +86,19 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(authService.validateApiKey).not.toHaveBeenCalled();
   });
 
-  it('does NOT accept the API key from the query string (credential must not travel in the URL)', async () => {
+  // PayLive deviation from upstream: the query-string API key fallback is KEPT.
+  // The PayLive worker connects with `query: { apiKey }` (workers/src/openwaClient.ts),
+  // so extractApiKey reads auth -> header -> query. Upstream dropped query for log
+  // hygiene; we cannot until the worker migrates to `auth: { apiKey }` (see the TODO in
+  // events.gateway.ts handleConnection). This test guards that the fallback stays
+  // functional so a resync does not silently break the realtime pipeline.
+  it('accepts the API key from the query string (PayLive worker compatibility)', async () => {
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
     const sock = makeSocket({});
-    sock.handshake.query.apiKey = 'leaky-key-in-url';
+    sock.handshake.query.apiKey = 'worker-key-in-query';
     await gateway.handleConnection(asSocket(sock));
-    expect(authService.validateApiKey).not.toHaveBeenCalled(); // query key ignored → treated as missing
-    expect(sock.disconnect).toHaveBeenCalled();
+    expect(authService.validateApiKey).toHaveBeenCalledWith('worker-key-in-query', expect.anything());
+    expect(sock.disconnect).not.toHaveBeenCalled();
   });
 
   it('audits a rejected WebSocket auth attempt (forensic parity with the REST guard)', async () => {
@@ -143,6 +150,22 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
 
     expect(res.type).toBe('subscribed');
     expect(sock.join).toHaveBeenCalled();
+  });
+
+  it('subscribes via the handshake key when client.data is not yet populated (connect/subscribe race)', async () => {
+    // Simulate a client that emits `subscribe` inside its `connect` handler, before the async
+    // handleConnection has stored `client.data.rawApiKey`. The handshake still carries the key.
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
+    const sock = makeSocket({ apiKey: 'good' }); // data:{} -- handleConnection NOT awaited yet
+
+    const res = (await gateway.handleMessage(
+      asSocket(sock),
+      subscribeMsg('sess-1', ['message.received']),
+    )) as WSSubscribedResponse;
+
+    expect(res.type).toBe('subscribed');
+    expect(sock.join).toHaveBeenCalled();
+    expect(sock.disconnect).not.toHaveBeenCalled();
   });
 
   it('accepts a subscription to group.join (a live, engine-emitted event)', async () => {
