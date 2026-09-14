@@ -71,6 +71,25 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
             id: quoted.id._serialized,
             body: quoted.body,
           };
+          // Carry the quoted media too. A reply to a status/story arrives as an ordinary chat
+          // message, and the status is reachable ONLY from here: it lives in `status@broadcast`,
+          // so it is in no chat history a consumer could go and fetch it from afterwards.
+          // Emitting the quote without its image left the reply unattributable.
+          //
+          // Goes through the same capped path as the message's own media, so an oversized or slow
+          // status degrades to an `omitted` marker instead of stalling the message -- it never
+          // blocks the reply itself.
+          if (quoted.hasMedia) {
+            try {
+              const quotedMedia = await host.capInboundMediaFor(quoted);
+              if (quotedMedia) incomingMessage.quotedMessage.media = quotedMedia;
+            } catch (mediaError) {
+              host.logger.warn('Quoted media download failed; emitting quote without it', {
+                msgId: quoted.id._serialized,
+                error: String(mediaError),
+              });
+            }
+          }
         } catch (error) {
           host.logger.error('Error getting quoted message', String(error));
         }

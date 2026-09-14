@@ -140,6 +140,17 @@ export interface IncomingMessage {
   quotedMessage?: {
     id: string;
     body: string;
+    /**
+     * Media of the quoted message, when it carries one and the download was within the
+     * inbound cap. Absent otherwise.
+     *
+     * Replying to a status/story is the case this exists for: the reply is an ordinary chat
+     * message and the status itself is reachable ONLY through this quote -- it lives in
+     * `status@broadcast`, so it is in no chat history a consumer could fetch it from
+     * afterwards. Without it a consumer sees the reply text with no way to tell what was
+     * being replied to. Same capped/omitted shape as `media`.
+     */
+    media?: IncomingMessage['media'];
   };
   location?: {
     latitude: number;
