@@ -7,7 +7,8 @@ import { StatusUpdate } from './entities/status-update.entity';
 import type { IncomingStatus } from './incoming-status';
 import type { Status } from '../../engine/interfaces/whatsapp-engine.interface';
 import { StorageService } from '../../common/storage/storage.service';
-import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
+import { sweepOrphanedFiles } from '../../common/storage/orphan-sweep';
+import { isUniqueViolation } from '../../common/utils/db-errors';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { userPart } from '../../engine/identity/wa-id';
 import { createLogger } from '../../common/services/logger.service';
@@ -21,11 +22,14 @@ const PURGE_INTERVAL_MS = 15 * 60 * 1000;
  * pre-gates history downloads at the same cap so over-cap blobs are never fetched. */
 export const DEFAULT_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 /** Default cadence of the orphaned-media reconciliation sweep (overridable via
- * STATUS_ORPHAN_SWEEP_INTERVAL_MS). Lighter-than-it-sounds: one listFiles + one indexed query. */
+ * STATUS_ORPHAN_SWEEP_INTERVAL_MS). Lighter-than-it-sounds: one streamed enumeration + one indexed query. */
 const DEFAULT_ORPHAN_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 /** Default grace window before an unreferenced status media file is deleted (overridable via
  * STATUS_ORPHAN_GRACE_MS), so a file mid-ingest is never reaped. */
 const DEFAULT_ORPHAN_GRACE_MS = 60 * 60 * 1000;
+
+/** Storage key prefix owned by the status store; the media bucket is shared with chat media. */
+const STATUS_MEDIA_PREFIX = 'statuses/';
 
 /** Subtypes whose registered mimetype name differs from the conventional file extension. */
 const MIME_SUBTYPE_EXT_OVERRIDES: Record<string, string> = { jpeg: 'jpg', quicktime: 'mov' };
@@ -133,7 +137,7 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
       // written at this point (row-first ordering), so unlike a file-first ingest there is nothing
       // to reap here — the winner's own call owns its file write.
       const winner = await this.repository.findOne({ where: { sessionId, waStatusId: s.waStatusId } });
-      if (winner && isUniqueConstraintError(error)) return { row: winner, created: false };
+      if (winner && isUniqueViolation(error)) return { row: winner, created: false };
       throw error;
     }
 
@@ -183,7 +187,7 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
     const media = s.media;
     if (!media?.data) return;
 
-    const key = `statuses/${sessionId}/${randomUUID()}.${extFromMimetype(media.mimetype)}`;
+    const key = `${STATUS_MEDIA_PREFIX}${sessionId}/${randomUUID()}.${extFromMimetype(media.mimetype)}`;
     try {
       await this.storageService.putFile(key, Buffer.from(media.data, 'base64'));
     } catch (error) {
@@ -215,6 +219,11 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
       row.mediaPath = undefined;
       row.mediaMimetype = undefined;
       row.mediaOmitted = true;
+      // This same object is what the status.received webhook carries, and every other omission path
+      // names its reason ('engine_omitted' / 'over_cap' / 'write_failed'). Leaving it unset here
+      // would hand a consumer a media-less status it cannot tell apart from an unexplained
+      // omission — the media really is gone (nothing retries), so say so.
+      row.omitReason = 'write_failed';
     }
   }
 
@@ -258,7 +267,7 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
    */
   private canonicalContactJid(jid: string): string {
     if (!jid.endsWith('@lid')) return jid;
-    const phone = this.lidMappingStore?.getCached(userPart(jid));
+    const phone = this.lidMappingStore?.resolveLid(jid);
     return phone ? `${phone}@c.us` : jid;
   }
 
@@ -319,6 +328,8 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
       }),
     );
 
+    // Every media delete may have failed — delete([]) throws TypeORM's empty-criteria error.
+    if (deletableIds.length === 0) return 0;
     const result = await this.repository.delete(deletableIds);
     return result.affected ?? deletableIds.length;
   }
@@ -335,35 +346,24 @@ export class StatusStoreService implements OnModuleInit, OnModuleDestroy {
    */
   async sweepOrphanedMedia(now: number = Date.now()): Promise<number> {
     const graceMs = this.configService.get<number>('status.orphanGraceMs', DEFAULT_ORPHAN_GRACE_MS);
-    const files = (await this.storageService.listFiles()).filter(file => file.startsWith('statuses/'));
-    const rows = await this.repository.find({
-      where: { mediaPath: Not(IsNull()) },
-      select: { mediaPath: true },
+    // The referenced set is bounded by the 24h TTL, so a single whole-set query is the cheap shape
+    // here (no chunking) — unlike the chat-media archive, whose rows can accumulate without bound.
+    const removed = await sweepOrphanedFiles({
+      storage: this.storageService,
+      prefix: STATUS_MEDIA_PREFIX,
+      graceMs,
+      now,
+      firstSeenAt: this.orphanFirstSeenAt,
+      referencedAmong: async () => {
+        const rows = await this.repository.find({
+          where: { mediaPath: Not(IsNull()) },
+          select: { mediaPath: true },
+        });
+        return new Set(rows.map(row => row.mediaPath));
+      },
+      onDeleteFailed: (file, err) =>
+        this.logger.warn(`Failed to delete orphaned status media ${file}`, { error: String(err) }),
     });
-    const referenced = new Set(rows.map(row => row.mediaPath));
-
-    let removed = 0;
-    const present = new Set(files);
-    for (const file of files) {
-      if (referenced.has(file)) {
-        this.orphanFirstSeenAt.delete(file);
-        continue;
-      }
-      const firstSeenAt = this.orphanFirstSeenAt.get(file) ?? now;
-      this.orphanFirstSeenAt.set(file, firstSeenAt);
-      if (now - firstSeenAt < graceMs) continue;
-      try {
-        await this.storageService.deleteFile(file);
-        this.orphanFirstSeenAt.delete(file);
-        removed += 1;
-      } catch (err) {
-        this.logger.warn(`Failed to delete orphaned status media ${file}`, { error: String(err) });
-      }
-    }
-    // Drop bookkeeping for files that are gone so the map can't grow unbounded.
-    for (const key of [...this.orphanFirstSeenAt.keys()]) {
-      if (!present.has(key)) this.orphanFirstSeenAt.delete(key);
-    }
     if (removed > 0) this.logger.log(`Status media orphan sweep removed ${removed} file(s)`);
     return removed;
   }

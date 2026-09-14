@@ -4,7 +4,7 @@ import type { UserRole } from '../types/role';
 
 const USER_ROLES: readonly UserRole[] = ['admin', 'operator', 'viewer'];
 
-function isUserRole(value: unknown): value is UserRole {
+export function isUserRole(value: unknown): value is UserRole {
   return typeof value === 'string' && (USER_ROLES as readonly string[]).includes(value);
 }
 
@@ -22,24 +22,25 @@ export function clearActorState(...caches: ClearableCache[]): void {
   for (const cache of caches) cache.clear();
 }
 
-export type StartupValidation =
-  | { action: 'role'; role: UserRole }
-  | { action: 'logout' }
-  | { action: 'keep' };
+export type StartupValidation = { action: 'role'; role: UserRole } | { action: 'logout' } | { action: 'keep' };
 
 /**
  * Fold the startup /auth/validate answer into an auth decision:
- * - non-ok (401 for a revoked/deleted/expired key) → full logout; the cached role is a lie.
+ * - 401/403 (a revoked/deleted/expired key, or one whose restrictions reject this client) → full
+ *   logout; the cached role is a lie.
+ * - any other non-ok status (429 rate limit, 5xx, a proxy error page) → keep the cached role:
+ *   a transient failure proves nothing about the key, so it must not eject the user.
  * - ok + role → refresh the cached role from the server (a demoted key must lose its old powers).
  * - anything else (unexpected body shape) → keep the cached role.
  * A network throw never reaches this function; the caller keeps the cached role for that case
  * so a transient outage at page load doesn't eject the user.
  */
 export function resolveStartupValidation(
-  ok: boolean,
+  status: number,
   body: { valid?: boolean; role?: string } | null,
 ): StartupValidation {
-  if (!ok) return { action: 'logout' };
+  if (status === 401 || status === 403) return { action: 'logout' };
+  if (status < 200 || status >= 300) return { action: 'keep' };
   if (body?.valid && isUserRole(body.role)) return { action: 'role', role: body.role };
   return { action: 'keep' };
 }

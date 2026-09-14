@@ -12,12 +12,15 @@ const SHA256_HEX = /^[0-9a-f]{64}$/i;
  * Optional content integrity for a plugin download, carried IN the URL so it works over any
  * transport (a catalog `download` link, a dashboard paste, a raw API call):
  *   - URL fragment:  https://host/pkg.zip#sha256=<64 hex>   — never sent to the server
- *   - query param:    https://host/pkg.zip?sha256=<64 hex>  — `checksum=` is accepted too
+ * The fragment is the only honored marker: unlike a query param it is not part of the request, so
+ * it cannot collide with a param the download host itself uses — a `?sha256=`/`?checksum=` on a
+ * CDN or artifact URL means something to THAT host, and seizing it as an integrity pin would
+ * fail or mis-verify an unrelated download.
  * Returns the lowercase expected digest, or null when the URL carries no integrity marker.
  *
- * Throws when a marker is present but malformed (not 64 hex chars) or when fragment and query
- * disagree: the caller explicitly asked for integrity, so an unusable marker fails closed rather
- * than silently degrading to no verification.
+ * Throws when the marker is present but malformed (not 64 hex chars): the caller explicitly asked
+ * for integrity, so an unusable marker fails closed rather than silently degrading to no
+ * verification.
  */
 export function expectedSha256FromUrl(url: string): string | null {
   let parsed: URL;
@@ -26,23 +29,12 @@ export function expectedSha256FromUrl(url: string): string | null {
   } catch {
     return null; // not a parseable URL — the SSRF guard / fetch rejects it downstream
   }
-  const markers: string[] = [];
-  if (parsed.hash.startsWith('#sha256=')) {
-    markers.push(parsed.hash.slice('#sha256='.length));
-  }
-  for (const key of ['sha256', 'checksum']) {
-    const value = parsed.searchParams.get(key);
-    if (value !== null) markers.push(value);
-  }
-  if (markers.length === 0) return null;
-  const digests = markers.map(marker => marker.trim().toLowerCase());
-  if (digests.some(digest => !SHA256_HEX.test(digest))) {
+  if (!parsed.hash.startsWith('#sha256=')) return null;
+  const digest = parsed.hash.slice('#sha256='.length).trim().toLowerCase();
+  if (!SHA256_HEX.test(digest)) {
     throw new Error('the URL carries a sha256 integrity marker that is not a 64-character hex digest');
   }
-  if (new Set(digests).size > 1) {
-    throw new Error('the URL carries conflicting sha256 integrity markers');
-  }
-  return digests[0];
+  return digest;
 }
 
 /**
@@ -57,6 +49,47 @@ export function assertDownloadSha256(url: string, body: Buffer): void {
   const actual = createHash('sha256').update(body).digest('hex');
   if (actual !== expected) {
     throw new Error(`sha256 mismatch for the downloaded package (expected ${expected}, got ${actual})`);
+  }
+}
+
+/**
+ * Transport rule for a plugin install/update URL, enforced BEFORE any fetch. The downloaded bytes
+ * are executable code, so plain http is only accepted when the URL pins the expected content with a
+ * `#sha256=<64 hex>` fragment — the pin is then verified against the download (fail-closed) before
+ * anything is installed. https is accepted as-is (TLS is the integrity layer), and anything else —
+ * an unparseable URL or a non-http(s) scheme — is left for the SSRF guard to reject downstream.
+ */
+export function assertPluginInstallUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return; // not a parseable URL — resolveSafeFetchTarget rejects it with the clearer error
+  }
+  // expectedSha256FromUrl throws on a malformed marker. On http that surfaces here (fail-closed
+  // at the transport gate); on https it is left for the post-download integrity check to report,
+  // preserving that error's wording — either way an explicit-but-unusable pin never degrades to
+  // "no pin".
+  let pinned = false;
+  try {
+    pinned = expectedSha256FromUrl(url) !== null;
+  } catch (error) {
+    if (parsed.protocol === 'http:') throw error;
+  }
+  if (parsed.protocol === 'http:' && !pinned) {
+    throw new Error('plain http is only accepted with a content pin: append #sha256=<64 hex> to the URL, or use https');
+  }
+  // Installing a plugin is executing third-party code on the host. HTTPS authenticates the
+  // CHANNEL, not the bytes-as-reviewed — a compromised release host or a hijacked catalog still
+  // ships whatever it likes. In production (or wherever PLUGIN_INSTALL_REQUIRE_PIN says so) an
+  // install from a URL therefore requires the pin; dev keeps the lighter default.
+  const requirePin =
+    process.env.PLUGIN_INSTALL_REQUIRE_PIN === 'true' ||
+    (process.env.PLUGIN_INSTALL_REQUIRE_PIN !== 'false' && process.env.NODE_ENV === 'production');
+  if (requirePin && !pinned) {
+    throw new Error(
+      'installing from a URL requires an integrity pin in this deployment: append #sha256=<64 hex> to the URL (PLUGIN_INSTALL_REQUIRE_PIN=false disables this)',
+    );
   }
 }
 

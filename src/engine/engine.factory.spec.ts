@@ -6,6 +6,7 @@ import { ConfigService } from '@nestjs/config';
 import { PluginLoaderService, PluginType } from '../core/plugins';
 import { BaileysMessageStoreService } from './adapters/baileys-message-store.service';
 import { LidMappingStoreService } from './identity/lid-mapping-store.service';
+import { ChatStateStoreService } from './adapters/baileys-chat-state-store.service';
 
 describe('EngineFactory', () => {
   const engineBlob = {
@@ -36,12 +37,25 @@ describe('EngineFactory', () => {
       remember: jest.fn().mockResolvedValue(undefined),
     }) as unknown as LidMappingStoreService;
 
+  const buildChatStateStore = (): ChatStateStoreService =>
+    ({
+      get: jest.fn(),
+      remember: jest.fn().mockResolvedValue(undefined),
+      reload: jest.fn().mockResolvedValue(undefined),
+    }) as unknown as ChatStateStoreService;
+
   it('refuses to create an engine for an unsafe session name (path-traversal into the auth dir)', () => {
     const createEngine = jest.fn().mockReturnValue({});
     const pluginLoader = {
       getPlugin: jest.fn().mockReturnValue({ instance: { type: PluginType.ENGINE, createEngine } }),
     } as unknown as PluginLoaderService;
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
 
     expect(() => factory.create({ sessionId: '../../etc', dbSessionId: 'db-1' })).toThrow(/unsafe session name/i);
     expect(() => factory.create({ sessionId: 'a/b', dbSessionId: 'db-1' })).toThrow(/unsafe session name/i);
@@ -55,7 +69,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn().mockReturnValue({ instance: pluginInstance }),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     factory.create({ sessionId: 'sess-1', dbSessionId: 'db-1', proxyUrl: 'http://p', proxyType: 'http' });
 
     // Plain-object (not objectContaining) assertion: any browser key (headless/puppeteerArgs/
@@ -76,7 +96,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn(),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     await factory.onModuleInit();
 
     expect(registerBuiltInPlugin).toHaveBeenCalledWith(
@@ -94,7 +120,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn(),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     await factory.onModuleInit();
 
     const registeredIds = registerBuiltInPlugin.mock.calls.map(call => (call as [{ id: string }])[0].id);
@@ -107,7 +139,13 @@ describe('EngineFactory', () => {
       getPlugin: jest.fn().mockReturnValue(undefined),
     } as unknown as PluginLoaderService;
 
-    const factory = new EngineFactory(buildConfigService(), pluginLoader, buildMessageStore(), buildLidStore());
+    const factory = new EngineFactory(
+      buildConfigService(),
+      pluginLoader,
+      buildMessageStore(),
+      buildLidStore(),
+      buildChatStateStore(),
+    );
     expect(() => factory.create({ sessionId: 'sess-2', dbSessionId: 'db-2' })).not.toThrow();
   });
 
@@ -123,8 +161,59 @@ describe('EngineFactory', () => {
       pluginLoader,
       buildMessageStore(),
       buildLidStore(),
+      buildChatStateStore(),
     );
     expect(() => factory.create({ sessionId: 'sess-b', dbSessionId: 'db-b' })).toThrow(/baileys/i);
+  });
+
+  describe('create() makes the session credential directories owner-only', () => {
+    let tmpRoot: string;
+
+    beforeEach(() => {
+      tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-create-'));
+    });
+    afterEach(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const buildTmpFactory = (preLoosen?: boolean) => {
+      const sessionDataPath = path.join(tmpRoot, 'sessions');
+      const authDir = path.join(tmpRoot, 'baileys');
+      // An upgrade reuses the dirs a previous install left world-readable (default umask); fresh
+      // installs have no dirs at all. Both must end at 0o700 after create().
+      if (preLoosen) {
+        fs.mkdirSync(path.join(sessionDataPath, 'session-alice'), { recursive: true, mode: 0o755 });
+        fs.mkdirSync(path.join(authDir, 'alice'), { recursive: true, mode: 0o755 });
+      }
+      const createEngine = jest.fn().mockReturnValue({});
+      const pluginLoader = {
+        getPlugin: jest.fn().mockReturnValue({ instance: { type: PluginType.ENGINE, createEngine } }),
+      } as unknown as PluginLoaderService;
+      const factory = new EngineFactory(
+        buildConfigService({
+          'engine.sessionDataPath': sessionDataPath,
+          'engine.baileys.authDir': authDir,
+        }),
+        pluginLoader,
+        buildMessageStore(),
+        buildLidStore(),
+        buildChatStateStore(),
+      );
+      return {
+        factory,
+        wwjsDir: path.join(sessionDataPath, 'session-alice'),
+        baileysDir: path.join(authDir, 'alice'),
+      };
+    };
+
+    it.each([false, true])('hardens both engine shapes on a %s install', preLoosen => {
+      const { factory, wwjsDir, baileysDir } = buildTmpFactory(preLoosen);
+
+      factory.create({ sessionId: 'alice', dbSessionId: 'db-1' });
+
+      expect(fs.statSync(wwjsDir).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(baileysDir).mode & 0o777).toBe(0o700);
+    });
   });
 
   describe('purgeSessionData (delete fully removes on-disk auth, keyed by session name)', () => {
@@ -151,6 +240,7 @@ describe('EngineFactory', () => {
         noPluginLoader(),
         buildMessageStore(),
         buildLidStore(),
+        buildChatStateStore(),
       );
       return { factory, wwjsDir: path.join(sessionDataPath, 'session-alice'), baileysDir: path.join(authDir, 'alice') };
     };

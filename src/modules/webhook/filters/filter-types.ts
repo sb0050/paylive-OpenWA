@@ -9,6 +9,9 @@
  * subscribed to several families behaves sanely without per-event filter sets.
  */
 
+import { MessageType } from '../../../engine/interfaces/whatsapp-engine.interface';
+import { chatKind, type ChatKind } from '../../../engine/identity/wa-id';
+
 export type FilterOperator = 'is' | 'isNot' | 'contains' | 'equals';
 
 /** Value shape a field resolves to, which decides how operators are applied. */
@@ -35,21 +38,33 @@ export interface FieldDefinition {
   enumValues?: readonly string[];
 }
 
-export const MESSAGE_TYPES = [
-  'text',
-  'image',
-  'video',
-  'audio',
-  'voice',
-  'document',
-  'sticker',
-  'location',
-  'contact',
-  'call',
-  'revoked',
-  'masked',
-  'unknown',
-] as const;
+/**
+ * Every neutral message type a `type` filter condition may name. Derived exhaustively from the
+ * engine-neutral {@link MessageType} union so a type added there cannot be silently rejected here:
+ * `poll` was offered by the dashboard's own copy of this list while saving was refused as invalid.
+ * The `Record<MessageType, ...>` shape makes an omitted or stale entry a compile error.
+ */
+const MESSAGE_TYPE_FLAGS: Record<MessageType, true> = {
+  text: true,
+  image: true,
+  video: true,
+  audio: true,
+  voice: true,
+  document: true,
+  sticker: true,
+  location: true,
+  contact: true,
+  poll: true,
+  call: true,
+  revoked: true,
+  masked: true,
+  unknown: true,
+};
+
+export const MESSAGE_TYPES: readonly MessageType[] = Object.keys(MESSAGE_TYPE_FLAGS) as MessageType[];
+
+/** Chat kinds a message-family filter can match on. `channel` is a newsletter; see chatKind(). */
+export const CHAT_KINDS: readonly ChatKind[] = ['individual', 'group', 'channel', 'status', 'broadcast', 'unknown'];
 
 // Guard rails. These bound both stored config size and per-event evaluation cost.
 export const MAX_CONDITIONS = 20;
@@ -100,6 +115,22 @@ export const FILTER_FIELDS: Record<string, FieldDefinition[]> = {
       kind: 'boolean',
       operators: BOOLEAN_OPERATORS,
       resolve: data => data.isGroup === true,
+    },
+    {
+      // The chat kind, so a filter can single out or exclude a channel (newsletter) where the
+      // boolean isGroup cannot: individual, group, channel, status, broadcast and unknown all
+      // collapse to isGroup=false. `kind` rides the received payload directly; the edited, reaction
+      // and revoked events in this family carry only chatId, so derive it there.
+      field: 'kind',
+      kind: 'enum',
+      operators: ENUM_OPERATORS,
+      enumValues: CHAT_KINDS,
+      resolve: data => {
+        const k = str(data.kind);
+        if (k) return k;
+        const chatId = str(data.chatId);
+        return chatId ? chatKind(chatId) : undefined;
+      },
     },
     {
       field: 'fromMe',

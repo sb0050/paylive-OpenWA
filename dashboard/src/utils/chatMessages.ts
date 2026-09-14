@@ -64,8 +64,14 @@ export function mergeChatMessages(db: ChatMessage[], history: ChatMessage[]): Ch
  * the same 📎 placeholder as a history row fetched without media; the newest `keep` stay
  * renderable (thread + lightbox). Count-based (not byte-based): payloads are bounded upstream
  * by the backend's media size cap.
+ *
+ * The cap bounds the RENDERED set, not the fetch window: useChatMessages pages, so a thread scrolled
+ * back far enough holds several 100-row pages and the older payloads inside the scrollable window
+ * fall back to the 📎 placeholder, whose download button still works. Do not scale `keep` with the
+ * page count to close that gap — the rendered set is exactly where a payload costs a second `data:`
+ * URI copy and a decoded bitmap, so scaling removes the bound this exists to enforce.
  */
-export const MEDIA_PAYLOAD_CACHE_LIMIT = 25;
+export const MEDIA_PAYLOAD_CACHE_LIMIT = 100;
 
 /**
  * Enforce MEDIA_PAYLOAD_CACHE_LIMIT on an ascending message list, stripping the oldest payloads
@@ -101,7 +107,21 @@ export const senderKey = (m: Pick<ChatMessage, 'author' | 'chatName'>): string |
 
 // ChatMessageView extends ChatMessage with the view-only fields the chat page renders.
 // Lifted from Chats.tsx so hooks/utils can share the same shape.
-type MessageMedia = { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
+export type MessageMedia = {
+  mimetype: string;
+  filename?: string;
+  data?: string;
+  omitted?: boolean;
+  sizeBytes?: number;
+};
+
+export const getMediaSrc = (media?: MessageMedia): string => {
+  if (!media || !media.data) return '';
+  if (media.data.startsWith('data:') || media.data.startsWith('http://') || media.data.startsWith('https://')) {
+    return media.data;
+  }
+  return `data:${media.mimetype};base64,${media.data}`;
+};
 
 export interface ChatMessageView extends ChatMessage {
   metadata?: {
@@ -131,12 +151,30 @@ export function mergeDeliveryStatus(
 }
 
 /**
+ * The reaction map to store after a `message.reaction` event.
+ *
+ * The gateway OMITS `reactions` when it holds no stored copy of the message to snapshot from — an
+ * ephemeral message, or one that predates the session going live. Absent means "unknown", so the map
+ * already on screen survives, including the optimistic reaction the local user just added under the
+ * `me` key. An empty object is a different claim: every reaction was withdrawn, and that must clear
+ * the badge. `??` draws that line where `||` would not, which is the whole reason this is a named
+ * function rather than an inline expression — the socket layer carries the absence through
+ * deliberately (useWebSocket.ts) and flattening it anywhere in between makes this dead code.
+ */
+export function mergeReactionSnapshot(
+  existing: Record<string, string> | undefined,
+  incoming: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  return incoming ?? existing;
+}
+
+/**
  * Merge two metadata bags field-by-field. The incoming copy wins per field only when it actually
  * carries a value — a live `message.sent` echo is built as `{media, quotedMessage, call}` with
  * undefined leaves, and a wholesale `incoming ?? existing` swap would wipe the optimistic bubble's
- * quote/call. Media has one extra rule: an incoming marker WITHOUT the payload (the engine's
- * own-send echo and the media-less history fetch both emit `{media: {omitted: true}}` with no
- * `data`) must not clobber an existing copy holding the real base64 — the optimistic send bubble is
+ * quote/call. Media has one extra rule: an incoming marker WITHOUT the payload (a Baileys API-send
+ * echo and the media-less history fetch both emit `{media: {omitted: true}}` with no `data`) must
+ * not clobber an existing copy holding the real base64 — the optimistic send bubble is
  * the only copy with the payload until a refetch, and the cache is staleTime: Infinity.
  */
 function mergeMessageMetadata(
@@ -171,6 +209,9 @@ function mergeMessageMetadata(
  * the existing media/quote — see mergeMessageMetadata). The result is run through capMediaPayloads
  * so a long session of incoming media can't grow the cached slice's base64 heap without bound.
  * Returns a new array — does not mutate the input.
+ *
+ * Requires an ASCENDING (oldest-first) `list` — the cap strips from the front, so a caller holding
+ * a `createdAt DESC` page would need to reverse it first, not call this directly on server order.
  */
 export function mergeOrAppend(list: ChatMessageView[], incoming: ChatMessageView): ChatMessageView[] {
   const idx = list.findIndex(m => msgKey(m) === msgKey(incoming));
@@ -210,6 +251,35 @@ export function removeMessageById(list: ChatMessageView[], id: string): ChatMess
   return list.filter(m => m.id !== id);
 }
 
+/** Does this row carry the given WhatsApp identity, under either of the two ids it can be keyed by? */
+export const byMessageId =
+  (messageId: string) =>
+  (m: ChatMessageView): boolean =>
+    m.id === messageId || m.waMessageId === messageId;
+
+/**
+ * Patch every row a WhatsApp identity names, leaving the array untouched when none match.
+ *
+ * Every match is patched, not just the first: a paged cache can hold the persisted row and its live
+ * copy on different pages (see findRevokedIndex for why the two are keyed differently), and
+ * patching only the one the merged view preferred would leave the other stale.
+ */
+export function patchMatchingMessage(
+  list: ChatMessageView[],
+  messageId: string,
+  patch: (message: ChatMessageView) => ChatMessageView,
+): ChatMessageView[] {
+  const isMatch = byMessageId(messageId);
+  let changed = false;
+  const next = list.map(m => {
+    if (!isMatch(m)) return m;
+    const patched = patch(m);
+    if (patched !== m) changed = true;
+    return patched;
+  });
+  return changed ? next : list;
+}
+
 /**
  * Locate the message a `message.revoked` event refers to. Returns -1 if it isn't cached.
  *
@@ -226,21 +296,22 @@ export function removeMessageById(list: ChatMessageView[], id: string): ChatMess
  * whose `waMessageId` is also undefined.
  */
 export function findRevokedIndex(list: ChatMessageView[], event: { id: string; revokedId?: string }): number {
-  const matches = (m: ChatMessageView, candidate: string): boolean => m.id === candidate || m.waMessageId === candidate;
-  return list.findIndex(m => matches(m, event.id) || (event.revokedId !== undefined && matches(m, event.revokedId)));
+  const byId = byMessageId(event.id);
+  const byRevokedId = event.revokedId !== undefined ? byMessageId(event.revokedId) : undefined;
+  return list.findIndex(m => byId(m) || (byRevokedId?.(m) ?? false));
 }
 
 /**
- * Replace the displayed body of a cached WhatsApp message after a `message.edited` event. Persisted
- * rows use a local UUID in `id` and the WhatsApp identity in `waMessageId`; live rows often use the
- * WhatsApp identity for both, so both candidates are required. Returns the original array on a miss.
+ * Replace the displayed body of a cached WhatsApp message after a `message.edited` event. Both id
+ * candidates are matched, for the reason given on findRevokedIndex. Returns the original array on
+ * a miss.
  */
 export function applyMessageEdit(
   list: ChatMessageView[],
   event: { messageId: string; body: string },
 ): ChatMessageView[] {
   if (!event.messageId) return list;
-  const idx = list.findIndex(m => m.id === event.messageId || m.waMessageId === event.messageId);
+  const idx = list.findIndex(byMessageId(event.messageId));
   if (idx === -1) return list;
   const next = list.slice();
   next[idx] = { ...next[idx], body: event.body };

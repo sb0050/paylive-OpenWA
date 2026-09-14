@@ -2,13 +2,13 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Languages } from 'lucide-react';
 import { GithubIcon } from '../components/GithubIcon';
-import { authApi } from '../services/api';
 import { CustomSelect } from '../components/CustomSelect';
 import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
+import { API_BASE_URL } from '../services/api';
 import './Login.css';
 
 interface LoginProps {
-  onLogin: (apiKey: string) => void;
+  onLogin: (apiKey: string, role?: string) => void;
 }
 
 export function Login({ onLogin }: LoginProps) {
@@ -33,11 +33,22 @@ export function Login({ onLogin }: LoginProps) {
     setError('');
 
     try {
-      const data = await authApi.validate(apiKey);
-      if (data.valid) {
-        onLogin(apiKey);
+      const response = await fetch(`${API_BASE_URL}/auth/validate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': apiKey,
+        },
+      });
+
+      if (response.ok) {
+        // The validate body already carries the key's role — hand it up so the app can set it
+        // directly instead of re-validating the same key a second time.
+        const data: { role?: string } = await response.json().catch(() => ({}));
+        onLogin(apiKey, data.role);
       } else {
-        setError(t('login.invalidKey'));
+        const errorData = await response.json().catch(() => ({}));
+        setError(errorData.message || t('login.invalidKey'));
       }
     } catch {
       setError(t('login.connectionError'));

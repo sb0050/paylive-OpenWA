@@ -1,5 +1,26 @@
 import { BaileysSessionStore } from './baileys-session-store';
 import type { LidMappingStore } from '../identity/lid-mapping-store.service';
+import type { ChatStateStore, ChatStateValue } from './baileys-chat-state-store.service';
+import { userPart } from '../identity/wa-id';
+
+/** In-memory ChatStateStore for tests: remember() applies synchronously so a following read sees it. */
+class FakeChatStateStore implements ChatStateStore {
+  readonly rows = new Map<string, ChatStateValue>();
+  private key(s: string, c: string): string {
+    return `${s}\u0000${c}`;
+  }
+  get(s: string, c: string): ChatStateValue | undefined {
+    return this.rows.get(this.key(s, c));
+  }
+  remember(s: string, c: string, patch: Partial<ChatStateValue>): Promise<void> {
+    const existing = this.rows.get(this.key(s, c)) ?? { muteEndTime: null, archived: false, pinned: false };
+    this.rows.set(this.key(s, c), { ...existing, ...patch });
+    return Promise.resolve();
+  }
+  reload(): Promise<void> {
+    return Promise.resolve();
+  }
+}
 
 describe('BaileysSessionStore', () => {
   let store: BaileysSessionStore;
@@ -25,6 +46,144 @@ describe('BaileysSessionStore', () => {
     expect(store.listContacts()).toHaveLength(1);
   });
 
+  /**
+   * Baileys documents `name` as the one YOU saved and `notify` as the pushname the contact set
+   * themselves, so a contact carrying only `notify` is not in the addressbook. Reporting true for
+   * everyone told an automation that every chat partner was a saved contact.
+   */
+  it('reports isMyContact from the saved name, not for every contact seen', () => {
+    store.upsertContacts([
+      { id: '628111@s.whatsapp.net', name: 'Alice', notify: 'Al' },
+      { id: '628222@s.whatsapp.net', notify: 'Bob' },
+    ]);
+    expect(store.findContact('628111@s.whatsapp.net')?.isMyContact).toBe(true);
+    expect(store.findContact('628222@s.whatsapp.net')?.isMyContact).toBe(false);
+    // The pushname still surfaces either way; it is the addressbook claim that changed.
+    expect(store.findContact('628222@s.whatsapp.net')?.pushName).toBe('Bob');
+  });
+
+  describe('archived, pinned and muted state', () => {
+    // A fresh store per call: upsertChats MERGES, so reusing one store lets an absent-field case
+    // re-read a value a prior call set, and the default-to-false path would never run.
+    const chatFor = (over: Record<string, unknown>) => {
+      const s = new BaileysSessionStore();
+      s.upsertChats([{ id: '628111@s.whatsapp.net', name: 'Alice', ...over }]);
+      return s.listChats()[0];
+    };
+
+    it('maps archived, pinned and muted each from its own field', () => {
+      // No Baileys case asserted archived: true before, so `archived: c.archived ?? false` could be
+      // a constant false and stay green. Mixed values pin each flag to its own source.
+      expect(chatFor({ archived: true, pinned: 0, muteEndTime: 0 })).toMatchObject({
+        archived: true,
+        pinned: false,
+        muted: false,
+      });
+      expect(chatFor({ archived: false, pinned: 2, muteEndTime: 0 })).toMatchObject({
+        archived: false,
+        pinned: true,
+        muted: false,
+      });
+    });
+
+    it('reads a pin as a flag, though Baileys reports it as an order', () => {
+      // proto.IConversation.pinned is a NUMBER — its position among pinned chats, not a boolean.
+      expect(chatFor({ pinned: 2 }).pinned).toBe(true);
+      expect(chatFor({ pinned: 0 }).pinned).toBe(false);
+      expect(chatFor({}).pinned).toBe(false);
+    });
+
+    it('treats a mute as active only while its end time is still ahead', () => {
+      const inAnHourMs = Date.now() + 60 * 60 * 1000;
+      const anHourAgoMs = Date.now() - 60 * 60 * 1000;
+      expect(chatFor({ muteEndTime: inAnHourMs }).muted).toBe(true);
+      expect(chatFor({ muteEndTime: anHourAgoMs }).muted).toBe(false);
+      expect(chatFor({ muteEndTime: 0 }).muted).toBe(false);
+      expect(chatFor({}).muted).toBe(false);
+    });
+
+    it('reads both units: epoch ms from an app-state write and epoch seconds from history sync', () => {
+      // A chatModify({ mute }) write echoes back the epoch-MS value the gateway passed; a history-sync
+      // Conversation.muteEndTime is epoch SECONDS (like conversationTimestamp on the same record). Both
+      // must read as muted while ahead, else a synced mute reads unmuted.
+      const nowS = Math.floor(Date.now() / 1000);
+      expect(chatFor({ muteEndTime: (nowS + 3600) * 1000 }).muted).toBe(true); // ms, still ahead
+      expect(chatFor({ muteEndTime: nowS + 3600 }).muted).toBe(true); // seconds, still ahead
+      expect(chatFor({ muteEndTime: nowS - 3600 }).muted).toBe(false); // seconds, already past
+    });
+
+    it('accepts a Long, which is what the proto actually hands over', () => {
+      const asLong = { toNumber: () => Date.now() + 60 * 60 * 1000 };
+      expect(chatFor({ muteEndTime: asLong }).muted).toBe(true);
+    });
+  });
+
+  describe('chat-state persistence (survives a reconnect Baileys cannot resync)', () => {
+    const SID = 'sess-1';
+    const CHAT = '628111@s.whatsapp.net';
+    let fake: FakeChatStateStore;
+    beforeEach(() => {
+      fake = new FakeChatStateStore();
+    });
+    // A fresh store sharing the SAME fake models a process restart: this.chats is empty and rebuilds
+    // from history sync, but the persisted state is retained.
+    const newStore = () => new BaileysSessionStore(undefined, SID, fake);
+    const chatOn = (s: BaileysSessionStore, over: Record<string, unknown>) => {
+      s.upsertChats([{ id: CHAT, name: 'Alice', ...over }]);
+      return s.listChats()[0];
+    };
+
+    it('persists a mute and reads it back as muted', () => {
+      expect(chatOn(newStore(), { muteEndTime: Date.now() + 60 * 60 * 1000 }).muted).toBe(true);
+      expect(fake.rows.size).toBe(1);
+    });
+
+    it('a fresh process reads a mute set before the restart, though history sync omits muteEndTime', () => {
+      chatOn(newStore(), { muteEndTime: Date.now() + 60 * 60 * 1000 });
+      // Restart: this.chats is rebuilt from a history-sync record with NO muteEndTime key.
+      expect(chatOn(newStore(), { name: 'Alice' }).muted).toBe(true);
+    });
+
+    it('a live unmute (muteEndTime: null) persists and reads unmuted, across a restart', () => {
+      const s = newStore();
+      chatOn(s, { muteEndTime: Date.now() + 3_600_000 });
+      expect(chatOn(s, { muteEndTime: null }).muted).toBe(false);
+      expect(chatOn(newStore(), { name: 'Alice' }).muted).toBe(false);
+    });
+
+    it('archived and pinned persist and survive a restart', () => {
+      chatOn(newStore(), { archived: true, pinned: 2 });
+      expect(chatOn(newStore(), { name: 'Alice' })).toMatchObject({ archived: true, pinned: true });
+    });
+
+    it('a partial update lacking the keys does not clobber persisted state', () => {
+      const s = newStore();
+      chatOn(s, { muteEndTime: Date.now() + 3_600_000, archived: true });
+      expect(chatOn(s, { name: 'Renamed' })).toMatchObject({ muted: true, archived: true });
+    });
+
+    it('normalizes a seconds-scale muteEndTime to ms on persist', () => {
+      const nowS = Math.floor(Date.now() / 1000);
+      chatOn(newStore(), { muteEndTime: nowS + 3600 });
+      expect(fake.get(SID, CHAT)?.muteEndTime).toBe((nowS + 3600) * 1000);
+      expect(chatOn(newStore(), { name: 'Alice' }).muted).toBe(true);
+    });
+
+    it('reports muteExpiration in ms when muted, absent when not, and survives a restart', () => {
+      const endMs = Date.now() + 90 * 60 * 1000;
+      expect(chatOn(newStore(), { muteEndTime: endMs })).toMatchObject({ muted: true, muteExpiration: endMs });
+      // Restart: the fresh store's this.chats has no muteEndTime, but the persisted expiry is read back.
+      expect(chatOn(newStore(), { name: 'Alice' })).toMatchObject({ muted: true, muteExpiration: endMs });
+      // An unmuted chat carries no expiry (undefined, so omitted from the JSON payload).
+      expect(chatOn(newStore(), { muteEndTime: null }).muteExpiration).toBeUndefined();
+    });
+
+    it('normalizes a seconds-scale expiry to ms for muteExpiration', () => {
+      const nowS = Math.floor(Date.now() / 1000);
+      expect(chatOn(newStore(), { muteEndTime: nowS + 3600 }).muteExpiration).toBe((nowS + 3600) * 1000);
+    });
+  });
+
   it('records the newest message per chat and surfaces it in getChats', () => {
     store.upsertChats([{ id: '628111@s.whatsapp.net', name: 'Alice', unreadCount: 2 }]);
     store.recordMessage({
@@ -47,6 +206,9 @@ describe('BaileysSessionStore', () => {
         unreadCount: 2,
         timestamp: 200,
         lastMessage: 'newest',
+        archived: false,
+        pinned: false,
+        muted: false,
       },
     ]);
     expect(store.lastMessage('628111@s.whatsapp.net')).toEqual({
@@ -317,9 +479,12 @@ describe('BaileysSessionStore', () => {
   describe('persistent lid->phone table', () => {
     const makeFakeLidStore = () => {
       const map = new Map<string, string | null>();
+      const getCached = jest.fn((lid: string) => map.get(lid));
       return {
         map,
-        getCached: jest.fn((lid: string) => map.get(lid)),
+        getCached,
+        // Mirrors the real implementation: userPart of the JID through getCached, null on a miss.
+        resolveLid: jest.fn((jid: string) => getCached(userPart(jid)) ?? null),
         lidsForPhone: jest.fn(() => [] as string[]),
         remember: jest.fn((lid: string, phone: string | null) => {
           map.set(lid, phone);
@@ -426,8 +591,10 @@ describe('BaileysSessionStore', () => {
 
     it('bounds lidToPn: an evicted mapping still resolves via the write-through persistent table', () => {
       const map = new Map<string, string | null>();
+      const getCached = jest.fn((lid: string) => map.get(lid));
       const lidStore = {
-        getCached: jest.fn((lid: string) => map.get(lid)),
+        getCached,
+        resolveLid: jest.fn((jid: string) => getCached(userPart(jid)) ?? null),
         lidsForPhone: jest.fn(() => [] as string[]),
         remember: jest.fn((lid: string, phone: string | null) => {
           map.set(lid, phone);
@@ -477,6 +644,12 @@ describe('BaileysSessionStore', () => {
       expect(s.listContacts()).toHaveLength(5000);
       expect(s.findContact('62100000@s.whatsapp.net')).toBeNull(); // the oldest went first
       expect(s.findContact('62105000@s.whatsapp.net')).not.toBeNull();
+    });
+
+    it('treats a blank override as unset, not as 0 (unbounded)', () => {
+      const s = storeWithCap('');
+      s.upsertContacts(Array.from({ length: 5001 }, (_, i) => ({ id: `62${100000 + i}@s.whatsapp.net` })));
+      expect(s.listContacts()).toHaveLength(5000);
     });
   });
 });

@@ -2,9 +2,11 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { LidMapping } from './lid-mapping.entity';
+import { userPart } from './wa-id';
 import { createLogger } from '../../common/services/logger.service';
+import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
-// Default cap on the in-memory lid->phone mirror. Every other long-lived map in the audited surface is
+// Default cap on the in-memory lid->phone mirror. Every other long-lived map in the engine surface is
 // bounded (the per-session lidPhoneCache is 5000); the LID mirror was the lone exception. A miss falls
 // back to engine re-resolution, so the cap trades a re-resolution for bounded memory, never data loss.
 export const LID_MAPPING_CACHE_DEFAULT = 5000;
@@ -16,8 +18,17 @@ export const LID_MAPPING_CACHE_DEFAULT = 5000;
  * (mirrors {@link BaileysMessageStore}).
  */
 export interface LidMappingStore {
-  /** Sync read from the in-memory cache: phone digits, `null` = known-unresolved, `undefined` = never seen. */
+  /**
+   * Sync read from the in-memory cache: phone digits, `null` = known-unresolved, `undefined` = never
+   * seen. A miss is warmed from the persisted table in the background, so a later read can hit.
+   */
   getCached(lid: string): string | null | undefined;
+  /**
+   * Resolve any WA JID through the mirror: the phone digits for its user part, `null` when the lid
+   * is known-unresolved or never seen. The webhook filter match, automation-rule match, plugin
+   * engine reads, and status contact grouping all resolve through this one method so they agree.
+   */
+  resolveLid(jid: string): string | null;
   /** Sync reverse lookup: the lids currently mapped to this phone (used by the message from-filter). */
   lidsForPhone(phone: string): string[];
   /** Write-through, last-write-wins: update the cache + persist. A `null` phone records a negative result. */
@@ -32,7 +43,8 @@ export interface LidMappingStore {
  *
  * The forward map is bounded by an LRU cap (`LID_MAPPING_CACHE_MAX`, default 5000) so a long-running,
  * contact-heavy account does not accumulate one entry per distinct LID ever seen into a slow memory leak.
- * A cache miss falls back to engine re-resolution (the table remains the source of truth), so eviction
+ * A cache miss is warmed from the table in the background (rows past the preload cap stay resolvable)
+ * and otherwise falls back to engine re-resolution (the table remains the source of truth), so eviction
  * only costs a re-resolution, never data loss. The reverse map is reconciled on each eviction so it does
  * not retain entries for LIDs no longer in the forward cache.
  */
@@ -41,7 +53,9 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
   private readonly logger = createLogger('LidMappingStore');
   private readonly lidToPhone = new Map<string, string | null>();
   private readonly phoneToLids = new Map<string, Set<string>>();
-  // 0 = unbounded (legacy behaviour). Every other long-lived map in the audited surface is bounded, so
+  /** Repository fallbacks in flight, one per lid, so a hot miss path can't stack duplicate queries. */
+  private readonly pendingLookups = new Set<string>();
+  // 0 = unbounded (legacy behaviour). Every other long-lived map in the engine surface is bounded, so
   // the default is finite; the env override exists for operators who explicitly want the old behaviour.
   private readonly maxCachedLids: number;
 
@@ -49,8 +63,7 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
     @InjectRepository(LidMapping, 'data')
     private readonly repo: Repository<LidMapping>,
   ) {
-    const parsed = Number(process.env.LID_MAPPING_CACHE_MAX ?? LID_MAPPING_CACHE_DEFAULT);
-    this.maxCachedLids = Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : LID_MAPPING_CACHE_DEFAULT;
+    this.maxCachedLids = resolveNonNegativeIntEnv(process.env.LID_MAPPING_CACHE_MAX, LID_MAPPING_CACHE_DEFAULT);
   }
 
   async onModuleInit(): Promise<void> {
@@ -66,7 +79,14 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
    */
   async reload(): Promise<void> {
     try {
-      const rows = await this.repo.find();
+      // Deterministic preload: an unordered find() followed by LRU eviction keeps an ARBITRARY
+      // subset once the table exceeds the cap. Order by last-write and take at most the cap, so
+      // the resident subset is the most-recently-written mappings; older rows stay persisted and
+      // are warmed back on the first cache miss (see getCached).
+      const rows = await this.repo.find({
+        order: { updatedAt: 'DESC' },
+        take: this.maxCachedLids > 0 ? this.maxCachedLids : undefined,
+      });
       this.lidToPhone.clear();
       this.phoneToLids.clear();
       for (const row of rows) {
@@ -89,7 +109,12 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
       this.lidToPhone.set(lid, phone as string | null);
       return phone;
     }
+    this.warmFromTable(lid);
     return undefined;
+  }
+
+  resolveLid(jid: string): string | null {
+    return this.getCached(userPart(jid)) ?? null;
   }
 
   lidsForPhone(phone: string): string[] {
@@ -109,6 +134,28 @@ export class LidMappingStoreService implements LidMappingStore, OnModuleInit {
         `Failed to persist lid->phone mapping for ${lid}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  /**
+   * Repository fallback for a cache miss. Rows past the preload cap (or evicted by the LRU) are
+   * still persisted, so a miss is warmed from the table: THIS lookup still returns undefined —
+   * the sync read contract can't await, and callers fall back to engine re-resolution — but the
+   * next one hits. A table miss is NOT cached (a false negative would shadow a later remember);
+   * a read error is swallowed (the table may not exist yet), the same posture as reload().
+   */
+  private warmFromTable(lid: string): void {
+    if (!lid || this.pendingLookups.has(lid)) return;
+    this.pendingLookups.add(lid);
+    void this.repo
+      .findOne({ where: { lid } })
+      .then(row => {
+        // Last-write-wins: a remember() that landed while the lookup was in flight is newer.
+        if (row && !this.lidToPhone.has(row.lid)) {
+          this.index(row.lid, row.phone);
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => this.pendingLookups.delete(lid));
   }
 
   /** Update both in-memory indexes, dropping any stale reverse entry from a previous phone. */

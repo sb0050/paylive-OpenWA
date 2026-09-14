@@ -10,11 +10,13 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { Logger, OnModuleDestroy } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { AuthService } from '../auth/auth.service';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { resolveCorsPolicy } from '../../config/bootstrap-security';
 import { resolveClientIp as resolveRequestClientIp, type RequestLike } from '../../common/utils/ip';
+import { DEFAULT_WEBHOOK_MEDIA_INLINE_MAX_BYTES, shedInlineMedia } from '../../common/utils/inline-media';
 import type { ApiKey } from '../auth/entities/api-key.entity';
 import {
   readWsRateLimitConfig,
@@ -88,12 +90,10 @@ const EVICTION_MESSAGES: Record<ApiKeyEvictionReason, string> = {
     origin: resolveWsCorsOrigin(),
   },
   namespace: '/events',
-  // 2 Mo : les messages image (média base64) peuvent dépasser le défaut 1 Mo.
-  maxHttpBufferSize: 2 * 1024 * 1024,
 })
 export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy {
   @WebSocketServer()
-  server: Server;
+  server!: Server;
 
   private logger = new Logger('EventsGateway');
 
@@ -131,6 +131,7 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   constructor(
     private readonly authService: AuthService,
     private readonly auditService: AuditService,
+    private readonly configService: ConfigService,
   ) {
     this.rateLimits = readWsRateLimitConfig();
     this.frameLimiter = new TokenBucketLimiter(this.rateLimits.framePerSecond, this.rateLimits.frameBurst);
@@ -221,24 +222,6 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     }
   }
 
-  /**
-   * Read the API key from the socket handshake (auth field → header → query fallback).
-   * Lives on the handshake, so it's available synchronously on every event handler —
-   * unlike `client.data`, which is only populated once the async `handleConnection`
-   * resolves. handleSubscribe uses this as a fallback to avoid a connect/subscribe race
-   * (a client that emits `subscribe` inside its `connect` handler can be processed before
-   * handleConnection's `await validateApiKey` has stored `client.data.rawApiKey`).
-   */
-  private extractApiKey(client: Socket): string | undefined {
-    const handshakeAuth = client.handshake.auth as { apiKey?: string } | undefined;
-    return (
-      handshakeAuth?.apiKey ||
-      (client.handshake.headers['x-api-key'] as string) ||
-      (client.handshake.query.apiKey as string) ||
-      undefined
-    );
-  }
-
   async handleConnection(client: Socket) {
     // Resolve the client IP once here so the handshake throttle, the validation, and the
     // audit trail all use the same trusted-proxy-aware value (parity with the REST guard / MCP mount).
@@ -255,12 +238,10 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       return;
     }
 
-    // Read the key via auth → header → query. We deliberately KEEP the query fallback that upstream
-    // dropped for log-hygiene: the PayLive worker connects to OpenWA with `query: { apiKey }`
-    // (workers/src/openwaClient.ts), so removing it here would reject the worker's Socket.IO
-    // connection and break the entire WhatsApp realtime pipeline.
-    // TODO(paylive): migrate the worker to `auth: { apiKey }`, then switch to auth||header only.
-    const apiKey = this.extractApiKey(client);
+    // Accept the key only via Socket.IO's `auth` field or the header — never the query string, which
+    // leaks the credential into proxy/access logs. (The deprecated `?apiKey=` fallback was removed.)
+    const handshakeAuth = client.handshake.auth as { apiKey?: string } | undefined;
+    const apiKey = handshakeAuth?.apiKey || (client.handshake.headers['x-api-key'] as string);
 
     if (!apiKey) {
       this.logger.warn(`Client ${client.id} rejected: No API key provided`);
@@ -306,6 +287,12 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       (client.data as { apiKey: unknown; rawApiKey: string }).apiKey = validKey;
       (client.data as { rawApiKey: string }).rawApiKey = apiKey;
       this.trackSocket(validKey.id, client);
+      // The handshake window is charged pre-auth to keep an unauthenticated flood off the DB. This
+      // one turned out to be authentic, so give the slot back: the window then bounds FAILED
+      // handshakes, and authenticated connections stay bounded by maxSocketsPerKey above. Without
+      // this, every client behind one NAT/proxy IP shares a 10/min budget and normal dashboard
+      // re-mounts lock each other out.
+      this.handshakeLimiter.refund(clientIp);
       this.logger.log(`Client connected: ${client.id} (key: ${validKey.name})`);
     } catch (error) {
       this.logger.warn(`Client ${client.id} rejected: Auth error`, {
@@ -376,13 +363,9 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
     // Re-validate the API key on every subscribe: a long-lived socket whose key was
     // revoked/expired after connect must not be able to keep opening new subscriptions.
-    // Fall back to the handshake key when `client.data` isn't populated yet — a client
-    // that subscribes inside its `connect` handler can race the async handleConnection
-    // (which sets rawApiKey only after `await validateApiKey`). The handshake travels
-    // with the socket, so it's always readable here.
-    const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey ?? this.extractApiKey(client);
     // The clientIp is re-resolved (trusted-proxy-aware) so an IP-restricted key is enforced
     // here too, not just at connect.
+    const rawApiKey = (client.data as { rawApiKey?: string }).rawApiKey;
     const clientIp = this.resolveClientIp(client);
     let subscriberKey: { allowedSessions?: string[] | null } | null;
     try {
@@ -560,6 +543,44 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
+   * Emit a restriction change (imposed or lifted), mirroring the `session.restriction` webhook
+   * payload. Needed live because a restriction can arrive with no status transition at all (the
+   * Baileys reachout timelock rides a connect probe) — without this push the dashboard badge only
+   * appeared on a full page reload.
+   */
+  emitSessionRestriction(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'session.restriction', data);
+  }
+
+  /**
+   * The end of a ringing call, one method per outcome.
+   *
+   * Three methods rather than one taking the name as a parameter: the drift guard discovers emitters
+   * by reflection and invokes each with an empty payload, so a parameterised name would leave the
+   * event catalog unverifiable — exactly the drift the guard exists to catch.
+   */
+  emitCallAccepted(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'call.accepted', data);
+  }
+
+  emitCallRejected(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'call.rejected', data);
+  }
+
+  emitCallMissed(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'call.missed', data);
+  }
+
+  /**
+   * Emit a presence update. Socket-subscribable as well as webhook-delivered because presence is the
+   * one event whose whole value is being live — a webhook round-trip to render a typing indicator
+   * has usually expired by the time it arrives. Only actual changes reach here (see the wiring).
+   */
+  emitPresenceUpdate(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'presence.update', data);
+  }
+
+  /**
    * Emit QR code update for a session
    */
   emitQRCode(sessionId: string, qrCode: string) {
@@ -567,17 +588,32 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
+   * Cap for inline base64 media on the message events, shared with the webhook delivery path so
+   * both outbound sinks emit the same omitted-marker contract for an over-cap blob. Without this,
+   * every subscribed socket (and, with the Redis adapter, every replica's pub/sub link) receives a
+   * full copy of a payload that can carry media up to MEDIA_DOWNLOAD_MAX_BYTES (~67 MB base64 for
+   * the 50 MiB cap); status.received already keeps its events media-free.
+   */
+  private messageMediaInlineMaxBytes(): number {
+    return this.configService.get<number>('webhook.mediaInlineMaxBytes', DEFAULT_WEBHOOK_MEDIA_INLINE_MAX_BYTES);
+  }
+
+  /**
    * Emit new message notification
    */
   emitMessage(sessionId: string, message: Record<string, unknown>) {
-    this.emitToRooms(sessionId, 'message.received', message);
+    this.emitToRooms(sessionId, 'message.received', this.shedMessageMedia(message));
   }
 
   /**
    * Emit message sent notification
    */
   emitMessageSent(sessionId: string, message: Record<string, unknown>) {
-    this.emitToRooms(sessionId, 'message.sent', message);
+    this.emitToRooms(sessionId, 'message.sent', this.shedMessageMedia(message));
+  }
+
+  private shedMessageMedia(message: Record<string, unknown>): Record<string, unknown> {
+    return shedInlineMedia(message, this.messageMediaInlineMaxBytes());
   }
 
   /**
@@ -632,6 +668,16 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
    */
   emitGroupUpdate(sessionId: string, data: Record<string, unknown>) {
     this.emitToRooms(sessionId, 'group.update', data);
+  }
+
+  /**
+   * Emit a pending join request (someone asked to join a group the account admins, join-approval
+   * on). Payload mirrors the `group.join_request` webhook:
+   * `{ groupId, participantIds, timestamp, actorId? }` — participantIds are the users asking to
+   * join; actorId is who created the request when the engine reports one.
+   */
+  emitGroupJoinRequest(sessionId: string, data: Record<string, unknown>) {
+    this.emitToRooms(sessionId, 'group.join_request', data);
   }
 
   /**

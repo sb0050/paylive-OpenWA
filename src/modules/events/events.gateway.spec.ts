@@ -1,4 +1,8 @@
 import { UnauthorizedException } from '@nestjs/common';
+import type { ConfigService } from '@nestjs/config';
+
+// ConfigService stub for the media-shed knob: no override means the default cap applies.
+const asConfig = (): { get: jest.Mock } => ({ get: jest.fn((_key: string, defaultValue?: unknown) => defaultValue) });
 import { Socket } from 'socket.io';
 import { EventsGateway, isSessionSubscriptionAllowed } from './events.gateway';
 import { AuthService } from '../auth/auth.service';
@@ -68,7 +72,11 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
   beforeEach(() => {
     authService = { validateApiKey: jest.fn() };
     auditService = { logWarn: jest.fn().mockResolvedValue(null) };
-    gateway = new EventsGateway(authService as unknown as AuthService, auditService as unknown as AuditService);
+    gateway = new EventsGateway(
+      authService as unknown as AuthService,
+      auditService as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
+    );
   });
 
   it('rejects a connection with no API key (and never calls validate)', async () => {
@@ -78,19 +86,12 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(authService.validateApiKey).not.toHaveBeenCalled();
   });
 
-  // PayLive deviation from upstream: the query-string API key fallback is KEPT.
-  // The PayLive worker connects with `query: { apiKey }` (workers/src/openwaClient.ts),
-  // so extractApiKey reads auth → header → query. Upstream dropped query for log
-  // hygiene; we cannot until the worker migrates to `auth: { apiKey }` (see the
-  // TODO in events.gateway.ts handleConnection). This test guards that the fallback
-  // stays functional so we don't silently break the realtime pipeline on a resync.
-  it('accepts the API key from the query string (PayLive worker compatibility)', async () => {
-    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
+  it('does NOT accept the API key from the query string (credential must not travel in the URL)', async () => {
     const sock = makeSocket({});
-    sock.handshake.query.apiKey = 'worker-key-in-query';
+    sock.handshake.query.apiKey = 'leaky-key-in-url';
     await gateway.handleConnection(asSocket(sock));
-    expect(authService.validateApiKey).toHaveBeenCalledWith('worker-key-in-query', expect.anything());
-    expect(sock.disconnect).not.toHaveBeenCalled();
+    expect(authService.validateApiKey).not.toHaveBeenCalled(); // query key ignored → treated as missing
+    expect(sock.disconnect).toHaveBeenCalled();
   });
 
   it('audits a rejected WebSocket auth attempt (forensic parity with the REST guard)', async () => {
@@ -142,22 +143,6 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
 
     expect(res.type).toBe('subscribed');
     expect(sock.join).toHaveBeenCalled();
-  });
-
-  it('subscribes via the handshake key when client.data is not yet populated (connect/subscribe race)', async () => {
-    // Simulate a client that emits `subscribe` inside its `connect` handler, before the async
-    // handleConnection has stored `client.data.rawApiKey`. The handshake still carries the key.
-    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
-    const sock = makeSocket({ apiKey: 'good' }); // data:{} — handleConnection NOT awaited yet
-
-    const res = (await gateway.handleMessage(
-      asSocket(sock),
-      subscribeMsg('sess-1', ['message.received']),
-    )) as WSSubscribedResponse;
-
-    expect(res.type).toBe('subscribed');
-    expect(sock.join).toHaveBeenCalled();
-    expect(sock.disconnect).not.toHaveBeenCalled();
   });
 
   it('accepts a subscription to group.join (a live, engine-emitted event)', async () => {
@@ -402,11 +387,84 @@ const makeCapturingServer = () => {
   return { server, emit, rooms };
 };
 
+describe('EventsGateway inline-media shedding on message events', () => {
+  const gwWithCap = (cap?: number) => {
+    const config = {
+      get: jest.fn((_key: string, defaultValue?: unknown) => (cap === undefined ? defaultValue : cap)),
+    };
+    return new EventsGateway(
+      { validateApiKey: jest.fn() } as unknown as AuthService,
+      { logWarn: jest.fn().mockResolvedValue(null) } as unknown as AuditService,
+      config as unknown as ConfigService,
+    );
+  };
+  const bigMedia = (): Record<string, unknown> => ({
+    id: 'm1',
+    media: { mimetype: 'image/jpeg', filename: 'big.jpg', data: 'A'.repeat(1024 * 1024 * 2) }, // ~1.5 MB decoded
+  });
+
+  it('replaces an over-cap inline media blob with the omitted marker on message.received', () => {
+    const gateway = gwWithCap();
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+    const message = bigMedia();
+
+    gateway.emitMessage('sess-1', message);
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect(sent.payload.event).toBe('message.received');
+    const media = (sent.payload.data as Record<string, unknown>).media as Record<string, unknown>;
+    expect(media.omitted).toBe(true);
+    expect(media.data).toBeUndefined();
+    expect(media.mimetype).toBe('image/jpeg');
+    expect(media.filename).toBe('big.jpg');
+    expect(typeof media.sizeBytes).toBe('number');
+    // The caller's event object is never mutated: the webhook fan-out receives the same object.
+    expect((message.media as Record<string, unknown>).data).toHaveLength(1024 * 1024 * 2);
+  });
+
+  it('sheds on message.sent with the same contract', () => {
+    const gateway = gwWithCap();
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+
+    gateway.emitMessageSent('sess-1', bigMedia());
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect(sent.payload.event).toBe('message.sent');
+    expect(((sent.payload.data as Record<string, unknown>).media as Record<string, unknown>).omitted).toBe(true);
+  });
+
+  it('passes small inline media through untouched', () => {
+    const gateway = gwWithCap();
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+    const small = { id: 'm2', media: { mimetype: 'image/png', data: 'aGk=' } };
+
+    gateway.emitMessage('sess-1', small);
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect((sent.payload.data as Record<string, unknown>).media).toEqual({ mimetype: 'image/png', data: 'aGk=' });
+  });
+
+  it('honors a tightened cap (0 sheds every inline blob, matching the webhook knob semantics)', () => {
+    const gateway = gwWithCap(0);
+    const { server, emit } = makeCapturingServer();
+    (gateway as unknown as { server: unknown }).server = server;
+
+    gateway.emitMessage('sess-1', { id: 'm3', media: { mimetype: 'image/png', data: 'aGk=' } });
+
+    const [, sent] = emit.mock.calls[0] as [string, WSEventMessage];
+    expect(((sent.payload.data as Record<string, unknown>).media as Record<string, unknown>).omitted).toBe(true);
+  });
+});
+
 describe('EventsGateway.emitToRooms fan-out', () => {
   const gw = () =>
     new EventsGateway(
       { validateApiKey: jest.fn() } as unknown as AuthService,
       { logWarn: jest.fn().mockResolvedValue(null) } as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
     );
 
   it('delivers one event with a single broadcast across all four rooms (no per-room duplicate emit)', () => {
@@ -443,6 +501,7 @@ describe('event catalog ⇔ emitter invariants (drift guard)', () => {
     const gateway = new EventsGateway(
       { validateApiKey: jest.fn() } as unknown as AuthService,
       { logWarn: jest.fn().mockResolvedValue(null) } as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
     );
     const captured: string[] = [];
     const op: { to: () => unknown; emit: (ch: string, msg: WSEventMessage) => boolean } = {
@@ -525,7 +584,11 @@ describe('EventsGateway rate limiting', () => {
   });
 
   const buildGateway = (): EventsGateway => {
-    gateway = new EventsGateway(authService as unknown as AuthService, auditService as unknown as AuditService);
+    gateway = new EventsGateway(
+      authService as unknown as AuthService,
+      auditService as unknown as AuditService,
+      asConfig() as unknown as ConfigService,
+    );
     return gateway;
   };
 
@@ -610,7 +673,8 @@ describe('EventsGateway rate limiting', () => {
     it('rejects the handshake above the window BEFORE validateApiKey runs', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '3';
       process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
-      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      // Failed handshakes are what the window is for — an authenticated one is refunded (below).
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
       const gw = buildGateway();
 
       for (let i = 0; i < 3; i++) {
@@ -632,6 +696,47 @@ describe('EventsGateway rate limiting', () => {
       );
     });
 
+    it('emits the RATE_LIMITED error frame BEFORE disconnecting, so the client can tell throttling from a dead server', async () => {
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
+      const gw = buildGateway();
+
+      await gw.handleConnection(asSocket(makeSock('s1', { apiKey: 'good' })));
+      const blocked = makeSock('s-blocked', { apiKey: 'good' });
+      await gw.handleConnection(asSocket(blocked));
+
+      // Order is the client-visible contract: socket.io delivers the queued error frame ahead of
+      // the disconnect packet, and the dashboard keys its reconnect banner on receiving a
+      // distinguishable error plus the server-initiated close.
+      expect(blocked.emit).toHaveBeenCalledWith(
+        'message',
+        expect.objectContaining({ type: 'error', code: 'RATE_LIMITED' }),
+      );
+      expect(blocked.disconnect).toHaveBeenCalled();
+      const emitOrder = blocked.emit.mock.invocationCallOrder[0];
+      const disconnectOrder = blocked.disconnect.mock.invocationCallOrder[0];
+      expect(emitOrder).toBeLessThan(disconnectOrder);
+    });
+
+    it('does not spend the shared per-IP budget on handshakes that authenticate', async () => {
+      // The window is charged pre-auth to keep a flood off the DB, but every client behind one
+      // NAT/proxy IP shares the subject — charging successful connects too would let a few
+      // dashboards re-mounting lock each other out. Authenticated volume is bounded by the
+      // per-key socket cap instead.
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '2';
+      process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
+      process.env.WS_MAX_SOCKETS_PER_KEY = '99';
+      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      const gw = buildGateway();
+
+      for (let i = 0; i < 6; i++) {
+        const sock = makeSock(`ok${i}`, { apiKey: 'good' });
+        await gw.handleConnection(asSocket(sock));
+        expect(sock.disconnect).not.toHaveBeenCalled();
+      }
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(6);
+    });
+
     it('throttles an unauthenticated handshake flood before any credential/audit work', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '2';
       const gw = buildGateway();
@@ -651,7 +756,7 @@ describe('EventsGateway rate limiting', () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
       process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
       jest.useFakeTimers();
-      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
       const gw = buildGateway();
 
       await gw.handleConnection(asSocket(makeSock('a', { apiKey: 'good' })));
@@ -663,15 +768,18 @@ describe('EventsGateway rate limiting', () => {
       jest.advanceTimersByTime(60_001);
       const recovered = makeSock('c', { apiKey: 'good' });
       await gw.handleConnection(asSocket(recovered));
-      expect(recovered.disconnect).not.toHaveBeenCalled();
+      // No longer shed by the window: it reaches the credential check. (It is still rejected here
+      // because this test drives the window with failing credentials, so assert on WHICH rejection.)
       expect(authService.validateApiKey).toHaveBeenCalledTimes(2);
+      expect(recovered.emit).toHaveBeenCalledWith('message', expect.objectContaining({ code: 'UNAUTHORIZED' }));
+      expect(recovered.emit).not.toHaveBeenCalledWith('message', expect.objectContaining({ code: 'RATE_LIMITED' }));
     });
 
     it('samples the violation audit: one row per subject per minute, suppressed count folded in', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';
       process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
       jest.useFakeTimers();
-      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      authService.validateApiKey.mockRejectedValue(new Error('bad key'));
       const gw = buildGateway();
 
       await gw.handleConnection(asSocket(makeSock('a', { apiKey: 'good' }))); // allowed
