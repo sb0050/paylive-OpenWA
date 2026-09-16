@@ -90,6 +90,40 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
               });
             }
           }
+
+          // PAYLIVE — DIAGNOSTIC TEMPORAIRE (commande par réponse à un statut). En production le
+          // statut cité arrive sans média (`media: null`). On journalise ce que whatsapp-web.js
+          // fournit réellement pour décider du bon correctif : drapeau hasMedia, type, présence
+          // d'une clé média / d'une miniature, et si le statut est relisible par son id.
+          // Aucun effet sur le message émis. À retirer une fois le correctif en place.
+          if (quoted.id._serialized.includes('status@broadcast')) {
+            const qData = ((quoted as unknown as { _data?: Record<string, unknown> })._data ?? {}) as Record<
+              string,
+              unknown
+            >;
+            const rawQuoted = ((msg as unknown as { _data?: { quotedMsg?: Record<string, unknown> } })._data
+              ?.quotedMsg ?? {}) as Record<string, unknown>;
+            let refetched: { found: boolean; hasMedia?: boolean; type?: string; error?: string };
+            try {
+              const byId = await client.getMessageById(quoted.id._serialized);
+              refetched = byId ? { found: true, hasMedia: byId.hasMedia, type: byId.type } : { found: false };
+            } catch (refetchError) {
+              refetched = { found: false, error: String(refetchError) };
+            }
+            host.logger.warn('[paylive-diag] quoted status', {
+              quotedId: quoted.id._serialized,
+              hasMedia: quoted.hasMedia,
+              type: quoted.type,
+              dataKeys: Object.keys(qData).slice(0, 40),
+              mimetype: qData.mimetype ?? null,
+              hasMediaKey: Boolean(qData.mediaKey),
+              bodyLength: typeof qData.body === 'string' ? qData.body.length : null,
+              rawQuotedKeys: Object.keys(rawQuoted).slice(0, 40),
+              rawQuotedType: rawQuoted.type ?? null,
+              rawQuotedBodyLength: typeof rawQuoted.body === 'string' ? rawQuoted.body.length : null,
+              refetched,
+            });
+          }
         } catch (error) {
           host.logger.error('Error getting quoted message', String(error));
         }
